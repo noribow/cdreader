@@ -120,6 +120,18 @@ std::vector<std::string> cacheLogLines(const TrackRipResult& r) {
     return lines;
 }
 
+std::vector<std::string> trackRipLogLines(const std::string& name, const TrackRipResult& r) {
+    char crc[16];
+    std::snprintf(crc, sizeof crc, "%08X", r.crc32);
+    std::string first = name + "  CRC32 " + crc + "  retries " + std::to_string(r.retries) + "  " + r.status();
+    if (r.paddedSamples)
+        first += "  (" + std::to_string(r.paddedSamples) + " samples outside the disc padded with silence)";
+    std::vector<std::string> lines = {first};
+    for (std::string& l : c2LogLines(r)) lines.push_back(std::move(l));
+    for (std::string& l : cacheLogLines(r)) lines.push_back(std::move(l));
+    return lines;
+}
+
 // --- Ripper ------------------------------------------------------------------
 
 // With a read offset the track's samples no longer start on a sector

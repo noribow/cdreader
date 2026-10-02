@@ -29,6 +29,7 @@ import android.widget.ProgressBar
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.Spinner
+import android.widget.Switch
 import android.widget.TextView
 import java.io.File
 import java.io.FileInputStream
@@ -40,8 +41,8 @@ import java.util.concurrent.Executors
 
 /**
  * Single screen: connect to a USB CD drive, show its TOC (with titles from
- * CDDB), rip the selected tracks to FLAC, Ogg FLAC, WAV, Opus or Vorbis files in a folder chosen with
- * the Storage Access Framework and check them against AccurateRip.
+ * CDDB), rip the selected tracks to FLAC, Ogg FLAC, WAV, Opus or Vorbis files (or into one file with a
+ * CUE sheet, #42) in a folder chosen with the Storage Access Framework and check them against AccurateRip.
  * USB I/O, network lookups and ripping run on one worker thread ([worker]);
  * the native session is only touched from there (except cancel()).
  */
@@ -58,6 +59,8 @@ class MainActivity : Activity() {
         const val PREF_C2 = "useC2"
         const val PREF_CACHE = "cacheMode"
         const val PREF_ADVANCED = "advancedOpen"
+        // Single-file mode (#42): the whole selection as one file plus a .cue file.
+        const val PREF_SINGLE_FILE = "singleFile"
         // CDDB server URL and contact e-mail address (#38); "" = default server / anonymous greeting.
         const val PREF_CDDB_SERVER = "cddbServer"
         const val PREF_CDDB_EMAIL = "cddbEmail"
@@ -91,6 +94,7 @@ class MainActivity : Activity() {
     private lateinit var checkVerify: CheckBox
     private lateinit var checkC2: CheckBox
     private lateinit var spinnerCache: Spinner
+    private lateinit var switchSingleFile: Switch
     private lateinit var textAdvanced: TextView
     private lateinit var groupAdvanced: View
     private lateinit var checkCddb: CheckBox
@@ -181,6 +185,7 @@ class MainActivity : Activity() {
         checkVerify = findViewById(R.id.checkVerify)
         checkC2 = findViewById(R.id.checkC2)
         spinnerCache = findViewById(R.id.spinnerCache)
+        switchSingleFile = findViewById(R.id.switchSingleFile)
         textAdvanced = findViewById(R.id.textAdvanced)
         groupAdvanced = findViewById(R.id.groupAdvanced)
         checkCddb = findViewById(R.id.checkCddb)
@@ -214,6 +219,7 @@ class MainActivity : Activity() {
         checkAccurateRip.isChecked = prefs.getBoolean(PREF_ACCURATERIP, true)
         checkC2.isChecked = prefs.getBoolean(PREF_C2, true)
         spinnerCache.setSelection(CacheMode.fromKey(prefs.getString(PREF_CACHE, null)).ordinal, false)
+        switchSingleFile.isChecked = prefs.getBoolean(PREF_SINGLE_FILE, false)
         showAdvanced(prefs.getBoolean(PREF_ADVANCED, false))
         cddbServer = prefs.getString(PREF_CDDB_SERVER, "").orEmpty()
         cddbEmail = prefs.getString(PREF_CDDB_EMAIL, "").orEmpty()
@@ -246,6 +252,9 @@ class MainActivity : Activity() {
         }
         checkC2.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(PREF_C2, checked).apply()
+        }
+        switchSingleFile.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(PREF_SINGLE_FILE, checked).apply()
         }
         spinnerCache.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
@@ -522,6 +531,7 @@ class MainActivity : Activity() {
         val cacheMode = selectedCacheMode()
         val format = selectedFormat()
         val accurateRip = checkAccurateRip.isChecked
+        val singleFile = switchSingleFile.isChecked
 
         ripping = true
         cancelRequested = false
@@ -534,40 +544,54 @@ class MainActivity : Activity() {
 
         worker.execute {
             val temp = File(cacheDir, "rip.$format")
+            val tempCue = File(cacheDir, "rip.cue")
             var message: String
             var results: String? = null
             var suggestDetection = false
             try {
+                // Single-file mode (#42): only consecutive tracks make an image of the disc.
+                val image = if (singleFile) imageNamesOrExplain(s, format, selected) else null
+                if (image != null) checkImageSpace(disc, selected, image, format)
                 if (cacheMode == CacheMode.AUTO) runOnUiThread { setStatus("ドライブのキャッシュを確認しています…") }
                 s.beginRip(format, offset, MAX_RETRIES, verify, useC2, cacheMode, source, sourceDetail)
                 val ripped = mutableListOf<Pair<Int, RipResult>>()
-                val dir = createDocument(treeDocument(tree), DocumentsContract.Document.MIME_TYPE_DIR, s.albumFolderName())
-                var problems = 0
-                for ((index, track) in selected.withIndex()) {
-                    if (cancelRequested) throw CancellationException()
-                    val label = "トラック ${track.number} (${index + 1}/${selected.size})"
-                    runOnUiThread { setStatus("$label を読み取り中…") }
-                    val r = s.ripTrack(track.number, temp.path) { done, total ->
-                        val permille = if (total > 0) (1000L * done / total).toInt() else 0
-                        runOnUiThread {
-                            progress.progress = permille
-                            setStatus("$label  ${permille / 10}%")
+                var imageResult: ImageResult? = null
+                val dir: Uri
+                if (image != null) {
+                    val (folder, r) = ripImage(s, tree, image, format, selected, temp, tempCue)
+                    dir = folder
+                    imageResult = r
+                    ripped += r.parts
+                } else {
+                    dir = createDocument(treeDocument(tree), DocumentsContract.Document.MIME_TYPE_DIR, s.albumFolderName())
+                    for ((index, track) in selected.withIndex()) {
+                        if (cancelRequested) throw CancellationException()
+                        val label = "トラック ${track.number} (${index + 1}/${selected.size})"
+                        runOnUiThread { setStatus("$label を読み取り中…") }
+                        val r = s.ripTrack(track.number, temp.path) { done, total ->
+                            val permille = if (total > 0) (1000L * done / total).toInt() else 0
+                            runOnUiThread {
+                                progress.progress = permille
+                                setStatus("$label  ${permille / 10}%")
+                            }
                         }
+                        copyToDocument(temp, createDocument(dir, mimeType(format), s.trackFileName(track.number, format)))
+                        ripped += track.number to r
                     }
-                    copyToDocument(temp, createDocument(dir, mimeType(format), s.trackFileName(track.number, format)))
-                    ripped += track.number to r
-                    if (!r.clean) problems++
                 }
+                val problems = ripped.count { !it.second.clean }
                 if (accurateRip) runOnUiThread { setStatus("AccurateRip データベースを照会しています…") }
                 val summary = s.checkAccurateRip(accurateRip, http)
                 val log = s.ripLog()
                 writeText(createDocument(dir, "application/octet-stream", "rip.log"), log)
-                results = describeC2(s.c2Status(), ripped) + "\n" + describeCache(s.cacheStatus(), ripped) + "\n" +
+                results = (if (image != null && imageResult != null) describeImage(image, imageResult) + "\n" else "") +
+                    describeC2(s.c2Status(), ripped) + "\n" + describeCache(s.cacheStatus(), ripped) + "\n" +
                     describeAccurateRip(summary)
                 // The disc is in AccurateRip but nothing matched: most likely the offset (#37).
                 suggestDetection = summary.status == AccurateRipStatus.FOUND && summary.accurateTracks == 0 &&
                     summary.tracksInDatabase > 0
-                message = if (problems == 0) "完了しました (${selected.size} トラック)"
+                val what = if (image != null) "${selected.size} トラックを 1 ファイルに保存" else "${selected.size} トラック"
+                message = if (problems == 0) "完了しました ($what)"
                 else "完了しましたが、$problems トラックに読めないセクタまたは疑わしい位置がありました (rip.log を参照)"
             } catch (e: CancellationException) {
                 message = "キャンセルしました"
@@ -575,20 +599,109 @@ class MainActivity : Activity() {
                 message = "エラー: ${e.message}"
             } finally {
                 temp.delete()
+                tempCue.delete()
             }
+            finishRip(message, results, suggestDetection)
+        }
+    }
+
+    // Worker thread: shows the outcome of a rip on the UI thread.
+    private fun finishRip(message: String, results: String?, suggestDetection: Boolean) {
+        runOnUiThread {
+            ripping = false
+            buttonRip.text = getString(R.string.rip)
+            setBusy(false)
+            setStatus(message)
+            if (results != null) {
+                textResults.text = results
+                textResults.scrollTo(0, 0)
+                textResults.visibility = View.VISIBLE
+            }
+            if (suggestDetection && toc != null) suggestOffsetDetection()
+        }
+    }
+
+    // --- Single-file mode (#42) -----------------------------------------------
+
+    /** Worker thread: the names of the image, or an IOException that says what to select. */
+    private fun imageNamesOrExplain(s: CdSession, format: String, selected: List<TrackInfo>): ImageNames =
+        try {
+            s.imageFileNames(format, selected.map { it.number })
+        } catch (e: IllegalArgumentException) {
+            throw IOException(
+                "1 ファイルにするには、連続したオーディオトラックを選択してください (${e.message})"
+            )
+        }
+
+    /**
+     * The image is written to the app's cache first (the writers patch their
+     * headers at the end): a whole disc as WAV needs up to about 800 MB there.
+     */
+    private fun checkImageSpace(disc: DiscToc, selected: List<TrackInfo>, image: ImageNames, format: String) {
+        var sectors = selected.sumOf { it.lengthSectors.toLong() }
+        if (image.withHtoa) sectors += disc.tracks.firstOrNull { it.number == 1 }?.startLba?.toLong() ?: 0L
+        val pcmBytes = sectors * 2352
+        // Rough upper bounds of the encoded size (lossless compression rarely saves less than 20%).
+        val needed = when (format) {
+            "wav" -> pcmBytes
+            "opus", "vorbis" -> pcmBytes / 5
+            else -> pcmBytes * 4 / 5
+        } + (16L shl 20)
+        val free = cacheDir.usableSpace
+        if (free < needed) {
+            throw IOException(
+                "端末の空き容量が足りません (一時ファイルに約 %d MB 必要、空き %d MB)".format(needed shr 20, free shr 20)
+            )
+        }
+    }
+
+    /**
+     * Worker thread: rips the image into [temp] / [tempCue], then copies both
+     * into a new album folder, which is returned with the result. The folder
+     * is created only after the rip and removed again (with what was copied
+     * into it) when the copy fails or is cancelled: no partial image is left.
+     */
+    private fun ripImage(
+        s: CdSession,
+        tree: Uri,
+        image: ImageNames,
+        format: String,
+        selected: List<TrackInfo>,
+        temp: File,
+        tempCue: File,
+    ): Pair<Uri, ImageResult> {
+        runOnUiThread { setStatus("${image.imageFile} を読み取り中…") }
+        val r = s.ripImage(selected.map { it.number }, temp.path, tempCue.path) { track, done, total ->
+            val permille = if (total > 0) (1000L * done / total).toInt() else 0
+            val part = if (track == 0) "隠しトラック (HTOA)" else "トラック $track"
             runOnUiThread {
-                ripping = false
-                buttonRip.text = getString(R.string.rip)
-                setBusy(false)
-                setStatus(message)
-                if (results != null) {
-                    textResults.text = results
-                    textResults.scrollTo(0, 0)
-                    textResults.visibility = View.VISIBLE
-                }
-                if (suggestDetection && toc != null) suggestOffsetDetection()
+                progress.progress = permille
+                setStatus("1 ファイルに保存: $part を読み取り中  ${permille / 10}%")
             }
         }
+        if (cancelRequested) throw CancellationException()
+        runOnUiThread { setStatus("${image.imageFile} を保存しています…") }
+        val dir = createDocument(treeDocument(tree), DocumentsContract.Document.MIME_TYPE_DIR, s.albumFolderName())
+        try {
+            copyToDocument(temp, createDocument(dir, mimeType(format), image.imageFile))
+            copyToDocument(tempCue, createDocument(dir, "application/octet-stream", image.cueFile))
+        } catch (e: Exception) {
+            deleteDocument(dir)
+            throw e
+        }
+        return dir to r
+    }
+
+    // e.g. "1 ファイル: Artist - Album.flac + Artist - Album.cue (CUE シートをファイル内にも埋め込み)"
+    private fun describeImage(image: ImageNames, r: ImageResult): String {
+        val embedded = when {
+            !r.embeddedCue -> ""
+            image.imageFile.endsWith(".mka") -> " (トラックはファイル内のチャプターにも記録)"
+            else -> " (CUE シートをファイル内にも埋め込み)"
+        }
+        var text = "1 ファイル: ${image.imageFile} + ${image.cueFile}$embedded"
+        if (r.withHtoa) text += "\n先頭に隠しトラック (HTOA) を含みます (Track 00)"
+        return text + "\nCRC32 %08X".format(r.crc32)
     }
 
     // --- Read offset (#37) -----------------------------------------------------
@@ -946,12 +1059,35 @@ class MainActivity : Activity() {
     // Ogg pages are simply written in one go), so the file is written
     // locally and then streamed through the document's ParcelFileDescriptor
     // (providers may hand out non-seekable pipes).
+    // A cancel during the copy (a disc image takes a while) or a failure
+    // deletes the document again.
     private fun copyToDocument(source: File, document: Uri) {
-        val pfd = contentResolver.openFileDescriptor(document, "w") ?: throw IOException("cannot open $document")
-        pfd.use {
-            FileOutputStream(it.fileDescriptor).use { out ->
-                FileInputStream(source).use { input -> input.copyTo(out, 1 shl 16) }
+        try {
+            val pfd = contentResolver.openFileDescriptor(document, "w") ?: throw IOException("cannot open $document")
+            pfd.use {
+                FileOutputStream(it.fileDescriptor).use { out ->
+                    FileInputStream(source).use { input ->
+                        val buffer = ByteArray(1 shl 16)
+                        while (true) {
+                            if (cancelRequested) throw CancellationException()
+                            val n = input.read(buffer)
+                            if (n < 0) break
+                            out.write(buffer, 0, n)
+                        }
+                    }
+                }
             }
+        } catch (e: Exception) {
+            deleteDocument(document)
+            throw e
+        }
+    }
+
+    private fun deleteDocument(document: Uri) {
+        try {
+            DocumentsContract.deleteDocument(contentResolver, document)
+        } catch (e: Exception) {
+            // Best effort: the provider may not support deleting.
         }
     }
 
@@ -1037,6 +1173,7 @@ class MainActivity : Activity() {
         checkVerify.isEnabled = !busy
         checkC2.isEnabled = !busy
         spinnerCache.isEnabled = !busy
+        switchSingleFile.isEnabled = !busy
         checkCddb.isEnabled = !busy
         // CDDB settings (#38): not while ripping, detecting or looking up.
         editCddbServer.isEnabled = !busy

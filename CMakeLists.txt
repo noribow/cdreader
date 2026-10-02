@@ -39,6 +39,7 @@ add_library(cdreader_core STATIC
   core/src/clock.cpp
   core/src/crc32.cpp
   core/src/cue_sheet.cpp
+  core/src/disc_image.cpp
   core/src/drive_cache.cpp
   core/src/file_naming.cpp
   core/src/flac_encoder.cpp

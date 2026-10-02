@@ -154,6 +154,21 @@
                     android:entries="@array/cache_modes" />
             </LinearLayout>
 
+            <!-- Single-file mode (#42): the selected tracks as one file plus a .cue file. -->
+            <Switch
+                android:id="@+id/switchSingleFile"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:checked="false"
+                android:text="@string/single_file" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/single_file_note"
+                android:textAppearance="@android:style/TextAppearance.Material.Caption" />
+
             <!-- CDDB server and contact e-mail address (#38). -->
             <TextView
                 android:layout_width="match_parent"

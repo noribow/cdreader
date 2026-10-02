@@ -25,6 +25,7 @@
 #include "cdreader/cddb.h"
 #include "cdreader/crc32.h"
 #include "cdreader/cue_sheet.h"
+#include "cdreader/disc_image.h"
 #include "cdreader/drive_cache.h"
 #include "cdreader/file_naming.h"
 #include "cdreader/flac_encoder.h"
@@ -4772,6 +4773,171 @@ TEST(cue_sheet_single_file_with_gaps_and_htoa) {
         threw = true;
     }
     CHECK(threw);
+}
+
+// #42: the single-file plan and log lines moved from the CLI (app/cli/main.cpp)
+// into core for the Android app. The references below are the CLI's former
+// inline code, so the CLI's files and rip.log stay byte-identical.
+TEST(disc_image_plan_matches_former_cli_code) {
+    cdr::Toc toc;
+    toc.firstTrack = 1;
+    toc.lastTrack = 3;
+    toc.leadOutLba = 2550;
+    toc.tracks = {{1, 450, 1050}, {2, 1500, 750}, {3, 2250, 300}};
+    toc.tracks[0].preEmphasis = true;
+    cdr::DiscGaps gaps;
+    gaps.status = cdr::DiscGaps::Status::Detected;
+    gaps.htoaSectors = 450;
+    gaps.tracks.resize(3);
+    for (int i = 0; i < 3; ++i) {
+        gaps.tracks[size_t(i)].track = i + 1;
+        gaps.tracks[size_t(i)].index01Lba = toc.tracks[size_t(i)].startLba;
+        gaps.tracks[size_t(i)].status = cdr::TrackIndexes::Status::Detected;
+    }
+    gaps.tracks[0].pregapSectors = 450;
+    gaps.tracks[1].pregapSectors = 150;
+    gaps.tracks[1].laterIndexes = {1800};
+    cdr::AlbumMetadata album;
+    album.artist = "Artist";
+    album.title = "Album: Live";
+    album.trackTitles = {"One", "Two", "Three"};
+    album.mcn = "4006381333931";
+    album.trackIsrcs = {"JPTO09901234", "", ""};
+
+    for (const std::string ext : {"flac", "wav", "mka"}) {
+        for (bool htoa : {true, false}) {
+            for (size_t first : {size_t(0), size_t(1)}) {
+                const std::vector<cdr::Track> selected(toc.tracks.begin() + ptrdiff_t(first), toc.tracks.end());
+                // The former CLI code (withHtoa = htoaSelected && singleFile).
+                const bool withHtoa = htoa && gaps.hasHtoa() && selected.front().number == 1;
+                const std::string albumBase = cdr::albumFileBase(album, "CDImage");
+                const std::string imageName = albumBase + "." + ext;
+                const std::vector<cdr::CueTrack> cueTracks =
+                    cdr::singleFileCueTracks(selected, imageName, album, gaps, withHtoa);
+                cdr::EmbeddedCueSheet embedded;
+                embedded.tracks = cueTracks;
+                embedded.mcn = album.mcn;
+                for (const cdr::Track& t : selected) embedded.totalSectors += t.lengthSectors;
+                if (withHtoa) embedded.totalSectors += gaps.htoaSectors;
+                embedded.text = cdr::formatCueSheet(album, cueTracks);
+                std::vector<cdr::Track> parts = selected;
+                if (withHtoa) parts.insert(parts.begin(), cdr::htoaTrack(toc));
+
+                const cdr::DiscImagePlan plan = cdr::planDiscImage(selected, toc, album, gaps, htoa, ext);
+                CHECK(plan.fileName == imageName);
+                CHECK(plan.fileName == "Artist - Album_ Live." + ext);
+                CHECK(plan.cueFileName == albumBase + ".cue");
+                CHECK(plan.withHtoa == withHtoa);
+                CHECK(plan.cueSheet == embedded.text);
+                const cdr::EmbeddedCueSheet e = plan.embeddedCueSheet();
+                CHECK(e.text == embedded.text);
+                CHECK(e.mcn == embedded.mcn);
+                CHECK_EQ(e.totalSectors, embedded.totalSectors);
+                CHECK(cdr::formatCueSheet(album, e.tracks) == cdr::formatCueSheet(album, embedded.tracks));
+                CHECK_EQ(e.tracks.size(), embedded.tracks.size());
+                for (size_t i = 0; i < e.tracks.size() && i < embedded.tracks.size(); ++i) {
+                    CHECK_EQ(e.tracks[i].startSectors, embedded.tracks[i].startSectors);
+                    CHECK(e.tracks[i].hasIndex00 == embedded.tracks[i].hasIndex00);
+                    CHECK_EQ(e.tracks[i].index00Sectors, embedded.tracks[i].index00Sectors);
+                    CHECK(e.tracks[i].laterIndexes == embedded.tracks[i].laterIndexes);
+                    CHECK(e.tracks[i].preEmphasis == embedded.tracks[i].preEmphasis);
+                }
+                CHECK_EQ(plan.parts.size(), parts.size());
+                for (size_t i = 0; i < plan.parts.size() && i < parts.size(); ++i) {
+                    CHECK_EQ(plan.parts[i].number, parts[i].number);
+                    CHECK_EQ(plan.parts[i].startLba, parts[i].startLba);
+                    CHECK_EQ(plan.parts[i].lengthSectors, parts[i].lengthSectors);
+                    CHECK(plan.parts[i].preEmphasis == parts[i].preEmphasis);
+                    char base[32];
+                    std::snprintf(base, sizeof base, parts[i].number == 0 ? "Track %02d (HTOA)" : "Track %02d",
+                                  parts[i].number);
+                    CHECK(cdr::DiscImagePlan::partName(parts[i]) == base);
+                }
+                const char* what = ext != "mka" ? "CUESHEET block and tag"
+                                   : withHtoa   ? "Matroska chapters (one per track, plus the HTOA)"
+                                                : "Matroska chapters (one per track)";
+                CHECK(cdr::embeddedCueSheetDescription(ext, withHtoa) == what);
+            }
+        }
+    }
+    // The exact sheet with the HTOA (as cue_sheet_single_file_with_gaps_and_htoa, plus metadata).
+    const cdr::DiscImagePlan plan = cdr::planDiscImage(toc.tracks, toc, album, gaps, true, "flac");
+    CHECK(plan.cueSheet ==
+          "REM COMMENT \"cdreader\"\r\n"
+          "CATALOG 4006381333931\r\n"
+          "PERFORMER \"Artist\"\r\n"
+          "TITLE \"Album: Live\"\r\n"
+          "FILE \"Artist - Album_ Live.flac\" WAVE\r\n"
+          "  TRACK 01 AUDIO\r\n"
+          "    TITLE \"One\"\r\n"
+          "    PERFORMER \"Artist\"\r\n"
+          "    FLAGS PRE\r\n"
+          "    ISRC JPTO09901234\r\n"
+          "    INDEX 00 00:00:00\r\n"
+          "    INDEX 01 00:06:00\r\n"
+          "  TRACK 02 AUDIO\r\n"
+          "    TITLE \"Two\"\r\n"
+          "    PERFORMER \"Artist\"\r\n"
+          "    INDEX 00 00:18:00\r\n"
+          "    INDEX 01 00:20:00\r\n"
+          "    INDEX 02 00:24:00\r\n"
+          "  TRACK 03 AUDIO\r\n"
+          "    TITLE \"Three\"\r\n"
+          "    PERFORMER \"Artist\"\r\n"
+          "    INDEX 01 00:30:00\r\n");
+    CHECK_EQ(plan.totalSectors, 2550u);
+    CHECK(cdr::planDiscImage(toc.tracks, toc, {}, gaps, true, "wav").fileName == "CDImage.wav");
+
+    // Not consecutive / empty: std::invalid_argument (the CLI makes it a usage error).
+    for (const std::vector<cdr::Track>& bad : {std::vector<cdr::Track>{toc.tracks[0], toc.tracks[2]},
+                                               std::vector<cdr::Track>{}}) {
+        bool threw = false;
+        try {
+            cdr::planDiscImage(bad, toc, album, gaps, true, "wav");
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+
+    // rip.log lines: the former inline code of the CLI and the app.
+    auto former = [](const std::string& name, const cdr::TrackRipResult& r) {
+        std::string log;
+        char crc[16];
+        std::snprintf(crc, sizeof crc, "%08X", r.crc32);
+        log += name + "  CRC32 " + crc + "  retries " + std::to_string(r.retries) + "  " + r.status();
+        if (r.paddedSamples)
+            log += "  (" + std::to_string(r.paddedSamples) + " samples outside the disc padded with silence)";
+        log += "\n";
+        for (const std::string& l : cdr::c2LogLines(r)) log += l + "\n";
+        for (const std::string& l : cdr::cacheLogLines(r)) log += l + "\n";
+        return log;
+    };
+    auto joined = [](const std::vector<std::string>& lines) {
+        std::string log;
+        for (const std::string& l : lines) log += l + "\n";
+        return log;
+    };
+    cdr::TrackRipResult r;
+    r.crc32 = 0x0012ABCD;
+    CHECK(joined(cdr::trackRipLogLines("Track 01", r)) == "Track 01  CRC32 0012ABCD  retries 0  OK\n");
+    CHECK(joined(cdr::trackRipLogLines("Track 01", r)) == former("Track 01", r));
+    r.retries = 3;
+    r.paddedSamples = 667;
+    r.unreadableSectors = 1;
+    r.c2 = true;
+    r.c2ErrorSectors = 2;
+    r.c2Rereads = 5;
+    r.c2Unresolved = 1;
+    r.suspiciousSectors = {10, 11};
+    r.c2Fallback = "rejected";
+    r.cacheDefeats = 4;
+    r.flushSectorsRead = 300;
+    r.cacheFallback = "illegal request";
+    CHECK(joined(cdr::trackRipLogLines("01 - One.flac", r)) == former("01 - One.flac", r));
+    CHECK(joined(cdr::trackRipLogLines("x", r)).find(
+              "  (667 samples outside the disc padded with silence)\n  C2 errors: 2 sector(s)") != std::string::npos);
+    CHECK(cdr::discImageCrcLogLine("CDImage.wav", 0xDEADBEEF) == "CDImage.wav  CRC32 DEADBEEF");
 }
 
 TEST(cue_sheet_per_track_gaps_appended_to_previous) {

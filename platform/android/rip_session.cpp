@@ -2,11 +2,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <sstream>
 
 #include "cdreader/audio_writer.h"
+#include "cdreader/crc32.h"
 #include "cdreader/file_naming.h"
 
 #ifndef CDREADER_VERSION
@@ -16,6 +18,11 @@
 namespace cdr {
 
 namespace {
+
+std::string fileExtension(const std::string& name) {
+    const size_t dot = name.rfind('.');
+    return dot == std::string::npos ? std::string() : name.substr(dot + 1);
+}
 
 std::string hex32(uint32_t v) {
     char buf[16];
@@ -126,6 +133,7 @@ const Toc& RipSession::readToc() {
     gaps_ = gapsFromToc(*toc_);
     detectedCache_.reset();
     ripped_.clear();
+    image_.reset();
     accurateRip_ = {};
     accurateRipChecked_ = false;
     detection_.reset();
@@ -219,6 +227,7 @@ void RipSession::beginRip(const RipSettings& settings) {
     settings_.options.flushSectors = cacheCheck_.flushSectors;
     cacheFallback_.clear();
     ripped_.clear();
+    image_.reset();
     accurateRip_ = {};
     accurateRipChecked_ = false;
     cancelled_ = false;
@@ -257,19 +266,15 @@ const RippedTrack& RipSession::ripTrack(int number, const std::filesystem::path&
             if (progress) progress(done, total);
         });
     writer->close();
-    if (ripped.result.c2 && !ripper.c2Active()) {
-        // The drive rejected C2 reads: plain reads for the rest of the disc.
-        settings_.options.useC2 = false;
-        c2Fallback_ = ripper.c2FallbackReason();
-    }
-    if (ripper.cacheDefeat() != settings_.options.cacheDefeat) {
-        // The drive rejected FUA: flush for the rest of the rip.
-        settings_.options.cacheDefeat = ripper.cacheDefeat();
-        cacheFallback_ = ripper.cacheFallbackReason();
-    }
+    takeFallbacks(ripper, ripped.result);
     ripped.accurateRipV1 = ar.v1();
     ripped.accurateRipV2 = ar.v2();
 
+    // Per-track files after an image: the image's parts are no results of these.
+    if (image_) {
+        image_.reset();
+        ripped_.clear();
+    }
     // Ripping a track again replaces its earlier result.
     for (auto it = ripped_.begin(); it != ripped_.end(); ++it) {
         if (it->track.number == number) {
@@ -280,6 +285,113 @@ const RippedTrack& RipSession::ripTrack(int number, const std::filesystem::path&
     ripped_.push_back(std::move(ripped));
     accurateRipChecked_ = false;
     return ripped_.back();
+}
+
+void RipSession::takeFallbacks(const Ripper& ripper, const TrackRipResult& result) {
+    if (result.c2 && !ripper.c2Active() && settings_.options.useC2) {
+        // The drive rejected C2 reads: plain reads for the rest of the disc.
+        settings_.options.useC2 = false;
+        c2Fallback_ = ripper.c2FallbackReason();
+    }
+    if (ripper.cacheDefeat() != settings_.options.cacheDefeat) {
+        // The drive rejected FUA: flush for the rest of the rip.
+        settings_.options.cacheDefeat = ripper.cacheDefeat();
+        cacheFallback_ = ripper.cacheFallbackReason();
+    }
+}
+
+DiscImagePlan RipSession::planImage(const std::vector<int>& numbers, const std::string& format) {
+    const Toc& t = toc();
+    const std::unique_ptr<AudioWriter> writer = createAudioWriter(format);
+    if (!writer) throw std::invalid_argument("unknown format '" + format + "'");
+    std::vector<Track> tracks;
+    if (numbers.empty()) {
+        for (const Track& track : t.tracks)
+            if (track.isAudio) tracks.push_back(track);
+        if (tracks.empty()) throw std::invalid_argument("no audio tracks on this disc");
+    }
+    for (int number : numbers) {
+        const Track* track = t.findTrack(number);
+        if (track == nullptr) throw std::invalid_argument("track " + std::to_string(number) + " is not on this disc");
+        if (!track->isAudio)
+            throw std::invalid_argument("track " + std::to_string(number) + " is not an audio track");
+        tracks.push_back(*track);
+    }
+    // The HTOA is part of every image that starts with track 1, as in the CLI.
+    return planDiscImage(tracks, t, album_, gaps_, true, writer->extension());
+}
+
+const RippedImage& RipSession::ripImage(const std::vector<int>& tracks, const std::filesystem::path& imagePath,
+                                        const std::filesystem::path& cuePath, const ImageProgress& progress) {
+    if (cancelled_) throw RipCancelled();
+    const Toc& t = toc();
+    RippedImage image;
+    image.plan = planImage(tracks, settings_.format);
+    const DiscImagePlan& plan = image.plan;
+
+    std::vector<RippedTrack> parts;
+    try {
+        std::unique_ptr<AudioWriter> writer = createAudioWriter(settings_.format, settings_.encoder);
+        if (!writer) throw std::invalid_argument("unknown format '" + settings_.format + "'");
+        image.embeddedCueSheet = writer->canEmbedCueSheet();
+        if (image.embeddedCueSheet) writer->setEmbeddedCueSheet(plan.embeddedCueSheet());
+        writer->open(imagePath, album_.forTrack(0, t.lastTrack));
+
+        Crc32 crc;
+        uint32_t base = 0;  // sectors of the parts before this one
+        Ripper ripper(drive_, t, settings_.options);
+        for (const Track& part : plan.parts) {
+            const bool htoa = part.number == 0;
+            RippedTrack ripped;
+            ripped.track = part;
+            ripped.fileName = DiscImagePlan::partName(part);
+            // No AccurateRip checksums for the HTOA: the database has none.
+            AccurateRipChecksum ar = AccurateRipChecksum::forTrack(t, htoa ? plan.parts[1] : part);
+            ripped.result = ripper.ripTrack(
+                part,
+                [&](const uint8_t* pcm, size_t bytes) {
+                    if (cancelled_) throw RipCancelled();
+                    writer->write(pcm, bytes);
+                    if (!htoa) ar.update(pcm, bytes);
+                    crc.update(pcm, bytes);
+                },
+                [&](uint32_t done, uint32_t total) {
+                    if (cancelled_) throw RipCancelled();
+                    const uint32_t inPart =
+                        total ? uint32_t(uint64_t(done) * part.lengthSectors / total) : part.lengthSectors;
+                    if (progress) progress(part.number, base + inPart, plan.totalSectors);
+                });
+            takeFallbacks(ripper, ripped.result);
+            base += part.lengthSectors;
+            ripped.accurateRipV1 = htoa ? 0 : ar.v1();
+            ripped.accurateRipV2 = htoa ? 0 : ar.v2();
+            parts.push_back(std::move(ripped));
+        }
+        writer->close();
+        writer.reset();
+        image.crc32 = crc.value();
+
+        if (!cuePath.empty()) {
+            std::ofstream out(cuePath, std::ios::binary | std::ios::trunc);
+            out << plan.cueSheet;
+            if (!out.flush()) throw std::runtime_error("failed to write " + plan.cueFileName);
+        }
+    } catch (...) {
+        // No partial outputs (the writer, if any, is closed by now).
+        std::error_code ec;
+        std::filesystem::remove(imagePath, ec);
+        if (!cuePath.empty()) std::filesystem::remove(cuePath, ec);
+        throw;
+    }
+
+    ripped_.clear();
+    for (RippedTrack& part : parts) {
+        if (part.track.number == 0) image.htoa = std::move(part);
+        else ripped_.push_back(std::move(part));
+    }
+    image_ = std::move(image);
+    accurateRipChecked_ = false;
+    return *image_;
 }
 
 const AccurateRipReport& RipSession::checkAccurateRip(HttpClient* http) {
@@ -319,7 +431,7 @@ const AccurateRipReport& RipSession::checkAccurateRip(HttpClient* http) {
 }
 
 int RipSession::problemTracks() const {
-    int n = 0;
+    int n = image_ && image_->htoa && !image_->htoa->result.clean() ? 1 : 0;
     for (const RippedTrack& r : ripped_) n += r.result.clean() ? 0 : 1;
     return n;
 }
@@ -367,15 +479,19 @@ std::string RipSession::ripLog() {
     log << "\n";
 
     log << "Folder: " << albumDirectoryName() << "\n";
-    for (const RippedTrack& r : ripped_) {
-        log << r.fileName << "  CRC32 " << hex32(r.result.crc32) << "  retries " << r.result.retries << "  "
-            << r.result.status();
-        if (r.result.paddedSamples)
-            log << "  (" << r.result.paddedSamples << " samples outside the disc padded with silence)";
-        log << "\n";
-        for (const std::string& l : c2LogLines(r.result)) log << l << "\n";
-        for (const std::string& l : cacheLogLines(r.result)) log << l << "\n";
+    if (image_) {
+        // The single-file layout of the CLI (#42).
+        log << "Single file: " << image_->plan.fileName << "\n";
+        if (image_->embeddedCueSheet)
+            log << "Embedded CUE sheet: "
+                << embeddedCueSheetDescription(fileExtension(image_->plan.fileName), image_->plan.withHtoa) << "\n";
+        if (image_->htoa)
+            for (const std::string& l : trackRipLogLines(image_->htoa->fileName, image_->htoa->result))
+                log << l << "\n";
     }
+    for (const RippedTrack& r : ripped_)
+        for (const std::string& l : trackRipLogLines(r.fileName, r.result)) log << l << "\n";
+    if (image_) log << discImageCrcLogLine(image_->plan.fileName, image_->crc32) << "\n";
 
     if (accurateRipChecked_) {
         log << "\n";

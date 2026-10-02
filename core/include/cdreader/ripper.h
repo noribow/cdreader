@@ -101,6 +101,12 @@ std::vector<std::string> c2LogLines(const TrackRipResult& result);
 // 2943 sectors read" and the FUA fallback; empty when nothing was done.
 std::vector<std::string> cacheLogLines(const TrackRipResult& result);
 
+// rip.log lines of one ripped file or one part of a disc image (#42): "<name>
+// CRC32 <crc>  retries <n>  <status>" (plus the padded samples of offset
+// correction), then c2LogLines() and cacheLogLines(). Shared by the CLI and
+// the app.
+std::vector<std::string> trackRipLogLines(const std::string& name, const TrackRipResult& result);
+
 class Ripper {
 public:
     using SampleSink = std::function<void(const uint8_t* pcm, size_t bytes)>;
