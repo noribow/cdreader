@@ -59,7 +59,8 @@ void detect(CdDrive& drive, const Toc& toc, Clock& clock, DriveCacheCheck& c) {
     const uint32_t n = kCacheTestSectors;
     const Toc::LbaRange run = largestAudioRun(toc);
     const uint32_t length = run.end - run.begin;
-    if (length < 2 * n + c.flushSectors) {
+    // Room for the full flush on one side of every test position.
+    if (length < 2 * n + 2 * c.flushSectors) {
         c.detail = "the audio area is too short for the test";
         return;
     }

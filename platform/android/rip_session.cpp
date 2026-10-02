@@ -101,6 +101,7 @@ const Toc& RipSession::readToc() {
     album_.discId = hex32(toc_->cddbId());
     discCodes_ = {};
     gaps_ = gapsFromToc(*toc_);
+    detectedCache_.reset();
     ripped_.clear();
     accurateRip_ = {};
     accurateRipChecked_ = false;
@@ -176,9 +177,23 @@ void RipSession::beginRip(const RipSettings& settings) {
     if (settings.options.maxRetries < 0) throw std::invalid_argument("negative retry count");
     settings_ = settings;
     // MODE SENSE on every rip: cheap, and the drive may have been swapped.
-    c2_ = checkC2(drive_, settings.useC2);
+    std::optional<DriveCapabilities> caps;
+    if (settings.useC2 || settings.cache != CacheSetting::None) caps = drive_.readCapabilities();
+    c2_ = caps ? checkC2(*caps, settings.useC2) : C2Availability{};
     settings_.options.useC2 = c2_.usable();
     c2Fallback_.clear();
+    // The cache timing test reads the disc for a few seconds: once per disc.
+    if (settings.cache == CacheSetting::Auto && detectedCache_) {
+        cacheCheck_ = *detectedCache_;
+    } else {
+        static const Toc noToc;  // None needs no TOC (and sends no command)
+        const Toc& t = settings.cache == CacheSetting::None ? noToc : toc();
+        cacheCheck_ = checkDriveCache(drive_, t, settings.cache, *clock_, caps ? &*caps : nullptr);
+        if (settings.cache == CacheSetting::Auto) detectedCache_ = cacheCheck_;
+    }
+    settings_.options.cacheDefeat = cacheCheck_.method;
+    settings_.options.flushSectors = cacheCheck_.flushSectors;
+    cacheFallback_.clear();
     ripped_.clear();
     accurateRip_ = {};
     accurateRipChecked_ = false;
@@ -222,6 +237,11 @@ const RippedTrack& RipSession::ripTrack(int number, const std::filesystem::path&
         // The drive rejected C2 reads: plain reads for the rest of the disc.
         settings_.options.useC2 = false;
         c2Fallback_ = ripper.c2FallbackReason();
+    }
+    if (ripper.cacheDefeat() != settings_.options.cacheDefeat) {
+        // The drive rejected FUA: flush for the rest of the rip.
+        settings_.options.cacheDefeat = ripper.cacheDefeat();
+        cacheFallback_ = ripper.cacheFallbackReason();
     }
     ripped.accurateRipV1 = ar.v1();
     ripped.accurateRipV2 = ar.v2();
@@ -286,8 +306,9 @@ std::string RipSession::ripLog() {
     std::ostringstream log;
     log << "cdreader " << CDREADER_VERSION << " (Android) rip log\n"
         << "Drive: " << driveName() << "\n"
-        << c2_.logLine() << "\n"
-        << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
+        << c2_.logLine() << "\n";
+    for (const std::string& l : cacheCheck_.logLines()) log << l << "\n";
+    log << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
         << "Read offset correction: " << (options.readOffsetSamples > 0 ? "+" : "") << options.readOffsetSamples
         << " samples\n"
@@ -337,6 +358,7 @@ std::string RipSession::ripLog() {
             log << "  (" << r.result.paddedSamples << " samples outside the disc padded with silence)";
         log << "\n";
         for (const std::string& l : c2LogLines(r.result)) log << l << "\n";
+        for (const std::string& l : cacheLogLines(r.result)) log << l << "\n";
     }
 
     if (accurateRipChecked_) {

@@ -22,6 +22,7 @@
 #include "cdreader/cddb.h"
 #include "cdreader/crc32.h"
 #include "cdreader/cue_sheet.h"
+#include "cdreader/drive_cache.h"
 #include "cdreader/file_naming.h"
 #include "cdreader/gaps.h"
 #include "cdreader/metadata.h"
@@ -52,7 +53,8 @@ void printUsage() {
         "cdreader %s - CD audio ripper\n"
         "\n"
         "Usage:\n"
-        "  cdreader drives                       List optical drives (and C2 pointer support)\n"
+        "  cdreader drives                       List optical drives (C2 pointer support,\n"
+        "                                        cache size)\n"
         "  cdreader toc <drive> [options]        Show the table of contents and disc info\n"
         "                        (CDDB options, --no-isrc and --no-gaps)\n"
         "  cdreader rip <drive> [options]        Rip audio tracks (see --format)\n"
@@ -83,6 +85,12 @@ void printUsage() {
         "                        report them (MODE SENSE) read with C2 bits, and\n"
         "                        sectors with C2 errors are re-read (up to --retries\n"
         "                        times); unresolved ones are logged as suspicious\n"
+        "      --cache <mode>    Defeat the drive's read cache before re-reads (verify\n"
+        "                        second read, retries, C2 re-reads) so that they read\n"
+        "                        the disc again: auto (default: test the drive once,\n"
+        "                        a few seconds), fua (READ(12) with FUA, fast, only\n"
+        "                        some drives), flush (read more than the cache size\n"
+        "                        elsewhere first, any drive, slower), none\n"
         "      --no-accuraterip  Do not look up the AccurateRip database after ripping\n"
         "      --single-file     Rip the tracks into one file (an image of the disc);\n"
         "                        the CUE sheet then marks the track positions. FLAC\n"
@@ -338,8 +346,13 @@ int cmdDrives() {
     for (char letter : letters) {
         try {
             OpenedDrive d = openDrive(letter);
-            std::printf("%c:  %s  [%s]\n", letter, d.info.displayName().c_str(),
-                        cdr::checkC2(*d.drive, true).logLine().c_str());
+            // The cache test needs a disc and takes seconds: rip --cache auto runs it.
+            const cdr::DriveCapabilities caps = d.drive->readCapabilities();
+            const std::string cache = !caps.valid      ? "cache size unknown"
+                                      : caps.bufferKB ? "cache " + std::to_string(caps.bufferKB) + " KB"
+                                                      : "cache size not reported";
+            std::printf("%c:  %s  [%s, %s]\n", letter, d.info.displayName().c_str(),
+                        cdr::checkC2(caps, true).logLine().c_str(), cache.c_str());
         } catch (const std::exception& e) {
             std::printf("%c:  (%s)\n", letter, e.what());
         }
@@ -460,6 +473,7 @@ int cmdRip(const std::vector<std::string>& args) {
     bool gapDetection = true;
     bool ripHtoa = false;
     bool useC2 = true;
+    cdr::CacheSetting cacheSetting = cdr::CacheSetting::Auto;
     cdr::EncoderSettings encoder;
 
     for (size_t i = 2; i < args.size(); ++i) {
@@ -481,6 +495,10 @@ int cmdRip(const std::vector<std::string>& args) {
         else if (a == "--htoa") ripHtoa = true;
         else if (a == "--verify") options.verify = true;
         else if (a == "--no-c2") useC2 = false;
+        else if (a == "--cache") {
+            if (!cdr::parseCacheSetting(value(), cacheSetting))
+                throw UsageError("invalid --cache mode '" + args[i] + "' (auto, fua, flush or none)");
+        }
         else if (parseCddbOption(args, i, cddb)) continue;
         else if (a == "--no-accuraterip") accurateRip = false;
         else if (a == "--single-file") singleFile = true;
@@ -522,10 +540,22 @@ int cmdRip(const std::vector<std::string>& args) {
     std::printf("Drive: %s\n", d.info.displayName().c_str());
 
     // C2 error pointers (#33): only for drives that report them.
-    const cdr::C2Availability c2 = cdr::checkC2(*d.drive, useC2);
+    const cdr::DriveCapabilities caps = d.drive->readCapabilities();
+    const cdr::C2Availability c2 = cdr::checkC2(caps, useC2);
     options.useC2 = c2.usable();
     const std::string c2Line = c2.logLine() + (useC2 ? "" : " (--no-c2)");
     std::printf("%s\n", c2Line.c_str());
+
+    // Drive cache defeat for re-reads (#34).
+    if (cacheSetting == cdr::CacheSetting::Auto) {
+        std::printf("Testing the drive cache...");
+        std::fflush(stdout);
+    }
+    const cdr::DriveCacheCheck cache = cdr::checkDriveCache(*d.drive, toc, cacheSetting, cdr::steadyClock(), &caps);
+    if (cacheSetting == cdr::CacheSetting::Auto) std::printf("\r");
+    std::printf("%s\n", cache.logLine().c_str());
+    options.cacheDefeat = cache.method;
+    options.flushSectors = cache.flushSectors;
 
     // MCN / ISRC are optional too: a drive that cannot read them only means
     // no CATALOG / ISRC lines and tags.
@@ -592,8 +622,9 @@ int cmdRip(const std::vector<std::string>& args) {
     std::ofstream log(dir / "rip.log");
     log << "cdreader " << kVersion << " rip log\n"
         << "Drive: " << d.info.displayName() << "\n"
-        << c2Line << "\n"
-        << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
+        << c2Line << "\n";
+    for (const std::string& l : cache.logLines()) log << l << "\n";
+    log << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
         << "Read offset correction: " << (options.readOffsetSamples > 0 ? "+" : "") << options.readOffsetSamples
         << " samples\n"
@@ -707,12 +738,17 @@ int cmdRip(const std::vector<std::string>& args) {
         if (r.c2ErrorSectors)
             notes += "  (C2 errors in " + std::to_string(r.c2ErrorSectors) + " sector(s), " +
                      std::to_string(r.c2Rereads) + " re-reads)";
+        if (r.cacheDefeats)
+            notes += "  (" + std::to_string(r.cacheDefeats) +
+                     (r.flushSectorsRead ? " cache flushes)" : " FUA commands)");
         std::printf("  CRC32 %s  %s%s\n", hex32(r.crc32).c_str(), status.c_str(), notes.c_str());
         if (!r.c2Fallback.empty()) std::printf("  C2 reads given up: %s\n", r.c2Fallback.c_str());
+        if (!r.cacheFallback.empty()) std::printf("  FUA given up: %s\n", r.cacheFallback.c_str());
         log << name << "  CRC32 " << hex32(r.crc32) << "  retries " << r.retries << "  " << status;
         if (r.paddedSamples) log << "  (" << r.paddedSamples << " samples outside the disc padded with silence)";
         log << "\n";
         for (const std::string& l : cdr::c2LogLines(r)) log << l << "\n";
+        for (const std::string& l : cdr::cacheLogLines(r)) log << l << "\n";
         if (!r.clean()) ++problems;
         if (!htoa) arTracks.push_back({t, ar.v1(), ar.v2()});
     }

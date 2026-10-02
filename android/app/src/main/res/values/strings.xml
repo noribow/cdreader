@@ -11,6 +11,14 @@
     <string name="advanced_collapsed">▶ 詳細設定</string>
     <string name="advanced_expanded">▼ 詳細設定</string>
     <string name="use_c2">C2 エラーポインタを使う (対応ドライブのみ)</string>
+    <string name="cache_mode">キャッシュ対策</string>
+    <!-- Order = NativeCd CacheMode (auto, FUA, flush, none). -->
+    <string-array name="cache_modes">
+        <item>自動</item>
+        <item>FUA</item>
+        <item>追い出し</item>
+        <item>なし</item>
+    </string-array>
     <string name="format">形式</string>
     <string name="format_flac">FLAC</string>
     <string name="format_oggflac">Ogg FLAC</string>

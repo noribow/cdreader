@@ -36,11 +36,13 @@ object NativeCd {
         maxRetries: Int,
         verify: Boolean,
         useC2: Boolean,
+        cacheMode: Int,
     )
     @JvmStatic external fun nativeRipTrack(handle: Long, track: Int, path: String, listener: RipProgressListener?): IntArray
     @JvmStatic external fun nativeCheckAccurateRip(handle: Long, enabled: Boolean, http: HttpGet?): IntArray
     @JvmStatic external fun nativeAccurateRipError(handle: Long): String
     @JvmStatic external fun nativeC2Status(handle: Long): Int
+    @JvmStatic external fun nativeCacheStatus(handle: Long): IntArray
     @JvmStatic external fun nativeRipLog(handle: Long): String
 }
 
@@ -98,12 +100,41 @@ data class RipResult(
     val c2Unresolved: Int,
     /** Output sectors at suspicious positions (listed in rip.log). */
     val suspiciousSectors: Int,
+    /** FUA commands or cache flushes sent before re-reads (#34). */
+    val cacheDefeats: Int,
 ) {
     val clean: Boolean get() = unreadableSectors == 0 && suspiciousSectors == 0
 }
 
 /** C2 error pointers of a rip (see [CdSession.c2Status]). */
 enum class C2Status { DISABLED, NOT_SUPPORTED, USED, GIVEN_UP }
+
+/**
+ * Drive cache defeat before re-reads (#34), in the order of the 詳細設定
+ * spinner (R.array.cache_modes); [code] is what nativeBeginRip expects.
+ */
+enum class CacheMode(val code: Int, val key: String) {
+    AUTO(0, "auto"), FUA(1, "fua"), FLUSH(2, "flush"), NONE(3, "none");
+
+    companion object {
+        fun fromKey(key: String?): CacheMode = CacheMode.entries.firstOrNull { it.key == key } ?: AUTO
+    }
+}
+
+/** Result of the cache test of [CacheMode.AUTO] (NOT_TESTED for the other modes). */
+enum class CacheResult { NOT_TESTED, NO_CACHE, FUA_WORKS, FUA_IGNORED, FUA_REJECTED, UNKNOWN }
+
+/** What a rip does before re-reads. */
+enum class CacheMethod { NONE, FUA, FLUSH }
+
+data class CacheStatus(
+    val result: CacheResult,
+    val method: CacheMethod,
+    /** Buffer size reported by the drive, 0 if unknown. */
+    val cacheKb: Int,
+    /** The drive rejected FUA during the rip: flushes from then on. */
+    val fuaGivenUp: Boolean,
+)
 
 enum class AccurateRipStatus { FOUND, NOT_FOUND, ERROR, DISABLED }
 
@@ -191,9 +222,21 @@ class CdSession private constructor(private val handle: Long) : Closeable {
     /**
      * Starts a rip ([format]: a name from [NativeCd.nativeFormats]); forgets the results of the previous one.
      * [useC2]: read with C2 error pointers when the drive supports them.
+     * [cacheMode]: drive cache defeat; [CacheMode.AUTO] tests the drive once per disc (a few seconds).
      */
-    fun beginRip(format: String, readOffset: Int, maxRetries: Int, verify: Boolean, useC2: Boolean) =
-        NativeCd.nativeBeginRip(handle, format, readOffset, maxRetries, verify, useC2)
+    fun beginRip(format: String, readOffset: Int, maxRetries: Int, verify: Boolean, useC2: Boolean, cacheMode: CacheMode) =
+        NativeCd.nativeBeginRip(handle, format, readOffset, maxRetries, verify, useC2, cacheMode.code)
+
+    /** The drive cache check of the current rip (known after [beginRip]). */
+    fun cacheStatus(): CacheStatus {
+        val v = NativeCd.nativeCacheStatus(handle)
+        return CacheStatus(
+            CacheResult.entries.getOrElse(v[0]) { CacheResult.UNKNOWN },
+            CacheMethod.entries.getOrElse(v[1]) { CacheMethod.NONE },
+            v[2],
+            v[3] != 0,
+        )
+    }
 
     /** Whether the current rip reads with C2 error pointers (known after [beginRip]). */
     fun c2Status(): C2Status = when (NativeCd.nativeC2Status(handle)) {
@@ -210,7 +253,7 @@ class CdSession private constructor(private val handle: Long) : Closeable {
      */
     fun ripTrack(track: Int, path: String, listener: RipProgressListener?): RipResult {
         val v = NativeCd.nativeRipTrack(handle, track, path, listener)
-        return RipResult(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7] != 0, v[8], v[9], v[10], v[11])
+        return RipResult(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7] != 0, v[8], v[9], v[10], v[11], v[12])
     }
 
     /** Compares the tracks ripped since [beginRip] with the AccurateRip database. Never fails for network problems. */

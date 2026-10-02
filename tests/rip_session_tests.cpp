@@ -89,6 +89,12 @@ struct Rig {
     cdr::usb::BulkOnlyTransport bot{device, 0};
     cdr::CdDrive drive{bot};
     cdr::RipSession session{drive};
+    // The cache detection (#34) times the fake drive's simulated commands; a
+    // small reported buffer, so that the 10 second disc has room for its flush.
+    Rig() {
+        fake.bufferKB = 200;
+        session.setClock(fake);
+    }
 };
 
 // The reference: a track ripped straight from a FakeDrive with the core ripper.
@@ -861,7 +867,9 @@ TEST(c2_errors_in_results_and_rip_log) {
     CHECK_EQ(rig.session.problemTracks(), 1);
 
     const std::string log = rig.session.ripLog();
-    CHECK(contains(log, "Drive: FAKE CD-ROM DRIVE (1.00)\nC2 pointers: supported\nMode: burst"));
+    CHECK(contains(log, "Drive: FAKE CD-ROM DRIVE (1.00)\nC2 pointers: supported\nDrive cache: 200 KB, "
+                        "no audio caching detected (method: none)\nCache test (26 sectors): re-read 32.2 ms, after "
+                        "flush 32.2 ms, after FUA 32.2 ms\nMode: burst"));
     CHECK(contains(log, "Track01.wav  CRC32 "));
     CHECK(contains(log, "  OK\n  C2 errors: 1 sector(s), 1 re-read(s) (1 recovered, 0 identical re-reads with C2, "
                         "0 unresolved)\n"));
@@ -914,6 +922,108 @@ TEST(c2_fallback_lasts_for_the_rest_of_the_rip) {
     rig.session.beginRip(settings("wav"));
     CHECK(rig.session.ripSettings().options.useC2);
     CHECK(rig.session.c2Fallback().empty());
+}
+
+// Drive cache defeat (#34) over the BOT: the Auto setting detects the cache
+// once per disc, verify reads send FUA, rip.log shows both.
+TEST(cache_detection_once_per_disc_and_rip_log) {
+    Rig rig;
+    rig.fake.cacheSectors = 100;
+    FakeDrive::C2Fault f;  // silently wrong on the first read: verify needs the disc again
+    f.reads = 1;
+    f.flagged = false;
+    rig.fake.c2Faults[100] = f;
+    cdr::RipSettings s = settings("wav");
+    s.options.verify = true;
+    CHECK(s.cache == cdr::CacheSetting::Auto);
+    rig.session.beginRip(s);
+    const cdr::DriveCacheCheck& check = rig.session.cacheCheck();
+    CHECK(check.result == cdr::DriveCacheCheck::Result::FuaWorks);
+    CHECK(rig.session.ripSettings().options.cacheDefeat == cdr::CacheDefeat::Fua);
+    const int detectionFua = rig.fake.fuaCommands;
+    CHECK_EQ(detectionFua, 3);
+
+    TempDir dir;
+    const cdr::RippedTrack t = rig.session.ripTrack(1, dir.path / "1.wav");
+    CHECK(t.result.clean());
+    CHECK_EQ(t.result.crc32, referenceRip(1).crc32);
+    CHECK_EQ(t.result.retries, 1u);
+    CHECK_EQ(t.result.cacheDefeats, 12u + 2u);  // 12 verify reads, the retry's two reads
+    CHECK_EQ(rig.fake.fuaCommands, detectionFua + 14);
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "\nDrive cache: 200 KB, caches audio, FUA works (method: fua)\nCache test (26 sectors): re-read "
+                        "1.0 ms, after flush 32.2 ms, after FUA 32.2 ms\nMode: verify (double read)"));
+    CHECK(contains(log, "retries 1  OK\n  Cache defeat: 14 FUA command(s)\n"));
+
+    // The next rip of the same disc keeps the result, a new disc runs the test again.
+    rig.session.beginRip(s);
+    CHECK(rig.session.cacheCheck().result == cdr::DriveCacheCheck::Result::FuaWorks);
+    CHECK_EQ(rig.fake.fuaCommands, detectionFua + 14);
+    rig.session.readToc();
+    rig.session.beginRip(s);
+    CHECK_EQ(rig.fake.fuaCommands, detectionFua + 14 + 3);
+    // Another setting does not need the test.
+    s.cache = cdr::CacheSetting::Flush;
+    rig.session.beginRip(s);
+    CHECK(rig.session.ripSettings().options.cacheDefeat == cdr::CacheDefeat::Flush);
+    CHECK_EQ(rig.session.ripSettings().options.flushSectors, 114u);
+    CHECK(contains(rig.session.ripLog(), "\nDrive cache: 200 KB, method: flush (forced), 114 sectors per flush\n"));
+}
+
+// "None" sends no cache command at all (not even MODE SENSE without C2):
+// the commands of a rip before #34.
+TEST(cache_none_setting_over_usb) {
+    for (bool c2 : {false, true}) {
+        Rig rig;
+        rig.fake.cacheSectors = 100;
+        rig.fake.c2Supported = true;
+        cdr::RipSettings s = settings("wav");
+        s.useC2 = c2;
+        s.cache = cdr::CacheSetting::None;
+        s.readDiscCodes = false;
+        s.detectGaps = false;
+        rig.session.readToc();
+        rig.device.opcodes.clear();
+        rig.session.beginRip(s);
+        CHECK(rig.session.ripSettings().options.cacheDefeat == cdr::CacheDefeat::None);
+        CHECK(rig.device.opcodes == (c2 ? std::vector<uint8_t>{0x5A} : std::vector<uint8_t>{}));
+        TempDir dir;
+        rig.session.ripTrack(2, dir.path / "2.wav");
+        CHECK(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xA8)) == 0);
+        CHECK(contains(rig.session.ripLog(), c2 ? "\nDrive cache: 200 KB, method: none (disabled)\nMode: burst"
+                                                : "\nDrive cache: method: none (disabled)\nMode: burst"));
+    }
+}
+
+// FUA chosen but rejected during the rip: flush for the rest of the rip.
+TEST(cache_fua_fallback_over_usb) {
+    Rig rig;
+    rig.fake.cacheSectors = 100;
+    cdr::RipSettings s = settings("wav");
+    s.options.verify = true;
+    s.cache = cdr::CacheSetting::Fua;
+    rig.session.beginRip(s);
+    CHECK(rig.session.ripSettings().options.cacheDefeat == cdr::CacheDefeat::Fua);
+    rig.fake.fuaSupported = false;  // e.g. accepted for the probe LBA only
+    TempDir dir;
+    const cdr::RippedTrack t1 = rig.session.ripTrack(1, dir.path / "1.wav");
+    CHECK_EQ(t1.result.crc32, referenceRip(1).crc32);
+    CHECK(!t1.result.cacheFallback.empty());
+    CHECK(rig.session.ripSettings().options.cacheDefeat == cdr::CacheDefeat::Flush);
+    CHECK(rig.session.cacheFallback() == t1.result.cacheFallback);
+    const cdr::RippedTrack t2 = rig.session.ripTrack(2, dir.path / "2.wav");
+    CHECK(t2.result.cacheDefeat == cdr::CacheDefeat::Flush);
+    CHECK(t2.result.cacheFallback.empty());
+    CHECK(t2.result.flushSectorsRead > 0);
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "\n  FUA given up: READ(12) with FUA rejected at LBA 0 (SCSI status 0x02, sense ILLEGAL REQUEST"));
+    CHECK(contains(log, "\nDrive cache: 200 KB, method: fua (forced)\n"));
+    CHECK(contains(log, " flush(es), "));
+    // A rejecting drive at beginRip: flush from the start.
+    rig.session.beginRip(s);
+    CHECK(rig.session.ripSettings().options.cacheDefeat == cdr::CacheDefeat::Flush);
+    CHECK(rig.session.cacheCheck().result == cdr::DriveCacheCheck::Result::FuaRejected);
+    CHECK(rig.session.cacheFallback().empty());
 }
 
 int main() {

@@ -19,6 +19,8 @@
 #include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
+#include "cdreader/clock.h"
+#include "cdreader/drive_cache.h"
 #include "cdreader/gaps.h"
 #include "cdreader/http.h"
 #include "cdreader/metadata.h"
@@ -53,6 +55,9 @@ struct RipSettings {
     // Read with C2 error pointers when the drive supports them (#33);
     // beginRip() checks the drive and sets options.useC2 accordingly.
     bool useC2 = true;
+    // Drive cache defeat for re-reads (#34); beginRip() decides the method
+    // (Auto: a timing test, once per disc) and sets options.cacheDefeat.
+    CacheSetting cache = CacheSetting::Auto;
 };
 
 struct RippedTrack {
@@ -87,11 +92,15 @@ class RipSession {
 public:
     explicit RipSession(CdDrive& drive) : drive_(drive) {}
 
+    // The clock of the cache detection (default: steadyClock()); tests use
+    // the fake drive's simulated time. `clock` must outlive the session.
+    void setClock(Clock& clock) { clock_ = &clock; }
+
     // INQUIRY display name (cached after the first call).
     const std::string& driveName();
 
-    // Reads the TOC (again) and forgets the metadata and rip results of the
-    // previous disc.
+    // Reads the TOC (again) and forgets the metadata, the cache detection and
+    // the rip results of the previous disc.
     const Toc& readToc();
     // The TOC read last, read now if there is none yet.
     const Toc& toc();
@@ -125,17 +134,24 @@ public:
     std::string trackFileName(int number, const std::string& format);
 
     // Starts a rip: validates the settings, forgets earlier rip results,
-    // clears a pending cancel and reads the MCN / ISRCs and detects the gaps
-    // if not done yet for this disc (settings.readDiscCodes / detectGaps).
-    // Throws std::invalid_argument.
+    // clears a pending cancel, checks C2 support and the drive cache (one
+    // MODE SENSE when either is wanted; the cache timing test of the Auto
+    // setting only once per disc) and reads the MCN / ISRCs and detects the
+    // gaps if not done yet for this disc (settings.readDiscCodes /
+    // detectGaps). Throws std::invalid_argument.
     void beginRip(const RipSettings& settings);
     // As used: options.useC2 is what the drive allows (and false after a
-    // fallback to plain reads during the rip).
+    // fallback to plain reads during the rip), options.cacheDefeat the method
+    // of the cache check (Flush after the drive rejected FUA during the rip).
     const RipSettings& ripSettings() const { return settings_; }
     // C2 support found by beginRip() (Disabled before it or when !useC2).
     const C2Availability& c2Availability() const { return c2_; }
     // Why C2 reads were given up during this rip (empty: they were not).
     const std::string& c2Fallback() const { return c2Fallback_; }
+    // The drive cache check of beginRip() (setting None before it).
+    const DriveCacheCheck& cacheCheck() const { return cacheCheck_; }
+    // Why FUA was given up during this rip (empty: it was not).
+    const std::string& cacheFallback() const { return cacheFallback_; }
 
     // Rips one audio track to `path` (a seekable local file: WAV, FLAC and Ogg
     // FLAC headers are patched when the file is closed), computing its AccurateRip
@@ -174,6 +190,10 @@ private:
     RipSettings settings_;
     C2Availability c2_;
     std::string c2Fallback_;
+    Clock* clock_ = &steadyClock();
+    DriveCacheCheck cacheCheck_;
+    std::optional<DriveCacheCheck> detectedCache_;  // Auto: the timing test of this disc
+    std::string cacheFallback_;
     std::vector<RippedTrack> ripped_;
     AccurateRipReport accurateRip_;
     bool accurateRipChecked_ = false;

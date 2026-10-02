@@ -106,6 +106,26 @@
             android:layout_height="wrap_content"
             android:checked="true"
             android:text="@string/use_c2" />
+
+        <!-- Drive cache defeat before re-reads (#34): 自動 / FUA / 追い出し / なし. -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/cache_mode" />
+
+            <Spinner
+                android:id="@+id/spinnerCache"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:entries="@array/cache_modes" />
+        </LinearLayout>
     </LinearLayout>
 
     <LinearLayout
