@@ -20,6 +20,7 @@ endif()
 
 # --- Platform independent core (shared with the future Android port) --------
 add_library(cdreader_core STATIC
+  core/src/accuraterip.cpp
   core/src/audio_writer.cpp
   core/src/cddb.cpp
   core/src/cd_drive.cpp

@@ -12,13 +12,14 @@
 #include <string>
 #include <vector>
 
+#include "cdreader/accuraterip.h"
 #include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
+#include "cdreader/crc32.h"
 #include "cdreader/file_naming.h"
 #include "cdreader/http.h"
 #include "cdreader/metadata.h"
-#include "cdreader/crc32.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
 #include "cdreader/toc.h"
@@ -713,6 +714,523 @@ TEST(file_names_from_metadata) {
     CHECK(cdr::albumDirectoryName(album) == "Artist_Name - Album");
     album.artist = album.title;
     CHECK(cdr::albumDirectoryName(album) == "Album");
+}
+
+// --- AccurateRip --------------------------------------------------------------
+// Reference values were cross-checked with an independent reimplementation of
+// ARver / whipper (which reproduces ARver's own published test vectors).
+
+namespace {
+
+// Builds a TOC from audio track lengths like ARver's DiscInfo.from_track_lengths:
+// the first track starts after `pregap` sectors (hidden track), an optional
+// data track follows in a second session (Enhanced CD).
+cdr::Toc tocFromLengths(const std::vector<uint32_t>& lengths, uint32_t pregap, uint32_t dataLength) {
+    cdr::Toc toc;
+    uint32_t lba = pregap;
+    int number = 1;
+    for (uint32_t length : lengths) {
+        cdr::Track t;
+        t.number = number++;
+        t.startLba = lba;
+        t.lengthSectors = length;
+        toc.tracks.push_back(t);
+        lba += length;
+    }
+    if (dataLength) {
+        cdr::Track t;
+        t.number = number++;
+        t.startLba = lba + cdr::kSessionGapSectors;
+        t.lengthSectors = dataLength;
+        t.isAudio = false;
+        toc.tracks.push_back(t);
+        lba = t.startLba + dataLength;
+    }
+    toc.firstTrack = 1;
+    toc.lastTrack = number - 1;
+    toc.leadOutLba = lba;
+    return toc;
+}
+
+std::vector<uint8_t> samplesToBytes(const std::vector<uint32_t>& samples) {
+    std::vector<uint8_t> bytes;
+    for (uint32_t s : samples)
+        for (int i = 0; i < 4; ++i) bytes.push_back(uint8_t(s >> (8 * i)));
+    return bytes;
+}
+
+std::string bytesToString(const std::vector<uint8_t>& v) { return std::string(v.begin(), v.end()); }
+
+// Real database responses (from ARver's test data).
+const std::vector<uint8_t> kDbar001 = {
+    0x01, 0xfd, 0x41, 0x04, 0x00, 0xfb, 0x83, 0x08, 0x00, 0x01, 0x88, 0x0e, 0x02, 0x07, 0x1e,
+    0x54, 0x16, 0x27, 0x6b, 0xca, 0xd5, 0x07, 0x01, 0xfd, 0x41, 0x04, 0x00, 0xfb, 0x83, 0x08,
+    0x00, 0x01, 0x88, 0x0e, 0x02, 0x06, 0x86, 0x54, 0x34, 0x80, 0x00, 0x00, 0x00, 0x00};
+const std::vector<uint8_t> kDbar013 = {
+    0x0d, 0x91, 0x67, 0x20, 0x00, 0x82, 0x6a, 0x48, 0x01, 0x0d, 0xde, 0x10, 0xa7, 0x02, 0xa2, 0x6e, 0xe2,
+    0xe4, 0x44, 0xef, 0x9f, 0x36, 0x02, 0x6c, 0x4b, 0x21, 0xcf, 0xe8, 0x70, 0xa3, 0x3c, 0x02, 0x0e, 0x63,
+    0x84, 0x21, 0x20, 0x57, 0xc4, 0x83, 0x02, 0xa9, 0x20, 0x2a, 0xd0, 0xf6, 0x4b, 0xde, 0x38, 0x02, 0x82,
+    0x85, 0xef, 0x55, 0x89, 0x83, 0x36, 0x90, 0x02, 0xbd, 0x8a, 0x7c, 0xcf, 0xa6, 0x6c, 0x72, 0xad, 0x02,
+    0xba, 0xc1, 0xd9, 0x48, 0x36, 0xbe, 0x5d, 0x6f, 0x02, 0xda, 0x75, 0x6c, 0x46, 0x10, 0x75, 0x6f, 0x1b,
+    0x02, 0x23, 0x9e, 0x46, 0xf9, 0x6f, 0x9a, 0x2e, 0x91, 0x02, 0x71, 0x59, 0x84, 0x56, 0xdf, 0xd4, 0x0e,
+    0x1b, 0x02, 0x9a, 0xa1, 0xd1, 0x51, 0x11, 0xb2, 0x02, 0x1d, 0x02, 0x73, 0xfa, 0xb3, 0x8a, 0x56, 0xb6,
+    0x81, 0xf3, 0x02, 0xde, 0xe0, 0x49, 0x86, 0xe3, 0xca, 0x83, 0xd5};
+
+// Returns the same response to every request (AccurateRip lookups).
+class CannedHttp : public cdr::HttpClient {
+public:
+    cdr::HttpResponse response;
+    std::vector<std::string> requests;
+
+    cdr::HttpResponse get(const std::string& url) override {
+        requests.push_back(url);
+        return response;
+    }
+};
+
+cdr::HttpResponse httpReply(int status, std::string body = {}) {
+    cdr::HttpResponse r;
+    r.ok = true;
+    r.status = status;
+    r.body = std::move(body);
+    return r;
+}
+
+// Rips every audio track of `fake` and returns the AccurateRip checksums.
+std::vector<std::pair<uint32_t, uint32_t>> ripAccurateRip(FakeDrive& fake, int offset) {
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    cdr::RipOptions options;
+    options.readOffsetSamples = offset;
+    cdr::Ripper ripper(drive, toc, options);
+    std::vector<std::pair<uint32_t, uint32_t>> sums;
+    for (const cdr::Track& t : toc.tracks) {
+        if (!t.isAudio) continue;
+        cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, t);
+        ripper.ripTrack(t, [&](const uint8_t* p, size_t n) { ar.update(p, n); });
+        CHECK_EQ(ar.samples(), t.lengthSectors * cdr::kSamplesPerSector);
+        sums.emplace_back(ar.v1(), ar.v2());
+    }
+    return sums;
+}
+
+}  // namespace
+
+TEST(accuraterip_disc_ids_match_reference) {
+    // Real discs (ARver test vectors; Enhanced CD ids as computed by EAC / dBpoweramp).
+    struct Case {
+        std::vector<uint32_t> lengths;
+        uint32_t pregap;
+        uint32_t data;
+        const char* id;
+    };
+    const Case cases[] = {
+        {{75258, 54815, 205880}, 0, 0, "003-00084264-001cc184-19117f03"},
+        {{279037}, 0, 0, "001-000441fd-000883fb-020e8801"},
+        {{107450, 71470, 105737, 71600}, 33, 0, "004-000e26d9-00380804-3e128e04"},
+        {{143963}, 32, 0, "001-0002329b-00046516-02077f01"},
+        {{12617, 27720, 22738, 30185, 24705, 33750, 32475, 30920, 32195, 22880}, 0, 52066,
+         "010-00164419-00b9f6e2-9e11600b"},
+        {{90778}, 0, 164721, "001-00041293-00082527-100de602"},
+        {{14765, 14932, 12508, 525, 20937, 6025, 19753, 35570, 17777, 15258, 23515, 18512, 26168, 13440}, 12375, 0,
+         "014-001ba337-01281b14-cf0c7b0e"},
+    };
+    for (const Case& c : cases) {
+        const std::string id = cdr::AccurateRipDiscId::fromToc(tocFromLengths(c.lengths, c.pregap, c.data)).toString();
+        if (id != c.id) std::fprintf(stderr, "  got %s, expected %s\n", id.c_str(), c.id);
+        CHECK(id == c.id);
+    }
+}
+
+TEST(accuraterip_disc_id_mixed_mode_skips_data_track) {
+    // "Mortal Kombat Trilogy": data track 1 followed by 28 audio tracks.
+    const uint32_t starts[] = {150,    66728,  76502,  85963,  93760,  104048, 116066, 124743, 134206, 142916,
+                               151852, 160720, 169425, 178731, 188459, 196711, 206354, 214845, 223686, 225746,
+                               226384, 232668, 239447, 239931, 244989, 254264, 260066, 261222, 261674};
+    cdr::Toc toc;
+    int number = 1;
+    for (uint32_t s : starts) {
+        cdr::Track t;
+        t.number = number++;
+        t.startLba = s - cdr::kPregapSectors;
+        t.isAudio = t.number != 1;
+        toc.tracks.push_back(t);
+    }
+    toc.leadOutLba = 261976 - cdr::kPregapSectors;
+    const cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(toc);
+    CHECK(id.toString() == "028-00517a54-05a845d2-af0da31d");
+    // The database slots follow the TOC: the first audio track is the 2nd entry.
+    CHECK_EQ(cdr::accurateRipEntryIndex(toc, toc.tracks[1]), 1u);
+}
+
+TEST(accuraterip_disc_id_from_enhanced_cd_toc) {
+    FakeDrive fake({{0, false}, {20000, false}, {50000, true}}, 60000);
+    cdr::CdDrive drive(fake);
+    const cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(drive.readToc());
+    CHECK(id.toString() == "002-00013880-00035b61-26032003");
+}
+
+TEST(accuraterip_url) {
+    cdr::AccurateRipDiscId id;
+    id.audioTracks = 1;
+    id.id1 = 0x000441fd;
+    id.id2 = 0x000883fb;
+    id.cddb = 0x020e8801;
+    CHECK(id.url() ==
+          "http://www.accuraterip.com/accuraterip/d/f/1/dBAR-001-000441fd-000883fb-020e8801.bin");
+}
+
+TEST(accuraterip_checksum_hand_computed) {
+    // Middle track: every sample counts, weighted by its 1-based position.
+    cdr::AccurateRipChecksum ones(1000, false, false);
+    const std::vector<uint8_t> one = samplesToBytes(std::vector<uint32_t>(1000, 1));
+    ones.update(one.data(), one.size());
+    CHECK_EQ(ones.v1(), 1000u * 1001u / 2);
+    CHECK_EQ(ones.v2(), 1000u * 1001u / 2);  // products never exceed 32 bits
+
+    // k * 0xFFFFFFFF = (k - 1) << 32 | (2^32 - k): low parts -6, high parts 0+1+2.
+    cdr::AccurateRipChecksum big(3, false, false);
+    const std::vector<uint8_t> max = samplesToBytes({0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu});
+    big.update(max.data(), max.size());
+    CHECK_EQ(big.v1(), 0xFFFFFFFAu);
+    CHECK_EQ(big.v2(), 0xFFFFFFFDu);
+
+    // Little-endian sample layout: left channel in the low 16 bits.
+    cdr::AccurateRipChecksum layout(2, false, false);
+    const uint8_t pcm[] = {0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+    layout.update(pcm, sizeof pcm);
+    CHECK_EQ(layout.v1(), 0x00020001u + 2u * 0x01000000u);
+}
+
+TEST(accuraterip_checksum_skips_disc_edges) {
+    const uint32_t n = 10000;
+    const std::vector<uint8_t> pcm = samplesToBytes(std::vector<uint32_t>(n, 1));
+    auto sum = [](uint64_t from, uint64_t to) { return uint32_t((from + to) * (to - from + 1) / 2); };
+
+    cdr::AccurateRipChecksum first(n, true, false);  // samples 1..2939 are ignored
+    first.update(pcm.data(), pcm.size());
+    CHECK_EQ(first.v1(), sum(2940, n));
+
+    cdr::AccurateRipChecksum last(n, false, true);  // the last 2940 samples are ignored
+    last.update(pcm.data(), pcm.size());
+    CHECK_EQ(last.v1(), sum(1, n - 2940));
+
+    cdr::AccurateRipChecksum only(n, true, true);
+    only.update(pcm.data(), pcm.size());
+    CHECK_EQ(only.v1(), sum(2940, n - 2940));
+
+    cdr::AccurateRipChecksum tiny(100, true, true);  // shorter than the skipped area
+    tiny.update(pcm.data(), 400);
+    CHECK_EQ(tiny.v1(), 0u);
+    CHECK_EQ(tiny.v2(), 0u);
+}
+
+TEST(accuraterip_checksum_accepts_any_chunking) {
+    const std::vector<uint8_t> pcm = expectedTrackData(450, 300);
+    cdr::AccurateRipChecksum whole(300 * cdr::kSamplesPerSector, false, true);
+    whole.update(pcm.data(), pcm.size());
+    cdr::AccurateRipChecksum pieces(300 * cdr::kSamplesPerSector, false, true);
+    for (size_t pos = 0, step = 1; pos < pcm.size(); pos += step, step = step % 13 + 1)
+        pieces.update(pcm.data() + pos, std::min(step, pcm.size() - pos));
+    CHECK_EQ(pieces.v1(), whole.v1());
+    CHECK_EQ(pieces.v2(), whole.v2());
+    CHECK_EQ(pieces.v1(), 0xe3ee9e80u);
+    CHECK_EQ(pieces.v2(), 0xa44d0069u);
+}
+
+TEST(accuraterip_checksums_of_ripped_disc) {
+    struct Case {
+        int offset;
+        uint32_t sums[3][2];
+    };
+    const Case cases[] = {
+        {0, {{0xf3408d0eu, 0xc2c91b16u}, {0x81a4a0aau, 0xf5917daau}, {0xe3ee9e80u, 0xa44d0069u}}},
+        {667, {{0x32ba416bu, 0x0242f822u}, {0xb9f72160u, 0x2de4a772u}, {0x3ed7b001u, 0xff3300b7u}}},
+        {-30, {{0x40d6ed75u, 0x1061c380u}, {0xdaa17a10u, 0x4e8e8285u}, {0x7583966bu, 0x35e06f7fu}}},
+    };
+    for (const Case& c : cases) {
+        FakeDrive fake = makeAudioDisc();
+        const auto sums = ripAccurateRip(fake, c.offset);
+        CHECK_EQ(sums.size(), 3u);
+        for (size_t i = 0; i < sums.size() && i < 3; ++i) {
+            CHECK_EQ(sums[i].first, c.sums[i][0]);
+            CHECK_EQ(sums[i].second, c.sums[i][1]);
+        }
+    }
+    FakeDrive single({{0, false}}, 300);  // first and last track at once
+    const auto sums = ripAccurateRip(single, 0);
+    CHECK_EQ(sums.size(), 1u);
+    CHECK_EQ(sums[0].first, 0x4e62a386u);
+    CHECK_EQ(sums[0].second, 0x0e99968du);
+}
+
+TEST(accuraterip_last_audio_track_of_enhanced_cd) {
+    FakeDrive fake({{0, false}, {300, false}, {5000, true}}, 6000);
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    // Track 2 ends the audio session: its last 5 sectors are skipped.
+    const cdr::Track& track = *toc.findTrack(2);
+    const uint32_t samples = track.lengthSectors * cdr::kSamplesPerSector;
+    const std::vector<uint8_t> pcm = expectedTrackData(300, track.lengthSectors);
+    cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, track);
+    cdr::AccurateRipChecksum last(samples, false, true);
+    cdr::AccurateRipChecksum middle(samples, false, false);
+    ar.update(pcm.data(), pcm.size());
+    last.update(pcm.data(), pcm.size());
+    middle.update(pcm.data(), pcm.size());
+    CHECK_EQ(ar.v1(), last.v1());
+    CHECK(ar.v1() != middle.v1());
+}
+
+TEST(accuraterip_parses_database_response) {
+    std::vector<cdr::AccurateRipPressing> p = cdr::parseAccurateRipResponse(bytesToString(kDbar001));
+    CHECK_EQ(p.size(), 2u);
+    CHECK(p[0].id.toString() == "001-000441fd-000883fb-020e8801");
+    CHECK(p[1].id == p[0].id);
+    CHECK_EQ(p[0].tracks.size(), 1u);
+    CHECK_EQ(p[0].tracks[0].confidence, 7);
+    CHECK_EQ(p[0].tracks[0].checksum, 655774750u);
+    CHECK_EQ(p[0].tracks[0].frame450Checksum, 0x07d5ca6bu);
+    CHECK_EQ(p[1].tracks[0].confidence, 6);
+    CHECK_EQ(p[1].tracks[0].checksum, 2150913158u);
+
+    p = cdr::parseAccurateRipResponse(bytesToString(kDbar013));
+    CHECK_EQ(p.size(), 1u);
+    CHECK(p[0].id.toString() == "013-00206791-01486a82-a710de0d");
+    CHECK_EQ(p[0].tracks.size(), 13u);
+    CHECK_EQ(p[0].tracks[0].checksum, 3840044706u);
+    CHECK_EQ(p[0].tracks[1].checksum, 3475065708u);
+    CHECK_EQ(p[0].tracks[12].checksum, 0x8649e0deu);
+    CHECK_EQ(p[0].tracks[12].confidence, 2);
+
+    for (size_t cut : {size_t(5), size_t(13), size_t(50), kDbar013.size() - 1}) {
+        bool threw = false;
+        try {
+            cdr::parseAccurateRipResponse(bytesToString(kDbar013).substr(0, cut));
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+    CHECK(cdr::parseAccurateRipResponse("").empty());
+}
+
+TEST(accuraterip_matching) {
+    const std::vector<cdr::AccurateRipPressing> p = cdr::parseAccurateRipResponse(bytesToString(kDbar001));
+    cdr::AccurateRipTrackResult r = cdr::matchAccurateRip(p, 0, 1, 655774750u, 1u);
+    CHECK(r.accurate() && r.inDatabase());
+    CHECK_EQ(r.v1Confidence, 7);
+    CHECK_EQ(r.v2Confidence, 0);
+    CHECK_EQ(r.totalConfidence, 13);
+    CHECK(r.matchedVersion() == "v1");
+    CHECK(r.describe() == "Accurately ripped with v1 (v2 0, v1 7 of 13 submissions; 1 of 2 pressings)");
+    CHECK_EQ(r.pressings.size(), 2u);
+    if (r.pressings.size() == 2) {
+        CHECK_EQ(r.pressings[0].pressing, 1);
+        CHECK_EQ(r.pressings[0].confidence, 7);
+        CHECK_EQ(r.pressings[0].checksum, 655774750u);
+        CHECK_EQ(r.pressings[0].version, 1);
+        CHECK_EQ(r.pressings[1].pressing, 2);
+        CHECK_EQ(r.pressings[1].confidence, 6);
+        CHECK_EQ(r.pressings[1].version, 0);
+    }
+
+    r = cdr::matchAccurateRip(p, 0, 1, 1u, 2150913158u);
+    CHECK_EQ(r.v2Confidence, 6);
+    CHECK(r.matchedVersion() == "v2");
+    CHECK(r.describe() == "Accurately ripped with v2 (v2 6, v1 0 of 13 submissions; 1 of 2 pressings)");
+    CHECK(r.pressings.size() == 2 && r.pressings[1].version == 2 && r.pressings[0].version == 0);
+
+    r = cdr::matchAccurateRip(p, 0, 1, 655774750u, 2150913158u);
+    CHECK_EQ(r.confidence(), 13);
+    CHECK_EQ(r.matchingPressings(), 2);
+    CHECK(r.describe() == "Accurately ripped with v1+v2 (v2 6, v1 7 of 13 submissions; 2 of 2 pressings)");
+
+    r = cdr::matchAccurateRip(p, 0, 1, 1u, 2u);
+    CHECK(!r.accurate() && r.inDatabase());
+    CHECK(r.matchedVersion().empty());
+    CHECK(r.describe() == "Not accurate (v2 0, v1 0 of 13 submissions; 0 of 2 pressings)");
+
+    r = cdr::matchAccurateRip(p, 1, 2, 1u, 2u);  // no entry (e.g. last track of a Mixed Mode CD)
+    CHECK(!r.inDatabase());
+    CHECK(r.describe() == "Not in database");
+
+    // Zero-confidence placeholders never match, not even a silent track's 0.
+    cdr::AccurateRipPressing placeholder;
+    placeholder.tracks.resize(1);
+    r = cdr::matchAccurateRip({placeholder}, 0, 1, 0u, 0u);
+    CHECK(!r.inDatabase() && !r.accurate());
+}
+
+TEST(accuraterip_lookup) {
+    cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(tocFromLengths({279037}, 0, 0));
+    CannedHttp http;
+    http.response = httpReply(200, bytesToString(kDbar001));
+    cdr::AccurateRipLookup l = cdr::lookupAccurateRip(http, id);
+    CHECK(l.status == cdr::AccurateRipLookup::Status::Found);
+    CHECK_EQ(l.pressings.size(), 2u);
+    CHECK_EQ(http.requests.size(), 1u);
+    CHECK(http.requests[0] == id.url());
+
+    http.response = httpReply(404, "<html>Not Found</html>");
+    l = cdr::lookupAccurateRip(http, id);
+    CHECK(l.status == cdr::AccurateRipLookup::Status::NotFound);
+    CHECK(l.pressings.empty());
+
+    http.response = cdr::HttpResponse{};
+    http.response.error = "no network";
+    l = cdr::lookupAccurateRip(http, id);
+    CHECK(l.status == cdr::AccurateRipLookup::Status::Error);
+    CHECK(l.error == "no network");
+
+    http.response = httpReply(500);
+    CHECK(cdr::lookupAccurateRip(http, id).status == cdr::AccurateRipLookup::Status::Error);
+
+    http.response = httpReply(200, bytesToString(kDbar013));  // another disc's record
+    l = cdr::lookupAccurateRip(http, id);
+    CHECK(l.status == cdr::AccurateRipLookup::Status::Error);
+    CHECK(l.pressings.empty());
+
+    http.response = httpReply(200, bytesToString(kDbar001).substr(0, 30));  // truncated
+    CHECK(cdr::lookupAccurateRip(http, id).status == cdr::AccurateRipLookup::Status::Error);
+
+    http.response = httpReply(200, "");
+    CHECK(cdr::lookupAccurateRip(http, id).status == cdr::AccurateRipLookup::Status::Error);
+}
+
+TEST(accuraterip_offset_scan_matches_direct_checksums) {
+    // The single-pass scan must equal ripping with each offset separately,
+    // including the skipped edges of the first / last track and the silence
+    // outside the disc.
+    const uint32_t maxOffset = 700;
+    for (int number = 1; number <= 3; ++number) {
+        FakeDrive fake = makeAudioDisc();
+        cdr::CdDrive drive(fake);
+        cdr::Toc toc = drive.readToc();
+        const cdr::Track& track = *toc.findTrack(number);
+        const std::vector<uint32_t> sums =
+            cdr::scanReadOffsets(drive, toc, track, maxOffset, {}).checksums();
+        CHECK_EQ(sums.size(), size_t(2 * maxOffset + 1));
+        for (int offset : {-700, -699, -588, -1, 0, 1, 6, 667, 699, 700}) {
+            FakeDrive again = makeAudioDisc();
+            OffsetRip rip = ripWithOffset(again, number, offset);
+            cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, track);
+            ar.update(rip.bytes.data(), rip.bytes.size());
+            CHECK_EQ(sums[size_t(offset + int(maxOffset))], ar.v1());
+        }
+    }
+}
+
+TEST(accuraterip_offset_detection) {
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    const cdr::Track& track = *toc.findTrack(2);
+    auto v1At = [&](int offset) {
+        FakeDrive other = makeAudioDisc();
+        OffsetRip rip = ripWithOffset(other, 2, offset);
+        cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, track);
+        ar.update(rip.bytes.data(), rip.bytes.size());
+        return ar.v1();
+    };
+    // Two pressings: rips made with +48 (confidence 5) and -472 (confidence 2).
+    std::vector<cdr::AccurateRipPressing> pressings(2);
+    for (cdr::AccurateRipPressing& p : pressings) p.tracks.resize(3);
+    pressings[0].tracks[1] = {5, v1At(48), 0};
+    pressings[1].tracks[1] = {2, v1At(-472), 0};
+
+    const cdr::AccurateRipOffsetScan scan = cdr::scanReadOffsets(drive, toc, track, 1000, {});
+    const std::vector<cdr::AccurateRipOffsetMatch> found = cdr::findAccurateRipOffsets(scan, pressings, 1);
+    CHECK_EQ(found.size(), 2u);
+    if (found.size() == 2) {
+        CHECK_EQ(found[0].offset, 48);
+        CHECK_EQ(found[0].confidence(), 5);
+        CHECK_EQ(found[0].v1Confidence, 5);
+        CHECK(found[0].matchedVersion() == "v1");
+        CHECK_EQ(found[1].offset, -472);
+        CHECK_EQ(found[1].confidence(), 2);
+    }
+    CHECK(cdr::findAccurateRipOffsets(scan, pressings, 0).empty());
+}
+
+// Track checksums ripped separately at `offset` (reference for the scan).
+static cdr::AccurateRipChecksum checksumAtOffset(const cdr::Toc& toc, int number, int offset) {
+    FakeDrive fake = makeAudioDisc();
+    OffsetRip rip = ripWithOffset(fake, number, offset);
+    cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, *toc.findTrack(number));
+    ar.update(rip.bytes.data(), rip.bytes.size());
+    return ar;
+}
+
+TEST(accuraterip_offset_scan_v2_matches_direct_checksums) {
+    const uint32_t maxOffset = 700;
+    for (int number = 1; number <= 3; ++number) {
+        FakeDrive fake = makeAudioDisc();
+        cdr::CdDrive drive(fake);
+        cdr::Toc toc = drive.readToc();
+        const cdr::AccurateRipOffsetScan scan =
+            cdr::scanReadOffsets(drive, toc, *toc.findTrack(number), maxOffset, {});
+        const std::vector<uint32_t> residues = scan.v2Residues();
+        CHECK_EQ(residues.size(), size_t(2 * maxOffset + 1));
+        for (int offset : {-700, -699, -588, -1, 0, 1, 6, 667, 699, 700}) {
+            const uint32_t v2 = checksumAtOffset(toc, number, offset).v2();
+            CHECK_EQ(scan.v2Checksum(offset), v2);
+            // The residue filter must never reject the true checksum.
+            CHECK(scan.mayMatchV2(residues[size_t(offset + int(maxOffset))], v2));
+        }
+    }
+}
+
+TEST(accuraterip_v2_residue_filter_is_exact_and_selective) {
+    // Every offset: the residue equals the exact sum mod 2^32 - 1, the true v2
+    // always passes, and unrelated checksums are almost always rejected.
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    const uint32_t maxOffset = 300;
+    const cdr::AccurateRipOffsetScan scan = cdr::scanReadOffsets(drive, toc, *toc.findTrack(2), maxOffset, {});
+    const std::vector<uint32_t> residues = scan.v2Residues();
+    int falsePositives = 0;
+    for (size_t i = 0; i < residues.size(); ++i) {
+        const int offset = int(i) - int(maxOffset);
+        const uint32_t v2 = scan.v2Checksum(offset);
+        CHECK(scan.mayMatchV2(residues[i], v2));
+        falsePositives += scan.mayMatchV2(residues[i], v2 ^ 0x5A5A5A5Au) ? 1 : 0;
+    }
+    CHECK(falsePositives < 5);
+}
+
+TEST(accuraterip_offset_detection_with_v2) {
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    // Pressing 1 only has v2 rips made at +48, pressing 2 v1 rips at +48,
+    // pressing 3 v2 rips at -472.
+    std::vector<cdr::AccurateRipPressing> pressings(3);
+    for (cdr::AccurateRipPressing& p : pressings) p.tracks.resize(3);
+    pressings[0].tracks[1] = {9, checksumAtOffset(toc, 2, 48).v2(), 0};
+    pressings[1].tracks[1] = {4, checksumAtOffset(toc, 2, 48).v1(), 0};
+    pressings[2].tracks[1] = {3, checksumAtOffset(toc, 2, -472).v2(), 0};
+
+    const cdr::AccurateRipOffsetScan scan = cdr::scanReadOffsets(drive, toc, *toc.findTrack(2), 1000, {});
+    const std::vector<cdr::AccurateRipOffsetMatch> found = cdr::findAccurateRipOffsets(scan, pressings, 1);
+    CHECK_EQ(found.size(), 2u);
+    if (found.size() == 2) {
+        CHECK_EQ(found[0].offset, 48);
+        CHECK_EQ(found[0].v2Confidence, 9);
+        CHECK_EQ(found[0].v1Confidence, 4);
+        CHECK_EQ(found[0].pressings, 2);
+        CHECK(found[0].matchedVersion() == "v1+v2");
+        CHECK_EQ(found[1].offset, -472);
+        CHECK_EQ(found[1].v2Confidence, 3);
+        CHECK_EQ(found[1].v1Confidence, 0);
+        CHECK(found[1].matchedVersion() == "v2");
+    }
+
+    // A disc with v2 entries only (the case v1-only detection missed).
+    pressings.erase(pressings.begin() + 1);
+    const std::vector<cdr::AccurateRipOffsetMatch> v2Only = cdr::findAccurateRipOffsets(scan, pressings, 1);
+    CHECK(!v2Only.empty() && v2Only[0].offset == 48 && v2Only[0].v1Confidence == 0);
 }
 
 int main() {
