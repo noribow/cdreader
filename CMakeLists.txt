@@ -46,6 +46,7 @@ add_library(cdreader_core STATIC
   core/src/resampler.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp
+  core/src/subchannel.cpp
   core/src/tags.cpp
   core/src/toc.cpp
   core/src/wav_writer.cpp
@@ -155,8 +156,15 @@ if(CDREADER_BUILD_TESTS)
   add_executable(cdreader_flac_cuesheet_check tests/flac_cuesheet_check.cpp)
   target_link_libraries(cdreader_flac_cuesheet_check PRIVATE cdreader_core)
   find_program(METAFLAC_EXECUTABLE metaflac)
+  find_program(FFPROBE_EXECUTABLE ffprobe)
   if(FLAC_EXECUTABLE AND METAFLAC_EXECUTABLE)
-    add_test(NAME flac_cuesheet COMMAND cdreader_flac_cuesheet_check "${FLAC_EXECUTABLE}" "${METAFLAC_EXECUTABLE}")
+    # ffprobe is optional (tag check of single tracks, #22).
+    set(_ffprobe_arg)
+    if(FFPROBE_EXECUTABLE)
+      set(_ffprobe_arg "${FFPROBE_EXECUTABLE}")
+    endif()
+    add_test(NAME flac_cuesheet COMMAND cdreader_flac_cuesheet_check "${FLAC_EXECUTABLE}" "${METAFLAC_EXECUTABLE}"
+             ${_ffprobe_arg})
   else()
     add_test(NAME flac_cuesheet COMMAND cdreader_flac_cuesheet_check)
   endif()

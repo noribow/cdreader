@@ -32,6 +32,7 @@
 #include "cdreader/resampler.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
+#include "cdreader/subchannel.h"
 #include "cdreader/tags.h"
 #include "cdreader/toc.h"
 #include "cdreader/wav_writer.h"
@@ -2008,6 +2009,7 @@ namespace {
 
 // Independent reader for the CUESHEET metadata block (FLAC format spec).
 struct ParsedCueSheet {
+    std::string mcn;  // up to the first NUL
     uint64_t leadIn = 0;
     bool isCd = false;
     struct Index {
@@ -2019,6 +2021,7 @@ struct ParsedCueSheet {
         int number;
         bool audio;
         bool preEmphasis;
+        std::string isrc;
         std::vector<Index> indexes;
     };
     std::vector<CueTrackEntry> tracks;
@@ -2044,6 +2047,7 @@ std::vector<uint8_t> flacBlock(const std::vector<uint8_t>& file, int type) {
 
 ParsedCueSheet parseCueSheet(const std::vector<uint8_t>& b) {
     ParsedCueSheet c;
+    c.mcn = std::string(reinterpret_cast<const char*>(b.data()), 128).c_str();
     size_t pos = 128;
     c.leadIn = be64At(b, pos);
     pos += 8;
@@ -2056,6 +2060,7 @@ ParsedCueSheet parseCueSheet(const std::vector<uint8_t>& b) {
         e.number = b[pos + 8];
         e.audio = (b[pos + 21] & 0x80) == 0;
         e.preEmphasis = (b[pos + 21] & 0x40) != 0;
+        e.isrc = std::string(reinterpret_cast<const char*>(b.data() + pos + 9), 12).c_str();
         const int indexes = b[pos + 35];
         pos += 36;
         for (int i = 0; i < indexes; ++i, pos += 12) e.indexes.push_back({be64At(b, pos), b[pos + 8]});
@@ -2067,9 +2072,9 @@ ParsedCueSheet parseCueSheet(const std::vector<uint8_t>& b) {
 
 cdr::EmbeddedCueSheet sampleEmbeddedCue() {
     cdr::EmbeddedCueSheet cue;
-    cue.tracks = {{1, "Image.flac", 0, false, false, "One", ""},
-                  {2, "Image.flac", 30, true, true, "Two", ""},
-                  {3, "Image.flac", 75, false, false, "Three", ""}};
+    cue.tracks = {{1, "Image.flac", 0, false, false, "One", "", ""},
+                  {2, "Image.flac", 30, true, true, "Two", "", ""},
+                  {3, "Image.flac", 75, false, false, "Three", "", ""}};
     cue.totalSectors = 100;
     cue.text = "\xEF\xBB\xBF" "FILE \"Image.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
     return cue;
@@ -2986,6 +2991,334 @@ TEST(vorbis_writer_decodes_close_to_input) {
 #endif  // CDREADER_HAVE_VORBIS
 
 }  // namespace
+
+// --- MCN / ISRC from the Q sub-channel (#22) ------------------------------------
+
+namespace {
+
+// A format 02h / 03h response as a drive returns it.
+std::vector<uint8_t> subChannelResponse(uint8_t format, int track, bool valid, const std::string& code) {
+    std::vector<uint8_t> r(24, 0);
+    r[3] = 20;
+    r[4] = format;
+    if (format == 0x03) {
+        r[5] = 0x30;
+        r[6] = uint8_t(track);
+    }
+    r[8] = valid ? 0x80 : 0x00;
+    std::memcpy(r.data() + 9, code.data(), std::min(code.size(), size_t(format == 0x02 ? 13 : 12)));
+    return r;
+}
+
+using Status = cdr::SubChannelCode::Status;
+
+}  // namespace
+
+TEST(mcn_and_isrc_validation) {
+    CHECK(cdr::isValidMcn("4988001234567"));
+    CHECK(cdr::isValidMcn("0075678263927"));
+    CHECK(!cdr::isValidMcn("0000000000000"));  // "no MCN" on some drives
+    CHECK(!cdr::isValidMcn("498800123456"));   // 12 digits
+    CHECK(!cdr::isValidMcn("498800123456A"));
+    CHECK(!cdr::isValidMcn(std::string("498800123456\0", 13)));
+    CHECK(cdr::isValidIsrc("JPVI09912345"));
+    CHECK(cdr::isValidIsrc("USRC17607839"));
+    CHECK(cdr::isValidIsrc("GBAYE0601498"));
+    CHECK(!cdr::isValidIsrc("jpvi09912345"));   // lower case
+    CHECK(!cdr::isValidIsrc("JP-VI0-99-12345"));
+    CHECK(!cdr::isValidIsrc("J1VI09912345"));   // country: letters only
+    CHECK(!cdr::isValidIsrc("JPV-09912345"));   // registrant: letters or digits
+    CHECK(!cdr::isValidIsrc("JPVI0A912345"));   // year: digits
+    CHECK(!cdr::isValidIsrc("JPVI099123X5"));   // designation: digits
+    CHECK(!cdr::isValidIsrc("000000000000"));
+    CHECK(!cdr::isValidIsrc(""));
+}
+
+TEST(subchannel_cdb_bytes) {
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    drive.readMcn();
+    // READ SUB-CHANNEL, SubQ, format 02h, allocation length 24.
+    CHECK(fake.lastSubChannelCdb == std::vector<uint8_t>({0x42, 0x00, 0x40, 0x02, 0, 0, 0, 0x00, 24, 0}));
+    drive.readIsrc(3);
+    CHECK(fake.lastSubChannelCdb == std::vector<uint8_t>({0x42, 0x00, 0x40, 0x03, 0, 0, 3, 0x00, 24, 0}));
+    uint8_t buf[16];
+    drive.readSubChannel(cdr::SubChannelFormat::CurrentPosition, 5, buf, sizeof buf, true);
+    // MSF bit set, track ignored for the current position format.
+    CHECK(fake.lastSubChannelCdb == std::vector<uint8_t>({0x42, 0x02, 0x40, 0x01, 0, 0, 0, 0x00, 16, 0}));
+    CHECK_EQ(fake.subChannelCommands, 3);
+    // Track numbers outside 1..99 never reach the drive.
+    CHECK(drive.readIsrc(0).status == Status::Invalid);
+    CHECK(drive.readIsrc(100).status == Status::Invalid);
+    CHECK_EQ(fake.subChannelCommands, 3);
+}
+
+TEST(read_mcn_and_isrc_from_drive) {
+    FakeDrive fake = makeAudioDisc();
+    fake.mcn = "4988001234567";
+    fake.isrcs[1] = "JPVI09912345";
+    fake.isrcs[3] = "USRC17607839";
+    cdr::CdDrive drive(fake);
+    const cdr::SubChannelCode mcn = drive.readMcn();
+    CHECK(mcn.found() && mcn.value == "4988001234567");
+    CHECK(mcn.describe() == "4988001234567");
+    CHECK(drive.readIsrc(1).value == "JPVI09912345");
+    CHECK(drive.readIsrc(2).status == Status::NotPresent);  // TCVal = 0
+    CHECK(drive.readIsrc(2).describe() == "not present");
+    CHECK(drive.readIsrc(3).value == "USRC17607839");
+}
+
+TEST(subchannel_not_present_and_garbage) {
+    // MCVal = 0, or MCVal = 1 with all zeros: no MCN.
+    std::vector<uint8_t> r = subChannelResponse(0x02, 0, false, "4988001234567");
+    CHECK(cdr::parseMcnResponse(r.data(), r.size()).status == Status::NotPresent);
+    r = subChannelResponse(0x02, 0, true, "0000000000000");
+    CHECK(cdr::parseMcnResponse(r.data(), r.size()).status == Status::NotPresent);
+    r = subChannelResponse(0x02, 0, true, "4988001234567");
+    CHECK(cdr::parseMcnResponse(r.data(), r.size()).value == "4988001234567");
+    // Malformed codes with the valid bit set.
+    r = subChannelResponse(0x02, 0, true, "49880012\x01" "4567");
+    cdr::SubChannelCode c = cdr::parseMcnResponse(r.data(), r.size());
+    CHECK(c.status == Status::Invalid && c.value.empty());
+    CHECK(c.describe() == "invalid response (MCN \"49880012?4567\")");
+    r = subChannelResponse(0x03, 2, true, "jp-vi0991234");
+    CHECK(cdr::parseIsrcResponse(r.data(), r.size(), 2).status == Status::Invalid);
+    r = subChannelResponse(0x03, 2, true, std::string(12, '\0'));
+    CHECK(cdr::parseIsrcResponse(r.data(), r.size(), 2).status == Status::NotPresent);
+    r = subChannelResponse(0x03, 2, false, "JPVI09912345");
+    CHECK(cdr::parseIsrcResponse(r.data(), r.size(), 2).status == Status::NotPresent);
+    // An answer for another track, or with the track left at 0.
+    r = subChannelResponse(0x03, 3, true, "JPVI09912345");
+    CHECK(cdr::parseIsrcResponse(r.data(), r.size(), 2).status == Status::Invalid);
+    r = subChannelResponse(0x03, 0, true, "JPVI09912345");
+    CHECK(cdr::parseIsrcResponse(r.data(), r.size(), 2).value == "JPVI09912345");
+    // Wrong format code, too small data length, short transfer.
+    r = subChannelResponse(0x03, 1, true, "JPVI09912345");
+    CHECK(cdr::parseMcnResponse(r.data(), r.size()).status == Status::Invalid);
+    r = subChannelResponse(0x02, 0, true, "4988001234567");
+    r[3] = 12;
+    CHECK(cdr::parseMcnResponse(r.data(), r.size()).status == Status::Invalid);
+    r[3] = 20;
+    CHECK(cdr::parseMcnResponse(r.data(), 23).status == Status::Invalid);
+    CHECK(cdr::parseMcnResponse(r.data(), 0).status == Status::Invalid);
+    CHECK(cdr::parseMcnResponse(nullptr, 24).status == Status::Invalid);
+
+    // The same through the drive.
+    FakeDrive fake = makeAudioDisc();
+    fake.mcn = "12345";  // MCVal set, then 5 digits and NULs
+    fake.isrcs[1] = "JPVI0991234";  // 11 characters
+    cdr::CdDrive drive(fake);
+    CHECK(drive.readMcn().status == Status::Invalid);
+    CHECK(drive.readIsrc(1).status == Status::Invalid);
+    fake.mcn = "4988001234567";
+    fake.subChannelTransferLimit = 20;  // the drive returns fewer bytes than asked for
+    c = drive.readMcn();
+    CHECK(c.status == Status::Invalid);
+    CHECK(c.detail == "short response (20 of 24 bytes)");
+}
+
+TEST(subchannel_unsupported_and_errors) {
+    FakeDrive fake = makeAudioDisc();
+    fake.mcn = "4988001234567";
+    fake.subChannelSupported = false;  // ILLEGAL REQUEST, invalid command operation code
+    cdr::CdDrive drive(fake);
+    CHECK(drive.readMcn().status == Status::Unsupported);
+    CHECK(drive.readIsrc(1).status == Status::Unsupported);
+    CHECK(drive.readMcn().describe() == "not supported by the drive");
+
+    fake.subChannelSupported = true;
+    fake.discPresent = false;  // NOT READY: another failure
+    const cdr::SubChannelCode c = drive.readMcn();
+    CHECK(c.status == Status::Failed);
+    CHECK(c.detail.find("NOT READY") != std::string::npos);
+
+    cdr::ScsiResult transport;
+    transport.error = "device gone";
+    CHECK(cdr::subChannelError(transport).status == Status::Failed);
+    CHECK(cdr::subChannelError(transport).describe() == "read failed (device gone)");
+}
+
+TEST(read_disc_codes_for_tracks) {
+    // Track 2 is a data track: no ISRC read.
+    FakeDrive fake({{0, false}, {300, true}, {450, false}}, 750);
+    fake.mcn = "4988001234567";
+    fake.isrcs[1] = "JPVI09912345";
+    fake.isrcs[2] = "JPVI09900000";
+    fake.isrcs[3] = "bad";
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscCodes codes = cdr::readDiscCodes(drive, toc.tracks);
+    CHECK(codes.read);
+    CHECK_EQ(fake.subChannelCommands, 3);
+    CHECK(codes.mcnValue() == "4988001234567");
+    CHECK_EQ(codes.isrcs.size(), 2u);
+    CHECK(codes.isrc(1) == "JPVI09912345");
+    CHECK(codes.isrc(2).empty());
+    CHECK(codes.isrc(3).empty());
+    CHECK(codes.isrcs.at(3).status == Status::Invalid);
+    const std::vector<std::string> lines = codes.logLines();
+    CHECK(lines == std::vector<std::string>({"MCN: 4988001234567", "Track  1  ISRC: JPVI09912345",
+                                             "Track  3  ISRC: invalid response (ISRC \"bad\")"}));
+
+    cdr::AlbumMetadata album = sampleAlbum();
+    album.trackIsrcs = {"OLD", "OLD", "OLD"};
+    codes.applyTo(album);
+    CHECK(album.mcn == "4988001234567");
+    CHECK(album.trackIsrcs == std::vector<std::string>({"JPVI09912345"}));
+    CHECK(album.forTrack(1, 3).isrc == "JPVI09912345");
+    CHECK(album.forTrack(1, 3).mcn == "4988001234567");
+    CHECK(album.forTrack(3, 3).isrc.empty());
+    CHECK(album.forTrack(0, 3).isrc.empty() && album.forTrack(0, 3).mcn == "4988001234567");
+
+    // A drive that rejects the command is asked once only.
+    FakeDrive old = makeAudioDisc();
+    old.subChannelSupported = false;
+    cdr::CdDrive oldDrive(old);
+    const cdr::DiscCodes none = cdr::readDiscCodes(oldDrive, oldDrive.readToc().tracks);
+    CHECK_EQ(old.subChannelCommands, 1);
+    CHECK(none.mcn.status == Status::Unsupported);
+    CHECK(none.isrcs.at(3).status == Status::Skipped);
+    CHECK(none.mcnValue().empty() && none.isrc(1).empty());
+    CHECK(none.logLines()[1] == "Track  1  ISRC: not read (command not supported)");
+    CHECK(cdr::DiscCodes{}.logLines() == std::vector<std::string>({"MCN / ISRC: not read (disabled)"}));
+}
+
+// A drive that throws from the transport (e.g. a USB device that went away)
+// must not abort the rip either.
+TEST(read_disc_codes_survives_throwing_transport) {
+    struct Throwing : cdr::ScsiTransport {
+        cdr::ScsiResult execute(const uint8_t*, size_t, void*, size_t, cdr::DataDirection, unsigned) override {
+            throw std::runtime_error("usb gone");
+        }
+    } transport;
+    cdr::CdDrive drive(transport);
+    std::vector<cdr::Track> tracks = {{1, 0, 300}};
+    const cdr::DiscCodes codes = cdr::readDiscCodes(drive, tracks);
+    CHECK(codes.mcn.status == Status::Failed && codes.mcn.detail == "usb gone");
+    CHECK(codes.isrcs.at(1).status == Status::Failed);
+}
+
+TEST(cue_sheet_catalog_and_isrc) {
+    std::vector<cdr::Track> tracks = {{1, 0, 300}, {2, 300, 150}, {3, 450, 300}};
+    tracks[1].preEmphasis = true;
+    cdr::AlbumMetadata album;
+    album.artist = "Artist";
+    album.mcn = "4988001234567";
+    album.trackIsrcs = {"JPVI09912345", "JPVI09912346", "garbage"};
+    const std::string cue = cdr::formatCueSheet(album, cdr::singleFileCueTracks(tracks, "a.flac", album));
+    // CATALOG at disc level; ISRC after TRACK (and FLAGS), before INDEX, as
+    // metaflac --export-cuesheet-to writes them. Invalid codes are left out.
+    CHECK(cue ==
+          "REM COMMENT \"cdreader\"\r\n"
+          "CATALOG 4988001234567\r\n"
+          "PERFORMER \"Artist\"\r\n"
+          "FILE \"a.flac\" WAVE\r\n"
+          "  TRACK 01 AUDIO\r\n"
+          "    PERFORMER \"Artist\"\r\n"
+          "    ISRC JPVI09912345\r\n"
+          "    INDEX 01 00:00:00\r\n"
+          "  TRACK 02 AUDIO\r\n"
+          "    PERFORMER \"Artist\"\r\n"
+          "    FLAGS PRE\r\n"
+          "    ISRC JPVI09912346\r\n"
+          "    INDEX 01 00:04:00\r\n"
+          "  TRACK 03 AUDIO\r\n"
+          "    PERFORMER \"Artist\"\r\n"
+          "    INDEX 01 00:06:00\r\n");
+    keepSample("isrc.cue", std::vector<uint8_t>(cue.begin(), cue.end()));
+    // Per-track sheets carry them too; an invalid MCN is left out.
+    album.mcn = "123";
+    const std::string perTrack =
+        cdr::formatCueSheet(album, cdr::perTrackCueTracks({tracks[0]}, {"01.flac"}, album));
+    CHECK(perTrack.find("CATALOG") == std::string::npos);
+    CHECK(perTrack.find("  TRACK 01 AUDIO\r\n    PERFORMER \"Artist\"\r\n    ISRC JPVI09912345\r\n    INDEX 01") !=
+          std::string::npos);
+}
+
+TEST(flac_cuesheet_block_mcn_and_isrc) {
+    cdr::EmbeddedCueSheet cue = sampleEmbeddedCue();
+    cue.mcn = "4988001234567";
+    cue.tracks[0].isrc = "JPVI09912345";
+    cue.tracks[2].isrc = "JPVI0991234X";  // invalid: left out
+    const std::vector<uint8_t> block = cdr::flac::cueSheet(cue, 100 * 588);
+    CHECK_EQ(block.size(), size_t(396 + 3 * 48 + 36));
+    // 13 ASCII digits, then NUL bytes up to 128.
+    CHECK(str(block, 0, 13) == "4988001234567");
+    CHECK(std::all_of(block.begin() + 13, block.begin() + 128, [](uint8_t b) { return b == 0; }));
+    const ParsedCueSheet c = parseCueSheet(block);
+    CHECK(c.mcn == "4988001234567");
+    CHECK(c.isCd);
+    CHECK_EQ(c.tracks.size(), 4u);
+    if (c.tracks.size() == 4) {
+        CHECK(c.tracks[0].isrc == "JPVI09912345");
+        CHECK(c.tracks[1].isrc.empty());
+        CHECK(c.tracks[2].isrc.empty());
+        CHECK(c.tracks[3].isrc.empty());  // lead-out
+    }
+    // The ISRC is the 12 bytes after the track offset and number.
+    const size_t track1 = 396;
+    CHECK(str(block, track1 + 9, 12) == "JPVI09912345");
+    CHECK_EQ(block[track1 + 21], 0);  // flags follow unchanged
+    // An invalid MCN is not written.
+    cue.mcn = "0000000000000";
+    const std::vector<uint8_t> noMcn = cdr::flac::cueSheet(cue, 100 * 588);
+    CHECK(std::all_of(noMcn.begin(), noMcn.begin() + 128, [](uint8_t b) { return b == 0; }));
+}
+
+TEST(tags_carry_isrc_and_mcn) {
+    cdr::TrackMetadata m = sampleAlbum().forTrack(2, 3);
+    m.isrc = "JPVI09912345";
+    m.mcn = "4988001234567";
+    const std::vector<uint8_t> vc = cdr::vorbisComment(m, "v");
+    const std::string text(vc.begin(), vc.end());
+    CHECK(text.find("ISRC=JPVI09912345") != std::string::npos);
+    CHECK(text.find("BARCODE=4988001234567") != std::string::npos);
+
+    const std::vector<uint8_t> tag = cdr::id3v2Tag(m);
+    const auto f = id3Frames(tag, 0);
+    CHECK(fieldValue(f, "TSRC") == "JPVI09912345");
+    int barcode = 0;
+    for (const auto& [id, value] : f)
+        barcode += id == "TXXX" && value == std::string("BARCODE") + '\0' + "4988001234567";
+    CHECK_EQ(barcode, 1);
+
+    // RIFF INFO has no ISRC field ("ISRC" there means "source"): unchanged.
+    cdr::TrackMetadata plain = m;
+    plain.isrc.clear();
+    plain.mcn.clear();
+    CHECK(cdr::riffInfoChunk(m) == cdr::riffInfoChunk(plain));
+
+    // Without codes nothing is added.
+    const std::vector<uint8_t> none = cdr::vorbisComment(plain, "v");
+    const std::string noneText(none.begin(), none.end());
+    CHECK(noneText.find("ISRC=") == std::string::npos && noneText.find("BARCODE=") == std::string::npos);
+    CHECK(fieldValue(id3Frames(cdr::id3v2Tag(plain), 0), "TSRC") == "<missing>");
+}
+
+TEST(flac_rip_tags_isrc_per_track) {
+    // ISRCs read from the fake drive end up in each track's FLAC tags.
+    FakeDrive fake = makeAudioDisc();
+    fake.mcn = "4988001234567";
+    fake.isrcs[2] = "JPVI09912346";
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::AlbumMetadata album;
+    cdr::readDiscCodes(drive, toc.tracks).applyTo(album);
+    cdr::Ripper ripper(drive, toc, {});
+    for (int n : {1, 2}) {
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() / ("cdreader_isrc_" + std::to_string(n) + ".flac");
+        cdr::FlacWriter writer;
+        writer.open(path, album.forTrack(n, 3));
+        ripper.ripTrack(*toc.findTrack(n), [&](const uint8_t* p, size_t b) { writer.write(p, b); });
+        writer.close();
+        const DecodedFlac d = decodeFlac(readFile(path));
+        std::filesystem::remove(path);
+        const bool hasIsrc = std::find(d.comments.begin(), d.comments.end(), "ISRC=JPVI09912346") != d.comments.end();
+        CHECK_EQ(hasIsrc, n == 2);
+        CHECK(std::find(d.comments.begin(), d.comments.end(), "BARCODE=4988001234567") != d.comments.end());
+    }
+}
 
 int main() {
     for (auto& [name, fn] : registry()) {

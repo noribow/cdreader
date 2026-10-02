@@ -38,6 +38,9 @@ std::vector<uint8_t> riffInfoChunk(const TrackMetadata& m) {
         {"ICRD", m.year},
         {"IGNR", m.genre},
         {"ICMT", m.discId.empty() ? std::string() : "CDDB disc ID " + m.discId},
+        // No ISRC / MCN here: the INFO id "ISRC" means "source" (who supplied
+        // the material), not the recording code, and there is no catalog
+        // number id. The WAV writer's id3 chunk carries both (TSRC, BARCODE).
     };
     std::vector<uint8_t> body = {'I', 'N', 'F', 'O'};
     for (const auto& [id, text] : fields) {
@@ -75,8 +78,10 @@ std::vector<uint8_t> id3v2Tag(const TrackMetadata& m) {
     text("TRCK", trackNumberText(m, true));
     text("TDRC", m.year);
     text("TCON", m.genre);
+    text("TSRC", m.isrc);
     // TXXX: description and value separated by a NUL in the frame's encoding.
     if (!m.discId.empty()) frame("TXXX", std::string("DISCID") + '\0' + m.discId);
+    if (!m.mcn.empty()) frame("TXXX", std::string("BARCODE") + '\0' + m.mcn);
     if (frames.empty()) return {};
 
     std::vector<uint8_t> tag = {'I', 'D', '3', 4, 0, 0};  // version 2.4.0, no flags
@@ -99,6 +104,8 @@ std::vector<uint8_t> vorbisComment(const TrackMetadata& m, const std::string& ve
     add("DATE", m.year);
     add("GENRE", m.genre);
     add("CDDB", m.discId);
+    add("ISRC", m.isrc);
+    add("BARCODE", m.mcn);
     add("CUESHEET", cueSheet);
 
     std::vector<uint8_t> v;

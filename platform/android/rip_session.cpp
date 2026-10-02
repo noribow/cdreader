@@ -99,6 +99,7 @@ const Toc& RipSession::readToc() {
     cddbLookedUp_ = false;
     album_ = {};
     album_.discId = hex32(toc_->cddbId());
+    discCodes_ = {};
     ripped_.clear();
     accurateRip_ = {};
     accurateRipChecked_ = false;
@@ -128,7 +129,15 @@ const CddbLookupResult& RipSession::lookupCddb(HttpClient* http, const CddbSetti
     }
     album_ = cddb_.found ? cddb_.album : AlbumMetadata{};
     album_.discId = hex32(t.cddbId());
+    discCodes_.applyTo(album_);
     return cddb_;
+}
+
+const DiscCodes& RipSession::readDiscCodes() {
+    const Toc& t = toc();
+    discCodes_ = cdr::readDiscCodes(drive_, t.tracks);
+    discCodes_.applyTo(album_);
+    return discCodes_;
 }
 
 TrackMetadata RipSession::trackMetadata(int number) { return album_.forTrack(number, toc().lastTrack); }
@@ -163,6 +172,7 @@ void RipSession::beginRip(const RipSettings& settings) {
     accurateRip_ = {};
     accurateRipChecked_ = false;
     cancelled_ = false;
+    if (settings.readDiscCodes && !discCodes_.read) readDiscCodes();
 }
 
 const RippedTrack& RipSession::ripTrack(int number, const std::filesystem::path& path,
@@ -279,6 +289,8 @@ std::string RipSession::ripLog() {
         const std::string title = trackLabel(track.number);
         log << line << (title.empty() ? "" : "  ") << title << "\n";
     }
+    log << "\n";
+    for (const std::string& l : discCodes_.logLines()) log << l << "\n";
     log << "\n";
 
     if (!cddbLookedUp_ || !cddbSettings_.enabled) {

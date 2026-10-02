@@ -2,8 +2,11 @@
 // by FlacWriter must pass `flac -t`, `metaflac --export-cuesheet-to` must give
 // the expected track positions, and re-importing that sheet with metaflac
 // (which validates it as CD-DA) must produce a byte-identical CUESHEET block.
+// The sheet carries an MCN (CATALOG) and ISRCs (#22), which must survive the
+// round trip. With ffprobe, the ISRC / BARCODE tags of a FLAC track and of a
+// WAV track (ID3 chunk) must be readable as well.
 //
-// Usage: cdreader_flac_cuesheet_check <flac> <metaflac>
+// Usage: cdreader_flac_cuesheet_check <flac> <metaflac> [<ffprobe>]
 // Exits with 77 (reported as "skipped" by ctest) when a tool is missing.
 
 #include <cstdint>
@@ -17,6 +20,7 @@
 
 #include "cdreader/cue_sheet.h"
 #include "cdreader/flac_writer.h"
+#include "cdreader/wav_writer.h"
 
 namespace fs = std::filesystem;
 
@@ -51,6 +55,11 @@ int run(const std::string& command) {
 #endif
 }
 
+std::string lower(std::string s) {
+    for (char& c : s) c = char(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    return s;
+}
+
 int failures = 0;
 
 void check(bool ok, const std::string& what) {
@@ -78,6 +87,8 @@ int main(int argc, char** argv) {
     album.artist = "Artist";
     album.title = "Album";
     album.trackTitles = {"One", "Two", "Three"};
+    album.mcn = "4988001234567";
+    album.trackIsrcs = {"JPVI09912345", "", "USRC17607839"};  // track 2 has none
     std::vector<cdr::Track> tracks(3);
     const uint32_t lengths[] = {200, 150, 301};
     uint32_t lba = 0;
@@ -91,6 +102,7 @@ int main(int argc, char** argv) {
     cdr::EmbeddedCueSheet cue;
     cue.tracks = cdr::singleFileCueTracks(tracks, "image.flac", album);
     cue.totalSectors = lba;
+    cue.mcn = album.mcn;
     cue.text = cdr::formatCueSheet(album, cue.tracks);
 
     cdr::FlacWriter writer;
@@ -105,10 +117,13 @@ int main(int argc, char** argv) {
     check(run(metaflac + " --export-cuesheet-to=" + quote(exported) + " " + quote(image)) == 0,
           "metaflac exports the CUESHEET block");
     const std::string sheet = readText(exported);
-    check(sheet.find("  TRACK 01 AUDIO\n    INDEX 01 00:00:00") != std::string::npos, "track 1 at 00:00:00");
+    check(sheet.find("CATALOG 4988001234567\n") != std::string::npos, "MCN exported as CATALOG");
+    check(sheet.find("  TRACK 01 AUDIO\n    ISRC JPVI09912345\n    INDEX 01 00:00:00") != std::string::npos,
+          "track 1 at 00:00:00 with its ISRC");
     check(sheet.find("  TRACK 02 AUDIO\n    FLAGS PRE\n    INDEX 01 00:02:50") != std::string::npos,
           "track 2 at 00:02:50 (200 sectors) with pre-emphasis");
-    check(sheet.find("  TRACK 03 AUDIO\n    INDEX 01 00:04:50") != std::string::npos, "track 3 at 00:04:50 (350 sectors)");
+    check(sheet.find("  TRACK 03 AUDIO\n    ISRC USRC17607839\n    INDEX 01 00:04:50") != std::string::npos,
+          "track 3 at 00:04:50 (350 sectors) with its ISRC");
     check(sheet.find("REM FLAC__lead-out 170 " + std::to_string(uint64_t(lba) * 588)) != std::string::npos,
           "lead-out at the end of the audio");
 
@@ -118,6 +133,38 @@ int main(int argc, char** argv) {
     check(reimported, "metaflac re-imports the sheet (CD-DA validation)");
     check(reimported && metadataBlock(copy, 5) == metadataBlock(image, 5) && !metadataBlock(image, 5).empty(),
           "re-imported CUESHEET block is byte-identical");
+
+    // ffprobe reads the ISRC (Vorbis comment ISRC, ID3 TSRC) and the MCN
+    // (BARCODE) of single tracks.
+    if (argc > 3 && *argv[3]) {
+        const std::string ffprobe = quote(fs::u8path(argv[3]));
+        const cdr::TrackMetadata track = album.forTrack(1, 3);
+        const std::vector<uint8_t> trackPcm(pcm.begin(), pcm.begin() + 200 * cdr::kSectorBytes);
+        const fs::path flacTrack = dir / "track.flac";
+        const fs::path wavTrack = dir / "track.wav";
+        cdr::FlacWriter flacWriter;
+        flacWriter.open(flacTrack, track);
+        flacWriter.write(trackPcm.data(), trackPcm.size());
+        flacWriter.close();
+        cdr::WavWriter wavWriter;
+        wavWriter.open(wavTrack, track);
+        wavWriter.write(trackPcm.data(), trackPcm.size());
+        wavWriter.close();
+        for (const fs::path& file : {flacTrack, wavTrack}) {
+            const fs::path out = dir / "tags.txt";
+            const int status = run(ffprobe + " -v error -show_entries format_tags -of default=noprint_wrappers=1 " +
+                                   quote(file) + " > " + quote(out) + " 2>&1");
+            const std::string tags = lower(readText(out));
+            // Vorbis comment keys are kept; FFmpeg reports the ID3 frame as TSRC.
+            const std::string isrc = file == wavTrack ? "tag:tsrc=jpvi09912345\n" : "tag:isrc=jpvi09912345\n";
+            const bool ok = status == 0 && tags.find(isrc) != std::string::npos &&
+                            tags.find("tag:barcode=4988001234567\n") != std::string::npos;
+            check(ok, "ffprobe reads ISRC and BARCODE from " + file.filename().string());
+            if (!ok) std::printf("%s\n", readText(out).c_str());
+        }
+    } else {
+        std::printf("ffprobe not available - tag check skipped\n");
+    }
 
     fs::remove_all(dir);
     std::printf("\n%s\n", failures ? "FAILED" : "PASSED");

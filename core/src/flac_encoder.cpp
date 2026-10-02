@@ -1,5 +1,7 @@
 #include "cdreader/flac_encoder.h"
 
+#include "cdreader/subchannel.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -587,7 +589,10 @@ std::vector<uint8_t> cueSheet(const EmbeddedCueSheet& cue, uint64_t leadOutSampl
             throw std::invalid_argument("CUE track starts after the end of the image");
     }
 
-    std::vector<uint8_t> v(128, 0);  // media catalog number: unknown
+    // Media catalog number: ASCII, NUL padded (all NUL: unknown). Only a
+    // valid 13-digit MCN, which metaflac accepts for a CD-DA sheet.
+    std::vector<uint8_t> v(128, 0);
+    if (isValidMcn(cue.mcn)) std::copy(cue.mcn.begin(), cue.mcn.end(), v.begin());
     putBigEndian(v, isCd ? kCdLeadInSamples : 0, 8);
     v.push_back(isCd ? 0x80 : 0x00);
     v.resize(v.size() + 258, 0);
@@ -595,7 +600,9 @@ std::vector<uint8_t> cueSheet(const EmbeddedCueSheet& cue, uint64_t leadOutSampl
     for (const CueTrack& t : cue.tracks) {
         putBigEndian(v, uint64_t(t.startSectors) * kSamplesPerSector, 8);
         v.push_back(uint8_t(t.number));
-        v.resize(v.size() + 12, 0);                          // ISRC: unknown
+        const size_t isrcAt = v.size();
+        v.resize(v.size() + 12, 0);                          // ISRC: 12 ASCII characters, NUL = unknown
+        if (isValidIsrc(t.isrc)) std::copy(t.isrc.begin(), t.isrc.end(), v.begin() + ptrdiff_t(isrcAt));
         v.push_back(uint8_t(t.preEmphasis ? 0x40 : 0x00));   // audio track, pre-emphasis flag
         v.resize(v.size() + 13, 0);
         v.push_back(1);                                      // one index point: INDEX 01 at the track start
