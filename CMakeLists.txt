@@ -23,9 +23,13 @@ add_library(cdreader_core STATIC
   core/src/audio_writer.cpp
   core/src/cd_drive.cpp
   core/src/crc32.cpp
+  core/src/cue_sheet.cpp
+  core/src/file_name.cpp
   core/src/metadata.cpp
+  core/src/ogg.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp
+  core/src/tags.cpp
   core/src/toc.cpp
   core/src/wav_writer.cpp
 )
