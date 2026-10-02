@@ -37,7 +37,7 @@ import java.util.concurrent.Executors
 
 /**
  * Single screen: connect to a USB CD drive, show its TOC (with titles from
- * CDDB), rip the selected tracks to FLAC or WAV files in a folder chosen with
+ * CDDB), rip the selected tracks to FLAC, WAV, Opus or Vorbis files in a folder chosen with
  * the Storage Access Framework and check them against AccurateRip.
  * USB I/O, network lookups and ripping run on one worker thread ([worker]);
  * the native session is only touched from there (except cancel()).
@@ -79,6 +79,8 @@ class MainActivity : Activity() {
     private lateinit var groupFormat: RadioGroup
     private lateinit var radioFlac: RadioButton
     private lateinit var radioWav: RadioButton
+    private lateinit var radioOpus: RadioButton
+    private lateinit var radioVorbis: RadioButton
     private lateinit var progress: ProgressBar
 
     // Owned by the worker thread once opened.
@@ -139,6 +141,8 @@ class MainActivity : Activity() {
         groupFormat = findViewById(R.id.groupFormat)
         radioFlac = findViewById(R.id.radioFlac)
         radioWav = findViewById(R.id.radioWav)
+        radioOpus = findViewById(R.id.radioOpus)
+        radioVorbis = findViewById(R.id.radioVorbis)
         progress = findViewById(R.id.progress)
         textResults.movementMethod = ScrollingMovementMethod()
         applySystemBarInsets(findViewById(R.id.root))
@@ -146,7 +150,11 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         editOffset.setText(prefs.getInt(PREF_OFFSET, 0).toString())
         prefs.getString(PREF_FOLDER, null)?.let { setOutputTree(Uri.parse(it)) }
-        if (prefs.getString(PREF_FORMAT, "flac") == "wav") radioWav.isChecked = true else radioFlac.isChecked = true
+        // Opus / Vorbis are only offered when the native library was built with them.
+        val available = NativeCd.nativeFormats().split(",")
+        for ((format, radio) in formatButtons()) radio.visibility = if (format in available) View.VISIBLE else View.GONE
+        val saved = prefs.getString(PREF_FORMAT, "flac")
+        (formatButtons().firstOrNull { it.first == saved && it.first in available }?.second ?: radioFlac).isChecked = true
         cddbEnabled = prefs.getBoolean(PREF_CDDB, true)
         checkCddb.isChecked = cddbEnabled
         checkAccurateRip.isChecked = prefs.getBoolean(PREF_ACCURATERIP, true)
@@ -445,9 +453,20 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun selectedFormat(): String = if (radioWav.isChecked) "wav" else "flac"
+    private fun formatButtons(): List<Pair<String, RadioButton>> =
+        listOf("flac" to radioFlac, "wav" to radioWav, "opus" to radioOpus, "vorbis" to radioVorbis)
 
-    private fun mimeType(format: String): String = if (format == "flac") "audio/flac" else "audio/x-wav"
+    private fun selectedFormat(): String = formatButtons().firstOrNull { it.second.isChecked }?.first ?: "flac"
+
+    // .opus is not in the MIME type table of older Android versions, whose
+    // document providers would then append ".ogg" to the name; a generic type
+    // keeps the name as given.
+    private fun mimeType(format: String): String = when (format) {
+        "flac" -> "audio/flac"
+        "vorbis" -> "audio/ogg"
+        "opus" -> "application/octet-stream"
+        else -> "audio/x-wav"
+    }
 
     // e.g. "Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2"
     private fun describeAccurateRip(summary: AccurateRipSummary): String {
@@ -486,7 +505,8 @@ class MainActivity : Activity() {
         DocumentsContract.createDocument(contentResolver, parent, mimeType, name)
             ?: throw IOException("$name を作成できませんでした")
 
-    // WAV and FLAC headers are patched at the end, so the file is written
+    // WAV and FLAC headers are patched at the end (and the Ogg pages are
+    // simply written in one go), so the file is written
     // locally and then streamed through the document's ParcelFileDescriptor
     // (providers may hand out non-seekable pipes).
     private fun copyToDocument(source: File, document: Uri) {
@@ -574,8 +594,7 @@ class MainActivity : Activity() {
         checkVerify.isEnabled = !busy
         checkCddb.isEnabled = !busy
         checkAccurateRip.isEnabled = !busy
-        radioFlac.isEnabled = !busy
-        radioWav.isEnabled = !busy
+        for ((_, radio) in formatButtons()) radio.isEnabled = !busy
         spinnerMatch.isEnabled = !busy
         listTracks.isEnabled = !busy
         updateRipButton(busy)

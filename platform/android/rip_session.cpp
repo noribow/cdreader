@@ -152,7 +152,8 @@ std::string RipSession::trackFileName(int number, const std::string& format) {
 }
 
 void RipSession::beginRip(const RipSettings& settings) {
-    if (!createAudioWriter(settings.format)) throw std::invalid_argument("unknown format '" + settings.format + "'");
+    if (!createAudioWriter(settings.format, settings.encoder))  // throws for invalid encoder settings
+        throw std::invalid_argument("unknown format '" + settings.format + "'");
     // Far beyond any real drive (known offsets are within about +-3000 samples).
     if (std::abs(settings.options.readOffsetSamples) > int(100 * kSamplesPerSector))
         throw std::invalid_argument("read offset out of range");
@@ -172,7 +173,7 @@ const RippedTrack& RipSession::ripTrack(int number, const std::filesystem::path&
     if (track == nullptr) throw std::invalid_argument("track " + std::to_string(number) + " is not on this disc");
     if (!track->isAudio) throw std::invalid_argument("track " + std::to_string(number) + " is not an audio track");
 
-    std::unique_ptr<AudioWriter> writer = createAudioWriter(settings_.format);
+    std::unique_ptr<AudioWriter> writer = createAudioWriter(settings_.format, settings_.encoder);
     if (!writer) throw std::invalid_argument("unknown format '" + settings_.format + "'");
     const TrackMetadata metadata = trackMetadata(number);
 
@@ -262,7 +263,12 @@ std::string RipSession::ripLog() {
         << "\n"
         << "Read offset correction: " << (options.readOffsetSamples > 0 ? "+" : "") << options.readOffsetSamples
         << " samples\n"
-        << "Format: " << settings_.format << "\n\n";
+        << "Format: " << settings_.format << "\n";
+    if (const std::unique_ptr<AudioWriter> writer = createAudioWriter(settings_.format, settings_.encoder)) {
+        const std::string encoder = writer->encoderDescription();
+        if (!encoder.empty()) log << "Encoder: " << encoder << "\n";
+    }
+    log << "\n";
 
     char line[256];
     log << "CDDB disc id: " << hex32(t.cddbId()) << "\n";

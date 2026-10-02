@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.16)
+# 3.18: FetchContent SOURCE_SUBDIR (cmake/Codecs.cmake)
+cmake_minimum_required(VERSION 3.18)
 
 project(cdreader VERSION 0.1.0 LANGUAGES CXX)
 
@@ -16,6 +17,9 @@ endif()
 
 # Ship a self-contained executable on Windows (no VC++ redistributable needed).
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+# Lossy codec libraries (Opus, Vorbis), before our warning flags are set.
+include(cmake/Codecs.cmake)
 
 if(MSVC)
   add_compile_options(/W4 /utf-8)
@@ -38,6 +42,7 @@ add_library(cdreader_core STATIC
   core/src/md5.cpp
   core/src/metadata.cpp
   core/src/ogg.cpp
+  core/src/resampler.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp
   core/src/tags.cpp
@@ -46,6 +51,14 @@ add_library(cdreader_core STATIC
 )
 target_include_directories(cdreader_core PUBLIC core/include)
 target_compile_definitions(cdreader_core PRIVATE CDREADER_VERSION="${PROJECT_VERSION}")
+# PUBLIC: users see CDREADER_HAVE_OPUS / CDREADER_HAVE_VORBIS (and the tests the libraries).
+target_link_libraries(cdreader_core PUBLIC cdreader_codecs)
+if(CDREADER_WITH_OPUS)
+  target_sources(cdreader_core PRIVATE core/src/opus_writer.cpp)
+endif()
+if(CDREADER_WITH_VORBIS)
+  target_sources(cdreader_core PRIVATE core/src/vorbis_writer.cpp)
+endif()
 
 # --- Windows: SCSI pass-through transport + command line front end ---------
 if(WIN32)
@@ -147,4 +160,20 @@ if(CDREADER_BUILD_TESTS)
     add_test(NAME flac_cuesheet COMMAND cdreader_flac_cuesheet_check)
   endif()
   set_tests_properties(flac_cuesheet PROPERTIES SKIP_RETURN_CODE 77)
+
+  # Opus / Vorbis output decoded by the reference tools (opus-tools,
+  # vorbis-tools; ffprobe for the tags). Skipped when none is installed.
+  add_executable(cdreader_lossy_decode_check tests/lossy_decode_check.cpp)
+  target_include_directories(cdreader_lossy_decode_check PRIVATE tests)
+  target_link_libraries(cdreader_lossy_decode_check PRIVATE cdreader_core)
+  set(_lossy_tools)
+  foreach(_tool opusdec opusinfo oggdec ogginfo ffprobe)
+    string(TOUPPER "${_tool}" _var)
+    find_program(${_var}_EXECUTABLE ${_tool})
+    if(${_var}_EXECUTABLE)
+      list(APPEND _lossy_tools --${_tool} "${${_var}_EXECUTABLE}")
+    endif()
+  endforeach()
+  add_test(NAME lossy_decode COMMAND cdreader_lossy_decode_check ${_lossy_tools})
+  set_tests_properties(lossy_decode PROPERTIES SKIP_RETURN_CODE 77)
 endif()

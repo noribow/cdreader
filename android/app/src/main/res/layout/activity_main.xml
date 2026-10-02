@@ -90,25 +90,43 @@
             android:layout_height="wrap_content"
             android:text="@string/format" />
 
-        <RadioGroup
-            android:id="@+id/groupFormat"
+        <!-- Four formats may not fit next to each other on narrow screens. -->
+        <HorizontalScrollView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:orientation="horizontal">
+            android:layout_marginStart="8dp">
 
-            <RadioButton
-                android:id="@+id/radioFlac"
+            <RadioGroup
+                android:id="@+id/groupFormat"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="@string/format_flac" />
+                android:orientation="horizontal">
 
-            <RadioButton
-                android:id="@+id/radioWav"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="@string/format_wav" />
-        </RadioGroup>
+                <RadioButton
+                    android:id="@+id/radioFlac"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/format_flac" />
+
+                <RadioButton
+                    android:id="@+id/radioWav"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/format_wav" />
+
+                <RadioButton
+                    android:id="@+id/radioOpus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/format_opus" />
+
+                <RadioButton
+                    android:id="@+id/radioVorbis"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/format_vorbis" />
+            </RadioGroup>
+        </HorizontalScrollView>
     </LinearLayout>
 
     <LinearLayout

@@ -1,6 +1,7 @@
 // Minimal self-contained test runner (no external dependencies).
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -27,11 +28,22 @@
 #include "cdreader/md5.h"
 #include "cdreader/metadata.h"
 #include "cdreader/ogg.h"
+#include "cdreader/resampler.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
 #include "cdreader/tags.h"
 #include "cdreader/toc.h"
 #include "cdreader/wav_writer.h"
+#ifdef CDREADER_HAVE_OPUS
+#include <opus.h>
+
+#include "cdreader/opus_writer.h"
+#endif
+#ifdef CDREADER_HAVE_VORBIS
+#include <vorbis/codec.h>
+
+#include "cdreader/vorbis_writer.h"
+#endif
 #include "fake_drive.h"
 #include "flac_decoder.h"
 #include "test_signals.h"
@@ -408,7 +420,7 @@ TEST(audio_writer_factory) {
     CHECK(std::find(formats.begin(), formats.end(), "wav") != formats.end());
     for (const std::string& f : formats) {
         std::unique_ptr<cdr::AudioWriter> w = cdr::createAudioWriter(f);
-        CHECK(w != nullptr && w->extension() == f);
+        CHECK(w != nullptr && w->extension() == (f == "vorbis" ? "ogg" : f));
     }
     CHECK(cdr::createAudioWriter("no-such-format") == nullptr);
 }
@@ -2186,6 +2198,526 @@ TEST(single_file_flac_rip_with_embedded_cuesheet) {
             CHECK(std::equal(perTrack[i].begin(), perTrack[i].end(), d.pcm.begin() + long(start)));
     }
 }
+
+namespace {
+
+// --- Resampler (44.1 -> 48 kHz for Opus) --------------------------------------
+
+std::vector<float> resampleAll(const std::vector<float>& in, size_t chunk) {
+    cdr::Resampler r(44100, 48000, 2);
+    std::vector<float> out;
+    for (size_t pos = 0; pos < in.size() / 2; pos += chunk)
+        r.process(in.data() + pos * 2, std::min(chunk, in.size() / 2 - pos), out);
+    r.finish(out);
+    return out;
+}
+
+// Signal-to-error ratio in dB of `actual` against `reference` (same length).
+double snrDb(const std::vector<double>& reference, const std::vector<double>& actual) {
+    double signal = 0, error = 0;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        signal += reference[i] * reference[i];
+        error += (actual[i] - reference[i]) * (actual[i] - reference[i]);
+    }
+    return error == 0 ? 999.0 : 10 * std::log10(signal / error);
+}
+
+TEST(resampler_output_length_and_chunking) {
+    cdr::Resampler r(44100, 48000, 2);
+    CHECK_EQ(r.outputLength(0), 0u);
+    CHECK_EQ(r.outputLength(147), 160u);
+    CHECK_EQ(r.outputLength(1), 2u);             // 1.088, rounded up
+    CHECK_EQ(r.outputLength(1000), 1089u);       // 1088.4 (opusenc: 1089 as well)
+    CHECK_EQ(r.outputLength(44100), 48000u);
+    CHECK_EQ(r.outputLength(588), 640u);          // one CD sector
+    testsig::Noise noise(11);
+    for (size_t frames : {size_t(0), size_t(1), size_t(2), size_t(146), size_t(147), size_t(148), size_t(1000),
+                          size_t(44100 + 7)}) {
+        std::vector<float> in(frames * 2);
+        for (float& v : in) v = float(noise.next() * 0.5);
+        const std::vector<float> whole = resampleAll(in, frames ? frames : 1);
+        CHECK_EQ(whole.size(), size_t(2 * ((frames * 160 + 146) / 147)));
+        CHECK_EQ(whole.size() / 2, size_t(r.outputLength(frames)));
+        // Any split of the input gives the same output.
+        CHECK(resampleAll(in, 588) == whole);
+        CHECK(resampleAll(in, 1) == whole);
+        CHECK(resampleAll(in, 4097) == whole);
+    }
+}
+
+TEST(resampler_sine_accuracy) {
+    // Sines across the band against the exact 48 kHz sines: the error contains
+    // passband ripple, images / aliases and arithmetic noise.
+    for (double freq : {100.0, 1000.0, 15000.0, 19500.0}) {
+        const size_t n = 44100;
+        std::vector<float> in(n * 2);
+        for (size_t i = 0; i < n; ++i) {
+            in[2 * i] = float(0.5 * std::sin(testsig::kTwoPi * freq * double(i) / 44100));
+            in[2 * i + 1] = float(0.5 * std::cos(testsig::kTwoPi * freq * double(i) / 44100));
+        }
+        const std::vector<float> out = resampleAll(in, 4096);
+        CHECK_EQ(out.size(), size_t(2 * 48000));
+        std::vector<double> ref, got;
+        for (size_t i = 500; i + 500 < 48000; ++i) {  // away from the start / end transients
+            ref.push_back(0.5 * std::sin(testsig::kTwoPi * freq * double(i) / 48000));
+            got.push_back(out[2 * i]);
+            ref.push_back(0.5 * std::cos(testsig::kTwoPi * freq * double(i) / 48000));
+            got.push_back(out[2 * i + 1]);
+        }
+        const double snr = snrDb(ref, got);
+        std::printf("  resampler %5.0f Hz: SNR %.1f dB\n", freq, snr);
+        CHECK(snr > 95);
+    }
+}
+
+TEST(resampler_rejects_out_of_band_and_keeps_dc) {
+    // DC passes with unity gain.
+    std::vector<float> dc(20000 * 2, 0.25f);
+    const std::vector<float> out = resampleAll(dc, 1000);
+    for (size_t i = 400; i + 400 < out.size() / 2; ++i) CHECK(std::abs(out[2 * i] - 0.25f) < 1e-5f);
+    // A tone in the transition band (20 .. 22.05 kHz) is attenuated; its image
+    // at 44.1 - 21.9 = 22.2 kHz is in the stop band and must be gone.
+    const size_t n = 44100;
+    std::vector<float> high(n * 2);
+    for (size_t i = 0; i < n; ++i)
+        high[2 * i] = high[2 * i + 1] = float(0.9 * std::sin(testsig::kTwoPi * 21900.0 * double(i) / 44100));
+    const std::vector<float> filtered = resampleAll(high, 4096);
+    // Amplitude of the component at `freq` (Hann windowed DFT, scaled to the sine amplitude).
+    auto amplitude = [&](double freq) {
+        double re = 0, im = 0, wsum = 0;
+        const size_t a = 1000, b = filtered.size() / 2 - 1000;
+        for (size_t i = a; i < b; ++i) {
+            const double w = 0.5 - 0.5 * std::cos(testsig::kTwoPi * double(i - a) / double(b - a));
+            re += w * filtered[2 * i] * std::cos(testsig::kTwoPi * freq * double(i) / 48000);
+            im += w * filtered[2 * i] * std::sin(testsig::kTwoPi * freq * double(i) / 48000);
+            wsum += w;
+        }
+        return 2 * std::sqrt(re * re + im * im) / wsum;
+    };
+    const double tone = amplitude(21900), image = amplitude(22200);
+    std::printf("  resampler 21.9 kHz tone: passed %.1f dB, image at 22.2 kHz %.1f dB\n",
+                20 * std::log10(tone / 0.9), 20 * std::log10(image / 0.9 + 1e-30));
+    CHECK(tone < 0.9 * 0.01);    // below -40 dB (transition band)
+    CHECK(image < 0.9 * 1e-5);   // below -100 dB (stop band)
+}
+
+#if defined(CDREADER_HAVE_OPUS) || defined(CDREADER_HAVE_VORBIS)
+
+// --- Ogg helpers for the lossy writers -----------------------------------------
+
+std::vector<uint8_t> encodeWith(cdr::AudioWriter& writer, const std::filesystem::path& path,
+                                const std::vector<uint8_t>& pcm, const cdr::TrackMetadata& meta) {
+    writer.open(path, meta);
+    size_t pos = 0;
+    if (pcm.size() > 7) {  // an odd split to exercise partial samples
+        writer.write(pcm.data(), 7);
+        pos = 7;
+    }
+    for (; pos < pcm.size(); pos += 2352 * 7) writer.write(pcm.data() + pos, std::min<size_t>(2352 * 7, pcm.size() - pos));
+    writer.close();
+    return readFile(path);
+}
+
+// Number of packets that end on each page.
+size_t packetsEndingOn(const OggPage& p) {
+    size_t n = 0;
+    for (uint8_t l : p.lacing) n += l < 255 ? 1 : 0;
+    return n;
+}
+
+cdr::TrackMetadata lossyMetadata() {
+    cdr::TrackMetadata m;
+    m.trackNumber = 3;
+    m.trackTotal = 12;
+    m.title = "\xE6\x9B\xB2\xE5\x90\x8D";  // 曲名
+    m.artist = "Artist";
+    m.album = "Album";
+    m.albumArtist = "Album Artist";
+    m.year = "1999";
+    m.genre = "Rock";
+    m.discId = "0A0B0C03";
+    return m;
+}
+
+bool containsText(const std::vector<uint8_t>& v, const std::string& text) {
+    const std::vector<uint8_t> t(text.begin(), text.end());
+    return std::search(v.begin(), v.end(), t.begin(), t.end()) != v.end();
+}
+
+#endif
+
+TEST(audio_writer_settings_validation) {
+    auto throws = [](const std::string& format, const cdr::EncoderSettings& s) {
+        try {
+            cdr::createAudioWriter(format, s);
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    cdr::EncoderSettings bitrate;
+    bitrate.bitrateKbps = 128;
+    cdr::EncoderSettings quality;
+    quality.quality = 4;
+    CHECK(throws("wav", bitrate));
+    CHECK(throws("flac", quality));
+    CHECK(!throws("flac", {}));
+    CHECK(!cdr::isLossyFormat("flac") && !cdr::isLossyFormat("wav"));
+    CHECK(cdr::isLossyFormat("opus") && cdr::isLossyFormat("vorbis"));
+#ifdef CDREADER_HAVE_OPUS
+    CHECK(!throws("opus", bitrate));
+    CHECK(throws("opus", quality));
+    for (int kbps : {5, 511, 0, -1}) {
+        cdr::EncoderSettings s;
+        s.bitrateKbps = kbps;
+        CHECK(throws("opus", s));
+    }
+    for (int kbps : {6, 510}) {
+        cdr::EncoderSettings s;
+        s.bitrateKbps = kbps;
+        CHECK(!throws("opus", s));
+    }
+    CHECK(cdr::createAudioWriter("opus")->encoderDescription().find("VBR 160 kbit/s") != std::string::npos);
+#endif
+#ifdef CDREADER_HAVE_VORBIS
+    CHECK(!throws("vorbis", bitrate));
+    CHECK(!throws("vorbis", quality));
+    cdr::EncoderSettings both = bitrate;
+    both.quality = 3;
+    CHECK(throws("vorbis", both));
+    for (double q : {-1.5, 10.5}) {
+        cdr::EncoderSettings s;
+        s.quality = q;
+        CHECK(throws("vorbis", s));
+    }
+    for (int kbps : {44, 501}) {
+        cdr::EncoderSettings s;
+        s.bitrateKbps = kbps;
+        CHECK(throws("vorbis", s));
+    }
+    CHECK(cdr::createAudioWriter("vorbis")->encoderDescription().find("VBR quality 5") != std::string::npos);
+    CHECK(cdr::createAudioWriter("vorbis", quality)->extension() == "ogg");
+#endif
+}
+
+#ifdef CDREADER_HAVE_OPUS
+
+TEST(opus_header_packets) {
+    const std::vector<uint8_t> head = cdr::opus::headPacket(2, 312, 44100);
+    const std::vector<uint8_t> expected = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, 2, 0x38, 0x01,
+                                           0x44, 0xAC, 0x00, 0x00, 0x00, 0x00, 0};
+    CHECK(head == expected);
+
+    const cdr::TrackMetadata m = lossyMetadata();
+    const std::vector<uint8_t> tags = cdr::opus::tagsPacket(m, "vendor");
+    CHECK(str(tags, 0, 8) == "OpusTags");
+    CHECK_EQ(le32At(tags, 8), 6u);
+    CHECK(str(tags, 12, 6) == "vendor");
+    CHECK_EQ(le32At(tags, 18), 9u);  // fields
+    size_t pos = 22;
+    std::vector<std::string> fields;
+    for (int i = 0; i < 9; ++i) {
+        const uint32_t len = le32At(tags, pos);
+        fields.push_back(str(tags, pos + 4, len));
+        pos += 4 + len;
+    }
+    CHECK_EQ(pos, tags.size());
+    const std::vector<std::string> want = {"TITLE=" + m.title, "ARTIST=Artist", "ALBUM=Album",
+                                           "ALBUMARTIST=Album Artist", "TRACKNUMBER=3", "TRACKTOTAL=12",
+                                           "DATE=1999", "GENRE=Rock", "CDDB=0A0B0C03"};
+    CHECK(fields == want);
+    CHECK(cdr::opus::libraryVersion().rfind("libopus ", 0) == 0);
+}
+
+struct DecodedOpus {
+    uint16_t preSkip = 0;
+    int64_t finalGranule = 0;
+    size_t packets = 0;
+    std::vector<float> pcm;  // 48 kHz stereo, pre-skip removed, end trimmed
+};
+
+// Checks the Ogg Opus structure (RFC 7845) of `file` and decodes it with libopus.
+DecodedOpus checkAndDecodeOpus(const std::vector<uint8_t>& file) {
+    DecodedOpus d;
+    const std::vector<OggPage> pages = parseOgg(file);
+    const std::vector<std::vector<uint8_t>> packets = oggPackets(pages);
+    CHECK(pages.size() >= 3);
+    CHECK(packets.size() >= 3);
+    if (pages.size() < 3 || packets.size() < 3) return d;
+    // Headers: each alone on its page, granule 0.
+    CHECK_EQ(pages[0].flags, 0x02);
+    CHECK_EQ(packetsEndingOn(pages[0]), 1u);
+    CHECK_EQ(pages[0].granule, 0);
+    CHECK_EQ(pages[1].flags, 0x00);
+    CHECK_EQ(packetsEndingOn(pages[1]), 1u);
+    CHECK_EQ(pages[1].granule, 0);
+    CHECK_EQ(packets[0].size(), 19u);
+    CHECK(str(packets[0], 0, 8) == "OpusHead");
+    d.preSkip = uint16_t(packets[0][10] | packets[0][11] << 8);
+    CHECK(packets[0] == cdr::opus::headPacket(2, d.preSkip, 44100));
+    CHECK(str(packets[1], 0, 8) == "OpusTags");
+    // Audio pages: granule = 960 * packets so far, except the last page,
+    // which ends the stream at the exact length (end trimming).
+    size_t completed = 0;
+    for (size_t i = 2; i < pages.size(); ++i) {
+        const OggPage& p = pages[i];
+        completed += packetsEndingOn(p);
+        const bool last = i + 1 == pages.size();
+        CHECK_EQ(bool(p.flags & 0x04), last);
+        CHECK_EQ(p.flags & 0x02, 0);
+        if (packetsEndingOn(p) == 0) {
+            CHECK_EQ(p.granule, -1);
+        } else if (!last) {
+            CHECK_EQ(p.granule, int64_t(completed) * 960);
+        }
+    }
+    d.packets = packets.size() - 2;
+    CHECK_EQ(completed, d.packets);
+    d.finalGranule = pages.back().granule;
+    CHECK(d.finalGranule >= int64_t(d.preSkip));
+    CHECK(d.finalGranule <= int64_t(d.packets) * 960);
+    CHECK(d.finalGranule > int64_t(d.packets - 1) * 960);  // only the last packet is trimmed
+
+    int error = 0;
+    OpusDecoder* decoder = opus_decoder_create(48000, 2, &error);
+    CHECK(error == OPUS_OK);
+    std::vector<float> all;
+    std::vector<float> frame(5760 * 2);
+    for (size_t i = 2; i < packets.size(); ++i) {
+        CHECK_EQ(opus_packet_get_nb_samples(packets[i].data(), opus_int32(packets[i].size()), 48000), 960);
+        const int n = opus_decode_float(decoder, packets[i].data(), opus_int32(packets[i].size()), frame.data(), 5760, 0);
+        CHECK_EQ(n, 960);
+        if (n > 0) all.insert(all.end(), frame.begin(), frame.begin() + n * 2);
+    }
+    opus_decoder_destroy(decoder);
+    const size_t begin = size_t(d.preSkip) * 2;
+    const size_t end = size_t(d.finalGranule) * 2;
+    if (end <= all.size() && begin <= end) d.pcm.assign(all.begin() + ptrdiff_t(begin), all.begin() + ptrdiff_t(end));
+    return d;
+}
+
+TEST(opus_writer_stream_structure_and_length) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.opus";
+    const cdr::Resampler lengths(44100, 48000, 2);
+    for (size_t samples : {size_t(0), size_t(1), size_t(147), size_t(1000), size_t(44100), size_t(44100 * 3 + 17)}) {
+        const testsig::Signal s = testsig::tonesPcm(samples);
+        cdr::OpusWriter writer;
+        const std::vector<uint8_t> file = encodeWith(writer, path, s.pcm, lossyMetadata());
+        if (samples == 44100 * 3 + 17) keepSample("tones.opus", file);
+        const DecodedOpus d = checkAndDecodeOpus(file);
+        CHECK_EQ(d.preSkip, writer.preSkip());
+        CHECK(d.preSkip > 0);
+        CHECK_EQ(d.finalGranule, int64_t(d.preSkip + lengths.outputLength(samples)));
+        CHECK_EQ(uint64_t(d.finalGranule), writer.finalGranulePosition());
+        CHECK_EQ(d.pcm.size(), size_t(2 * lengths.outputLength(samples)));
+        CHECK(containsText(file, "TITLE=" + lossyMetadata().title));
+    }
+    std::filesystem::remove(path);
+}
+
+TEST(opus_writer_decodes_close_to_input) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.opus";
+    const size_t samples = 44100 * 4 + 5;
+    const testsig::Signal s = testsig::tonesPcm(samples);
+    // The exact signal at 48 kHz (computed once, it is slow to evaluate).
+    const size_t n48 = size_t(cdr::Resampler(44100, 48000, 2).outputLength(samples));
+    std::vector<double> exact(2 * n48 + 4);
+    for (size_t i = 0; i < n48 + 2; ++i) {
+        exact[2 * i] = testsig::tones(double(i) / 48000, 0);
+        exact[2 * i + 1] = testsig::tones(double(i) / 48000, 1);
+    }
+    std::vector<size_t> sizes;
+    for (int kbps : {64, 160, 256}) {
+        cdr::OpusWriter writer(kbps);
+        const std::vector<uint8_t> file = encodeWith(writer, path, s.pcm, {});
+        sizes.push_back(file.size());
+        const DecodedOpus d = checkAndDecodeOpus(file);
+        const size_t n = d.pcm.size() / 2;
+        CHECK_EQ(n, n48);
+        // Against the exact signal at 48 kHz, so that the resampler and the
+        // pre-skip (alignment) are checked as well; lags around 0 must be worse.
+        auto snrAtLag = [&](int lag) {
+            std::vector<double> ref, got;
+            for (size_t i = 2400; i + 2400 < n; ++i) {
+                const size_t j = size_t(int64_t(i) + lag);
+                ref.push_back(exact[2 * j]);
+                got.push_back(d.pcm[2 * i]);
+                ref.push_back(exact[2 * j + 1]);
+                got.push_back(d.pcm[2 * i + 1]);
+            }
+            return snrDb(ref, got);
+        };
+        const double snr = snrAtLag(0);
+        std::printf("  opus %3d kbit/s: %6zu bytes, SNR %.1f dB (lag -1: %.1f, +1: %.1f)\n", kbps, file.size(), snr,
+                    snrAtLag(-1), snrAtLag(1));
+        CHECK(snr > (kbps >= 160 ? 20 : 12));
+        CHECK(snr > snrAtLag(-1) + 3 && snr > snrAtLag(1) + 3);
+    }
+    CHECK(sizes[0] < sizes[1] && sizes[1] < sizes[2]);
+    std::filesystem::remove(path);
+}
+
+TEST(opus_writer_rejects_partial_sample) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_partial.opus";
+    cdr::OpusWriter writer;
+    writer.open(path, {});
+    const uint8_t bytes[3] = {1, 2, 3};
+    writer.write(bytes, 3);
+    bool threw = false;
+    try {
+        writer.close();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    std::filesystem::remove(path);
+}
+
+#endif  // CDREADER_HAVE_OPUS
+
+#ifdef CDREADER_HAVE_VORBIS
+
+struct DecodedVorbis {
+    int64_t finalGranule = 0;
+    std::vector<uint8_t> comment;
+    std::vector<float> pcm;  // 44.1 kHz stereo
+};
+
+// Checks the Ogg Vorbis page layout of `file` and decodes it with libvorbis.
+DecodedVorbis checkAndDecodeVorbis(const std::vector<uint8_t>& file) {
+    DecodedVorbis d;
+    const std::vector<OggPage> pages = parseOgg(file);
+    const std::vector<std::vector<uint8_t>> packets = oggPackets(pages);
+    CHECK(pages.size() >= 3 && packets.size() >= 4);
+    if (pages.size() < 3 || packets.size() < 4) return d;
+    CHECK_EQ(pages[0].flags, 0x02);
+    CHECK_EQ(packetsEndingOn(pages[0]), 1u);  // identification header alone
+    CHECK_EQ(packetsEndingOn(pages[1]), 2u);  // comment + setup, then audio on a fresh page
+    CHECK_EQ(pages[1].granule, 0);
+    CHECK(packets[0][0] == 1 && str(packets[0], 1, 6) == "vorbis");
+    CHECK_EQ(packets[0][11], 2);               // channels
+    CHECK_EQ(le32At(packets[0], 12), 44100u);  // sample rate
+    CHECK(packets[1][0] == 3 && str(packets[1], 1, 6) == "vorbis");
+    CHECK(packets[2][0] == 5 && str(packets[2], 1, 6) == "vorbis");
+    d.comment = packets[1];
+    int64_t last = 0;
+    for (size_t i = 2; i < pages.size(); ++i) {
+        CHECK_EQ(bool(pages[i].flags & 0x04), i + 1 == pages.size());
+        if (pages[i].granule != -1) {
+            CHECK(pages[i].granule >= last);
+            last = pages[i].granule;
+        }
+    }
+    d.finalGranule = pages.back().granule;
+
+    vorbis_info vi;
+    vorbis_comment vc;
+    vorbis_info_init(&vi);
+    vorbis_comment_init(&vc);
+    for (size_t i = 0; i < packets.size(); ++i) {
+        ogg_packet op{};
+        op.packet = const_cast<unsigned char*>(packets[i].data());
+        op.bytes = long(packets[i].size());
+        op.b_o_s = i == 0;
+        op.e_o_s = i + 1 == packets.size();
+        op.granulepos = i + 1 == packets.size() ? d.finalGranule : -1;
+        op.packetno = ogg_int64_t(i);
+        if (i < 3) {
+            CHECK_EQ(vorbis_synthesis_headerin(&vi, &vc, &op), 0);
+            if (i == 2) break;
+        }
+    }
+    CHECK_EQ(vi.channels, 2);
+    CHECK_EQ(vi.rate, 44100);
+    vorbis_dsp_state vd;
+    vorbis_block vb;
+    CHECK_EQ(vorbis_synthesis_init(&vd, &vi), 0);
+    vorbis_block_init(&vd, &vb);
+    for (size_t i = 3; i < packets.size(); ++i) {
+        ogg_packet op{};
+        op.packet = const_cast<unsigned char*>(packets[i].data());
+        op.bytes = long(packets[i].size());
+        op.e_o_s = i + 1 == packets.size();
+        op.granulepos = i + 1 == packets.size() ? d.finalGranule : -1;
+        op.packetno = ogg_int64_t(i);
+        CHECK_EQ(vorbis_synthesis(&vb, &op), 0);
+        vorbis_synthesis_blockin(&vd, &vb);
+        float** pcm = nullptr;
+        int n;
+        while ((n = vorbis_synthesis_pcmout(&vd, &pcm)) > 0) {
+            for (int k = 0; k < n; ++k) {
+                d.pcm.push_back(pcm[0][k]);
+                d.pcm.push_back(pcm[1][k]);
+            }
+            vorbis_synthesis_read(&vd, n);
+        }
+    }
+    vorbis_block_clear(&vb);
+    vorbis_dsp_clear(&vd);
+    vorbis_comment_clear(&vc);
+    vorbis_info_clear(&vi);
+    return d;
+}
+
+TEST(vorbis_writer_stream_structure_and_length) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.ogg";
+    for (size_t samples : {size_t(0), size_t(1), size_t(1000), size_t(44100), size_t(44100 * 3 + 17)}) {
+        const testsig::Signal s = testsig::tonesPcm(samples);
+        cdr::VorbisWriter writer;
+        const std::vector<uint8_t> file = encodeWith(writer, path, s.pcm, lossyMetadata());
+        if (samples == 44100 * 3 + 17) keepSample("tones.ogg", file);
+        const DecodedVorbis d = checkAndDecodeVorbis(file);
+        CHECK_EQ(d.finalGranule, int64_t(samples));
+        CHECK_EQ(writer.samples(), uint64_t(samples));
+        CHECK_EQ(d.pcm.size(), 2 * samples);
+        // Our tags in the comment header, libvorbis' vendor string.
+        CHECK(str(d.comment, 11, 18) == "Xiph.Org libVorbis");
+        CHECK(containsText(d.comment, "TITLE=" + lossyMetadata().title));
+        CHECK(containsText(d.comment, "TRACKNUMBER=3"));
+        CHECK(containsText(d.comment, "CDDB=0A0B0C03"));
+        CHECK_EQ(d.comment.back(), 1);  // framing bit
+    }
+    std::filesystem::remove(path);
+}
+
+TEST(vorbis_writer_decodes_close_to_input) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.ogg";
+    const size_t samples = 44100 * 4 + 5;
+    const testsig::Signal s = testsig::tonesPcm(samples);
+    std::vector<size_t> sizes;
+    for (double q : {0.0, 5.0, 8.0}) {
+        cdr::VorbisWriter writer(q);
+        const std::vector<uint8_t> file = encodeWith(writer, path, s.pcm, {});
+        sizes.push_back(file.size());
+        const DecodedVorbis d = checkAndDecodeVorbis(file);
+        CHECK_EQ(d.pcm.size(), 2 * samples);
+        std::vector<double> ref, got;
+        for (size_t i = 0; i < samples && 2 * i + 1 < d.pcm.size(); ++i) {
+            for (int c = 0; c < 2; ++c) {
+                const uint8_t* p = s.pcm.data() + 4 * i + 2 * size_t(c);
+                ref.push_back(double(int16_t(uint16_t(p[0] | p[1] << 8))) / 32768);
+                got.push_back(d.pcm[2 * i + size_t(c)]);
+            }
+        }
+        const double snr = snrDb(ref, got);
+        std::printf("  vorbis q%.0f: %6zu bytes, SNR %.1f dB\n", q, file.size(), snr);
+        CHECK(snr > (q >= 5 ? 20 : 12));
+    }
+    CHECK(sizes[0] < sizes[1] && sizes[1] < sizes[2]);
+    cdr::EncoderSettings abr;
+    abr.bitrateKbps = 96;
+    std::unique_ptr<cdr::AudioWriter> w = cdr::createAudioWriter("vorbis", abr);
+    const std::vector<uint8_t> file = encodeWith(*w, path, s.pcm, {});
+    CHECK_EQ(checkAndDecodeVorbis(file).pcm.size(), 2 * samples);
+    const double kbps = double(file.size()) * 8 / (double(samples) / 44100) / 1000;
+    std::printf("  vorbis --bitrate 96: %.0f kbit/s\n", kbps);
+    CHECK(kbps > 60 && kbps < 140);
+    std::filesystem::remove(path);
+}
+
+#endif  // CDREADER_HAVE_VORBIS
+
+}  // namespace
 
 int main() {
     for (auto& [name, fn] : registry()) {

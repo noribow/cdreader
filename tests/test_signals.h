@@ -70,6 +70,28 @@ inline Signal music(size_t samples) {
     });
 }
 
+// A "music-like" signal without noise, defined in continuous time so that a
+// lossy codec's output can be compared with the exact signal at any sample
+// rate (Opus decodes at 48 kHz): chords of harmonic tones with slow
+// envelopes, values in about [-0.6, 0.6].
+inline double tones(double t, int channel) {
+    const double notes[] = {220.0, 277.18, 329.63, 440.0, 1318.5, 3520.0};
+    double v = 0;
+    for (int k = 0; k < 6; ++k) {
+        const double env = 0.5 + 0.5 * std::sin(kTwoPi * (0.3 + 0.17 * k) * t + channel);
+        for (int h = 1; h <= 4; ++h) v += env / (h * (k < 4 ? 1 : 3)) * std::sin(kTwoPi * notes[k] * h * t + 0.3 * k * channel);
+    }
+    return v * 0.075;
+}
+
+inline Signal tonesPcm(size_t samples) {
+    return make("tones", samples, [](size_t i, int16_t& l, int16_t& r) {
+        const double t = double(i) / 44100;
+        l = clamp16(tones(t, 0) * 32768);
+        r = clamp16(tones(t, 1) * 32768);
+    });
+}
+
 inline std::vector<Signal> all() {
     std::vector<Signal> v;
     v.push_back(make("empty", 0, [](size_t, int16_t&, int16_t&) {}));

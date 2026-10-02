@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "bot_transport.h"
+#include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
 #include "cdreader/http.h"
@@ -242,6 +243,13 @@ private:
 
 extern "C" {
 
+// Output formats built into the library, comma separated ("wav,flac,opus,vorbis").
+JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeFormats(JNIEnv* env, jclass) {
+    std::string list;
+    for (const std::string& f : cdr::audioFormats()) list += (list.empty() ? "" : ",") + f;
+    return toJava(env, list);
+}
+
 JNIEXPORT jlong JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeOpen(
     JNIEnv* env, jclass, jint fd, jint interfaceNumber, jint endpointIn, jint endpointOut) {
     try {
@@ -355,7 +363,7 @@ JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeAlbumFo
     }
 }
 
-// File name of a track for `format` ("wav" / "flac"), from the CDDB metadata.
+// File name of a track for `format` ("wav" / "flac" / "opus" / "vorbis"), from the CDDB metadata.
 JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTrackFileName(JNIEnv* env, jclass,
                                                                                        jlong handle, jint track,
                                                                                        jstring format) {
@@ -370,6 +378,7 @@ JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTrackFi
 }
 
 // Starts a rip with these settings: forgets earlier results, clears a cancel.
+// Lossy formats use their default settings (Opus VBR 160 kbit/s, Vorbis q5).
 JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(JNIEnv* env, jclass, jlong handle,
                                                                                jstring format, jint readOffset,
                                                                                jint maxRetries, jboolean verify) {

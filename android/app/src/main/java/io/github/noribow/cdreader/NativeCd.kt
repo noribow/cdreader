@@ -13,6 +13,7 @@ object NativeCd {
         System.loadLibrary("cdreader_jni")
     }
 
+    @JvmStatic external fun nativeFormats(): String
     @JvmStatic external fun nativeOpen(fd: Int, interfaceNumber: Int, endpointIn: Int, endpointOut: Int): Long
     @JvmStatic external fun nativeClose(handle: Long)
     @JvmStatic external fun nativeCancel(handle: Long)

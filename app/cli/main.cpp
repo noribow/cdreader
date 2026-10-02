@@ -4,6 +4,7 @@
 #include <shellapi.h>
 
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <exception>
@@ -59,6 +60,11 @@ void printUsage() {
         "                        otherwise cd_<CDDB id>)\n"
         "                        A CUE sheet (<album>.cue) is written next to the audio\n"
         "  -f, --format <name>   Output format: %s (default: wav)\n"
+        "                        opus = Ogg Opus (.opus), vorbis = Ogg Vorbis (.ogg)\n"
+        "                        (when built with libopus / libvorbis)\n"
+        "  -b, --bitrate <kbps>  Lossy formats: target bitrate in kbit/s (VBR)\n"
+        "                        opus: 6-510 (default 160), vorbis: 45-500 (average)\n"
+        "  -q, --quality <q>     vorbis: VBR quality -1..10 (default 5, about 160 kbit/s)\n"
         "  -t, --tracks <list>   Tracks to rip, e.g. 1,3-5 (default: all audio tracks)\n"
         "  -r, --retries <n>     Retries per failing read (default: 5)\n"
         "      --offset <n>      Drive read offset correction in samples, e.g. 6 or -472\n"
@@ -111,6 +117,16 @@ int parseSignedInt(const std::string& s, const char* what) {
         size_t used = 0;
         int v = std::stoi(s, &used);
         if (used == s.size() && !s.empty() && s[0] != ' ') return v;
+    } catch (const std::exception&) {
+    }
+    throw UsageError(std::string("invalid ") + what + " '" + s + "'");
+}
+
+double parseNumber(const std::string& s, const char* what) {
+    try {
+        size_t used = 0;
+        const double v = std::stod(s, &used);
+        if (used == s.size() && !s.empty() && s[0] != ' ' && std::isfinite(v)) return v;
     } catch (const std::exception&) {
     }
     throw UsageError(std::string("invalid ") + what + " '" + s + "'");
@@ -381,6 +397,7 @@ int cmdRip(const std::vector<std::string>& args) {
     bool accurateRip = true;
     bool singleFile = false;
     bool cueFile = true;
+    cdr::EncoderSettings encoder;
 
     for (size_t i = 2; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -390,6 +407,8 @@ int cmdRip(const std::vector<std::string>& args) {
         };
         if (a == "-o" || a == "--output") outputDir = value();
         else if (a == "-f" || a == "--format") format = value();
+        else if (a == "-b" || a == "--bitrate") encoder.bitrateKbps = parseSignedInt(value(), "bitrate");
+        else if (a == "-q" || a == "--quality") encoder.quality = parseNumber(value(), "quality");
         else if (a == "-t" || a == "--tracks") wanted = parseTrackList(value());
         else if (a == "-r" || a == "--retries") options.maxRetries = parseInt(value(), "retry count");
         else if (a == "--offset") options.readOffsetSamples = parseSignedInt(value(), "read offset");
@@ -401,8 +420,18 @@ int cmdRip(const std::vector<std::string>& args) {
         else throw UsageError("unknown option '" + a + "'");
     }
 
-    if (!cdr::createAudioWriter(format))
+    std::unique_ptr<cdr::AudioWriter> probe;
+    try {
+        probe = cdr::createAudioWriter(format, encoder);
+    } catch (const std::invalid_argument& e) {
+        throw UsageError(std::string(e.what()) +
+                         (cdr::isLossyFormat(format) ? "" : " (--bitrate / --quality are for lossy formats)"));
+    }
+    if (!probe) {
+        if (cdr::isLossyFormat(format))
+            throw UsageError("format '" + format + "' is not available in this build (available: " + formatList() + ")");
         throw UsageError("unknown format '" + format + "' (available: " + formatList() + ")");
+    }
 
     OpenedDrive d = openDrive(letter);
     const cdr::Toc toc = readTocOrExplain(*d.drive);
@@ -436,7 +465,8 @@ int cmdRip(const std::vector<std::string>& args) {
 
     // In single-file mode the tracks are written back to back, which is only
     // an image of the disc if they are adjacent on it.
-    const std::string extension = cdr::createAudioWriter(format)->extension();
+    const std::string extension = probe->extension();
+    const std::string encoderText = probe->encoderDescription();
     const std::string albumBase = cdr::albumFileBase(album, "CDImage");
     const std::string imageName = albumBase + "." + extension;
     std::vector<cdr::CueTrack> cueTracks;
@@ -453,6 +483,7 @@ int cmdRip(const std::vector<std::string>& args) {
 
     std::printf("Read offset correction: %+d samples\n", options.readOffsetSamples);
     std::printf("Format: %s\n", format.c_str());
+    if (!encoderText.empty()) std::printf("Encoder: %s\n", encoderText.c_str());
     std::printf("Output: %s\n\n", dir.u8string().c_str());
 
     std::ofstream log(dir / "rip.log");
@@ -462,7 +493,9 @@ int cmdRip(const std::vector<std::string>& args) {
         << "\n"
         << "Read offset correction: " << (options.readOffsetSamples > 0 ? "+" : "") << options.readOffsetSamples
         << " samples\n"
-        << "Format: " << format << "\n\n";
+        << "Format: " << format << "\n";
+    if (!encoderText.empty()) log << "Encoder: " << encoderText << "\n";
+    log << "\n";
     {
         char line[256];
         log << "CDDB disc id: " << hex32(toc.cddbId()) << "\n";
@@ -499,7 +532,7 @@ int cmdRip(const std::vector<std::string>& args) {
     cdr::Crc32 imageCrc;
     std::vector<std::string> trackFiles;
     if (singleFile) {
-        writer = cdr::createAudioWriter(format);
+        writer = cdr::createAudioWriter(format, encoder);
         if (writer->canEmbedCueSheet()) {
             cdr::EmbeddedCueSheet embedded;
             embedded.tracks = cueTracks;
@@ -521,7 +554,7 @@ int cmdRip(const std::vector<std::string>& args) {
             std::snprintf(base, sizeof base, "Track %02d", t.number);
             name = base;
         } else {
-            writer = cdr::createAudioWriter(format);
+            writer = cdr::createAudioWriter(format, encoder);
             const cdr::TrackMetadata metadata = album.forTrack(t.number, toc.lastTrack);
             name = cdr::trackFileBaseName(metadata) + "." + extension;
             writer->open(dir / fs::u8path(name), metadata);
