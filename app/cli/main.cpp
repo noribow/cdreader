@@ -9,17 +9,20 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "cdreader/accuraterip.h"
 #include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
 #include "cdreader/metadata.h"
 #include "cdreader/ripper.h"
 #include "cdreader/toc.h"
 #include "spti_transport.h"
+#include "winhttp_client.h"
 
 namespace fs = std::filesystem;
 
@@ -39,6 +42,7 @@ void printUsage() {
         "  cdreader drives                       List optical drives\n"
         "  cdreader toc <drive>                  Show the table of contents\n"
         "  cdreader rip <drive> [options]        Rip audio tracks to WAV\n"
+        "  cdreader offset <drive> [options]     Detect the drive read offset (AccurateRip)\n"
         "\n"
         "Rip options:\n"
         "  -o, --output <dir>    Output directory (default: cd_<CDDB id>)\n"
@@ -47,6 +51,12 @@ void printUsage() {
         "      --offset <n>      Drive read offset correction in samples, e.g. 6 or -472\n"
         "                        (same value as EAC / AccurateRip; default: 0)\n"
         "      --verify          Read everything twice and compare (slower)\n"
+        "      --no-accuraterip  Do not look up the AccurateRip database after ripping\n"
+        "\n"
+        "Offset options:\n"
+        "  -t, --track <n>       Track to compare (default: the best known track)\n"
+        "      --range <n>       Offsets to try, -n..+n samples (default: 3000)\n"
+        "  -r, --retries <n>     Retries per failing read (default: 5)\n"
         "\n"
         "<drive> is a drive letter such as D or D:\n",
         kVersion);
@@ -132,6 +142,7 @@ cdr::Toc readTocOrExplain(cdr::CdDrive& drive) {
 
 void printToc(const cdr::Toc& toc, FILE* out) {
     std::fprintf(out, "CDDB disc id: %s\n", hex32(toc.cddbId()).c_str());
+    std::fprintf(out, "AccurateRip disc id: %s\n", cdr::AccurateRipDiscId::fromToc(toc).toString().c_str());
     std::fprintf(out, "Track  Start LBA   Length     Type\n");
     for (const cdr::Track& t : toc.tracks) {
         std::fprintf(out, "  %2d   %9u   %s   %s%s\n", t.number, t.startLba, cdr::formatMsf(t.lengthSectors).c_str(),
@@ -165,12 +176,84 @@ int cmdToc(const std::vector<std::string>& args) {
     return 0;
 }
 
+struct ArTrack {
+    cdr::Track track;
+    uint32_t v1 = 0;
+    uint32_t v2 = 0;
+};
+
+// Looks up the rip in the AccurateRip database and prints the per-track
+// verdicts to the console and the log. Failures only produce a message.
+void reportAccurateRip(const cdr::Toc& toc, const std::vector<ArTrack>& tracks, bool lookup, char letter,
+                       std::ostream& log) {
+    const cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(toc);
+    auto line = [&](const std::string& text) {
+        std::printf("%s\n", text.c_str());
+        log << text << "\n";
+    };
+    std::printf("\n");
+    log << "\n";
+
+    cdr::AccurateRipLookup result;
+    if (lookup) {
+        std::printf("Looking up AccurateRip database...\r");
+        std::fflush(stdout);
+        cdr::win::WinHttpClient http(std::string("cdreader/") + kVersion);
+        result = cdr::lookupAccurateRip(http, id);
+    }
+    const bool found = result.status == cdr::AccurateRipLookup::Status::Found;
+
+    line("AccurateRip (disc id " + id.toString() + ")" +
+         (found ? ", " + std::to_string(result.pressings.size()) + " pressing(s) in database" : std::string()));
+    int accurate = 0;
+    int inDatabase = 0;
+    std::map<std::string, int> byVersion;  // accurate tracks per matched checksum version
+    for (const ArTrack& t : tracks) {
+        const cdr::AccurateRipTrackResult r =
+            cdr::matchAccurateRip(result.pressings, cdr::accurateRipEntryIndex(toc, t.track), t.track.number, t.v1, t.v2);
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "Track %02d  v1 %s  v2 %s  ", t.track.number, hex32(t.v1).c_str(),
+                      hex32(t.v2).c_str());
+        line(buf + (found ? r.describe() : std::string()));
+        // Per pressing: its checksum, how many submissions stand behind it and
+        // which of our checksums (if any) it equals.
+        for (const cdr::AccurateRipPressingMatch& p : r.pressings) {
+            std::snprintf(buf, sizeof buf, "          pressing %d: %s  confidence %3d  %s", p.pressing,
+                          hex32(p.checksum).c_str(), p.confidence,
+                          p.version == 2 ? "v2 match" : p.version == 1 ? "v1 match" : "no match");
+            line(buf);
+        }
+        accurate += r.accurate() ? 1 : 0;
+        inDatabase += r.inDatabase() ? 1 : 0;
+        if (r.accurate()) ++byVersion[r.matchedVersion()];
+    }
+
+    if (!lookup) {
+        line("AccurateRip: lookup disabled (--no-accuraterip)");
+    } else if (result.status == cdr::AccurateRipLookup::Status::NotFound) {
+        line("AccurateRip: this disc is not in the database (no rips submitted yet)");
+    } else if (!found) {
+        line("AccurateRip: lookup failed: " + result.error);
+    } else {
+        std::string versions;
+        for (const auto& [version, count] : byVersion)
+            versions += (versions.empty() ? "" : ", ") + version + ": " + std::to_string(count);
+        line("AccurateRip: " + std::to_string(accurate) + " of " + std::to_string(tracks.size()) +
+             " track(s) accurately ripped" + (versions.empty() ? "" : " (" + versions + ")") + ", " +
+             std::to_string(inDatabase) + " track(s) in database");
+        if (accurate == 0 && inDatabase > 0)
+            line(std::string("Hint: no track matched. Check the read offset (--offset), e.g. with 'cdreader offset ") +
+                 letter + ":'.");
+    }
+}
+
 int cmdRip(const std::vector<std::string>& args) {
     if (args.size() < 2) throw UsageError("rip needs a drive argument");
     const char letter = parseDriveLetter(args[1]);
     std::string outputDir;
     std::set<int> wanted;
     cdr::RipOptions options;
+    bool accurateRip = true;
 
     for (size_t i = 2; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -183,6 +266,7 @@ int cmdRip(const std::vector<std::string>& args) {
         else if (a == "-r" || a == "--retries") options.maxRetries = parseInt(value(), "retry count");
         else if (a == "--offset") options.readOffsetSamples = parseSignedInt(value(), "read offset");
         else if (a == "--verify") options.verify = true;
+        else if (a == "--no-accuraterip") accurateRip = false;
         else throw UsageError("unknown option '" + a + "'");
     }
 
@@ -222,6 +306,7 @@ int cmdRip(const std::vector<std::string>& args) {
     {
         char line[256];
         log << "CDDB disc id: " << hex32(toc.cddbId()) << "\n";
+        log << "AccurateRip disc id: " << cdr::AccurateRipDiscId::fromToc(toc).toString() << "\n";
         for (const cdr::Track& t : toc.tracks) {
             std::snprintf(line, sizeof line, "Track %2d  LBA %7u  %s  %s\n", t.number, t.startLba,
                           cdr::formatMsf(t.lengthSectors).c_str(), t.isAudio ? "audio" : "data");
@@ -236,6 +321,7 @@ int cmdRip(const std::vector<std::string>& args) {
 
     cdr::Ripper ripper(*d.drive, toc, options);
     int problems = 0;
+    std::vector<ArTrack> arTracks;
     for (const cdr::Track& t : selected) {
         std::unique_ptr<cdr::AudioWriter> writer = cdr::createAudioWriter(format);
         char base[32];
@@ -245,8 +331,13 @@ int cmdRip(const std::vector<std::string>& args) {
 
         writer->open(file, album.forTrack(t.number, toc.lastTrack));
         int lastPercent = -1;
+        cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, t);
         cdr::TrackRipResult r = ripper.ripTrack(
-            t, [&](const uint8_t* pcm, size_t bytes) { writer->write(pcm, bytes); },
+            t,
+            [&](const uint8_t* pcm, size_t bytes) {
+                writer->write(pcm, bytes);
+                ar.update(pcm, bytes);
+            },
             [&](uint32_t done, uint32_t total) {
                 int percent = total ? int(uint64_t(done) * 100 / total) : 100;
                 if (percent != lastPercent) {
@@ -264,11 +355,111 @@ int cmdRip(const std::vector<std::string>& args) {
         if (r.paddedSamples) log << "  (" << r.paddedSamples << " samples outside the disc padded with silence)";
         log << "\n";
         if (!r.clean()) ++problems;
+        arTracks.push_back({t, ar.v1(), ar.v2()});
     }
+
+    reportAccurateRip(toc, arTracks, accurateRip, letter, log);
 
     log << "\n" << (problems ? "Finished with errors" : "All tracks ripped without errors") << "\n";
     std::printf("\n%s\n", problems ? "Finished with errors - see rip.log" : "Done.");
     return problems ? 2 : 0;
+}
+
+// Detects the read offset by reading one track and comparing its checksum
+// at every candidate offset with the AccurateRip database.
+int cmdOffset(const std::vector<std::string>& args) {
+    if (args.size() < 2) throw UsageError("offset needs a drive argument");
+    const char letter = parseDriveLetter(args[1]);
+    int trackNumber = 0;
+    int range = 3000;
+    cdr::RipOptions options;
+    for (size_t i = 2; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        auto value = [&]() -> const std::string& {
+            if (i + 1 >= args.size()) throw UsageError(a + " needs a value");
+            return args[++i];
+        };
+        if (a == "-t" || a == "--track") trackNumber = parseInt(value(), "track number");
+        else if (a == "--range") range = parseInt(value(), "offset range");
+        else if (a == "-r" || a == "--retries") options.maxRetries = parseInt(value(), "retry count");
+        else throw UsageError("unknown option '" + a + "'");
+    }
+    if (range < 1 || range > int(100 * cdr::kSamplesPerSector)) throw UsageError("offset range out of range");
+
+    OpenedDrive d = openDrive(letter);
+    const cdr::Toc toc = readTocOrExplain(*d.drive);
+    const cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(toc);
+    std::printf("Drive: %s\n", d.info.displayName().c_str());
+    std::printf("AccurateRip disc id: %s\n", id.toString().c_str());
+
+    cdr::win::WinHttpClient http(std::string("cdreader/") + kVersion);
+    const cdr::AccurateRipLookup lookup = cdr::lookupAccurateRip(http, id);
+    if (lookup.status == cdr::AccurateRipLookup::Status::NotFound) {
+        std::printf("This disc is not in the AccurateRip database. Try a more popular CD.\n");
+        return 1;
+    }
+    if (lookup.status != cdr::AccurateRipLookup::Status::Found)
+        throw std::runtime_error("AccurateRip lookup failed: " + lookup.error);
+
+    // Total confidence of a track's database entries.
+    auto confidence = [&](const cdr::Track& t) {
+        return cdr::matchAccurateRip(lookup.pressings, cdr::accurateRipEntryIndex(toc, t), t.number, 0, 0)
+            .totalConfidence;
+    };
+    const cdr::Track* track = nullptr;
+    if (trackNumber) {
+        track = toc.findTrack(trackNumber);
+        if (!track || !track->isAudio) throw UsageError("track " + std::to_string(trackNumber) + " is not an audio track");
+    } else {
+        // Prefer tracks in the middle of the disc: the first and last ones
+        // touch the unreadable area outside the disc at large offsets.
+        const size_t audio = toc.audioTrackCount();
+        size_t index = 0;
+        int best = 0;
+        for (const cdr::Track& t : toc.tracks) {
+            if (!t.isAudio) continue;
+            ++index;
+            const bool edge = audio > 2 && (index == 1 || index == audio);
+            const int c = confidence(t) * (edge ? 1 : 1000);
+            if (c > best) {
+                best = c;
+                track = &t;
+            }
+        }
+        if (!track) throw std::runtime_error("no track of this disc has AccurateRip data");
+    }
+
+    std::printf("Checking track %d (confidence %d) at offsets -%d..+%d\n", track->number, confidence(*track), range,
+                range);
+    int lastPercent = -1;
+    const cdr::AccurateRipOffsetScan scan = cdr::scanReadOffsets(
+        *d.drive, toc, *track, uint32_t(range), options, [&](uint32_t done, uint32_t total) {
+            const int percent = total ? int(uint64_t(done) * 100 / total) : 100;
+            if (percent != lastPercent) {
+                std::printf("\rReading track %02d  %3d%%", track->number, percent);
+                std::fflush(stdout);
+                lastPercent = percent;
+            }
+        });
+    std::printf("\n");
+
+    const std::vector<cdr::AccurateRipOffsetMatch> matches =
+        cdr::findAccurateRipOffsets(scan, lookup.pressings, cdr::accurateRipEntryIndex(toc, *track));
+    if (matches.empty()) {
+        std::printf("No offset in -%d..+%d matches the database (try another track with -t, or a wider --range).\n",
+                    range, range);
+        return 1;
+    }
+    std::printf("Matching offsets (submissions whose checksum matches at that offset):\n");
+    for (const cdr::AccurateRipOffsetMatch& m : matches)
+        std::printf("  offset %+5d  %-5s  v2 %3d  v1 %3d  (%d of %d pressing(s))\n", m.offset,
+                    m.matchedVersion().c_str(), m.v2Confidence, m.v1Confidence, m.pressings, int(lookup.pressings.size()));
+    const cdr::AccurateRipOffsetMatch& best = matches.front();
+    std::printf("\nRead offset: %+d  (matched %s, confidence %d; use: cdreader rip %c: --offset %d)\n", best.offset,
+                best.matchedVersion().c_str(), best.confidence(), letter, best.offset);
+    if (matches.size() > 1)
+        std::printf("Several offsets match (different pressings); confirm the result with another disc.\n");
+    return 0;
 }
 
 }  // namespace
@@ -288,6 +479,7 @@ int main() {
         if (args[0] == "drives") return cmdDrives();
         if (args[0] == "toc") return cmdToc(args);
         if (args[0] == "rip") return cmdRip(args);
+        if (args[0] == "offset") return cmdOffset(args);
         throw UsageError("unknown command '" + args[0] + "'");
     } catch (const UsageError& e) {
         std::fprintf(stderr, "error: %s\n\n", e.what());
