@@ -1,7 +1,9 @@
 // Minimal self-contained test runner (no external dependencies).
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -13,13 +15,17 @@
 
 #include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
-#include "cdreader/metadata.h"
 #include "cdreader/crc32.h"
+#include "cdreader/cue_sheet.h"
+#include "cdreader/file_name.h"
 #include "cdreader/flac_encoder.h"
 #include "cdreader/flac_writer.h"
 #include "cdreader/md5.h"
+#include "cdreader/metadata.h"
+#include "cdreader/ogg.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
+#include "cdreader/tags.h"
 #include "cdreader/toc.h"
 #include "cdreader/wav_writer.h"
 #include "fake_drive.h"
@@ -686,6 +692,485 @@ TEST(flac_writer_rejects_partial_sample) {
     }
     std::filesystem::remove(path);
     CHECK(threw);
+}
+
+// --- Tags, WAV metadata, CUE sheets, single-file rips, Ogg -----------------
+
+namespace {
+
+uint32_t le32At(const std::vector<uint8_t>& v, size_t o) {
+    return uint32_t(v[o]) | uint32_t(v[o + 1]) << 8 | uint32_t(v[o + 2]) << 16 | uint32_t(v[o + 3]) << 24;
+}
+
+std::string str(const std::vector<uint8_t>& v, size_t o, size_t n) {
+    return std::string(reinterpret_cast<const char*>(v.data() + o), n);
+}
+
+std::vector<uint8_t> readFile(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// Set CDREADER_TEST_OUTPUT to a directory to keep sample files for checking
+// with external tools (ffprobe, MediaInfo, ExifTool, ogginfo, ...).
+void keepSample(const std::string& name, const std::vector<uint8_t>& bytes) {
+    const char* dir = std::getenv("CDREADER_TEST_OUTPUT");
+    if (!dir || !*dir) return;
+    std::ofstream out(std::filesystem::u8path(dir) / name, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+}
+
+cdr::AlbumMetadata sampleAlbum() {
+    cdr::AlbumMetadata album;
+    album.artist = "Artist";
+    album.title = "Album";
+    album.genre = "Hard Rock";
+    album.year = "1999";
+    album.discId = "0A0B0C03";
+    album.trackTitles = {"One", "Two \"2\"", "Three"};
+    album.trackArtists = {"", "Guest", ""};
+    return album;
+}
+
+struct Chunk {
+    std::string id;
+    size_t offset;  // of the payload
+    uint32_t size;
+};
+
+// Walks the chunks of a RIFF file and checks that they exactly fill it.
+std::vector<Chunk> riffChunks(const std::vector<uint8_t>& file) {
+    std::vector<Chunk> chunks;
+    CHECK(file.size() >= 12 && str(file, 0, 4) == "RIFF" && str(file, 8, 4) == "WAVE");
+    CHECK_EQ(le32At(file, 4), uint32_t(file.size() - 8));
+    size_t pos = 12;
+    while (pos + 8 <= file.size()) {
+        Chunk c{str(file, pos, 4), pos + 8, le32At(file, pos + 4)};
+        chunks.push_back(c);
+        pos = c.offset + c.size + (c.size % 2);
+    }
+    CHECK_EQ(pos, file.size());
+    return chunks;
+}
+
+// Sub-chunks of a LIST/INFO payload as id -> text (without the terminator).
+std::vector<std::pair<std::string, std::string>> infoFields(const std::vector<uint8_t>& v, size_t offset, uint32_t size) {
+    std::vector<std::pair<std::string, std::string>> fields;
+    CHECK(str(v, offset, 4) == "INFO");
+    size_t pos = offset + 4;
+    while (pos + 8 <= offset + size) {
+        const uint32_t n = le32At(v, pos + 4);
+        CHECK(n > 0 && v[pos + 8 + n - 1] == 0);  // NUL-terminated
+        fields.emplace_back(str(v, pos, 4), str(v, pos + 8, n - 1));
+        pos += 8 + n + (n % 2);
+    }
+    CHECK_EQ(pos, offset + size);
+    return fields;
+}
+
+uint32_t syncsafe(const std::vector<uint8_t>& v, size_t o) {
+    return uint32_t(v[o]) << 21 | uint32_t(v[o + 1]) << 14 | uint32_t(v[o + 2]) << 7 | v[o + 3];
+}
+
+// Frames of an ID3v2.4 tag as id -> payload (after the encoding byte).
+std::vector<std::pair<std::string, std::string>> id3Frames(const std::vector<uint8_t>& v, size_t offset) {
+    std::vector<std::pair<std::string, std::string>> frames;
+    CHECK(str(v, offset, 3) == "ID3" && v[offset + 3] == 4 && v[offset + 4] == 0 && v[offset + 5] == 0);
+    const size_t end = offset + 10 + syncsafe(v, offset + 6);
+    size_t pos = offset + 10;
+    while (pos + 10 <= end) {
+        const uint32_t n = syncsafe(v, pos + 4);
+        CHECK_EQ(v[pos + 10], 3);  // UTF-8
+        frames.emplace_back(str(v, pos, 4), str(v, pos + 11, n - 1));
+        pos += 10 + n;
+    }
+    CHECK_EQ(pos, end);
+    return frames;
+}
+
+std::string fieldValue(const std::vector<std::pair<std::string, std::string>>& fields, const std::string& id) {
+    for (const auto& [k, v] : fields)
+        if (k == id) return v;
+    return "<missing>";
+}
+
+struct OggPage {
+    uint8_t flags;
+    int64_t granule;
+    uint32_t serial;
+    uint32_t sequence;
+    std::vector<uint8_t> lacing;
+    std::vector<uint8_t> body;
+};
+
+// Splits an Ogg stream into pages, verifying the capture pattern and CRC.
+std::vector<OggPage> parseOgg(const std::vector<uint8_t>& s) {
+    std::vector<OggPage> pages;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        CHECK(pos + 27 <= s.size() && str(s, pos, 4) == "OggS" && s[pos + 4] == 0);
+        OggPage p;
+        p.flags = s[pos + 5];
+        uint64_t g = 0;
+        for (int i = 7; i >= 0; --i) g = (g << 8) | s[pos + 6 + size_t(i)];
+        p.granule = int64_t(g);
+        p.serial = le32At(s, pos + 14);
+        p.sequence = le32At(s, pos + 18);
+        const size_t segments = s[pos + 26];
+        p.lacing.assign(s.begin() + ptrdiff_t(pos + 27), s.begin() + ptrdiff_t(pos + 27 + segments));
+        size_t bodySize = 0;
+        for (uint8_t l : p.lacing) bodySize += l;
+        const size_t pageSize = 27 + segments + bodySize;
+        CHECK(pos + pageSize <= s.size());
+        p.body.assign(s.begin() + ptrdiff_t(pos + 27 + segments), s.begin() + ptrdiff_t(pos + pageSize));
+        std::vector<uint8_t> copy(s.begin() + ptrdiff_t(pos), s.begin() + ptrdiff_t(pos + pageSize));
+        const uint32_t stored = le32At(copy, 22);
+        std::fill(copy.begin() + 22, copy.begin() + 26, uint8_t(0));
+        CHECK_EQ(cdr::oggCrc32(copy.data(), copy.size()), stored);
+        pages.push_back(std::move(p));
+        pos += pageSize;
+    }
+    return pages;
+}
+
+// Reassembles packets from pages (checking the continued flags).
+std::vector<std::vector<uint8_t>> oggPackets(const std::vector<OggPage>& pages) {
+    std::vector<std::vector<uint8_t>> packets;
+    std::vector<uint8_t> current;
+    bool open = false;
+    for (const OggPage& p : pages) {
+        CHECK_EQ(bool(p.flags & 0x01), open);
+        size_t pos = 0;
+        for (uint8_t l : p.lacing) {
+            current.insert(current.end(), p.body.begin() + ptrdiff_t(pos), p.body.begin() + ptrdiff_t(pos + l));
+            pos += l;
+            open = l == 255;
+            if (!open) {
+                packets.push_back(current);
+                current.clear();
+            }
+        }
+    }
+    CHECK(!open);
+    return packets;
+}
+
+}  // namespace
+
+TEST(riff_info_chunk_layout) {
+    cdr::TrackMetadata m = sampleAlbum().forTrack(2, 3);
+    m.title = "Two";  // 3 bytes + NUL: even, no pad
+    const std::vector<uint8_t> c = cdr::riffInfoChunk(m);
+    CHECK(str(c, 0, 4) == "LIST");
+    CHECK_EQ(le32At(c, 4), uint32_t(c.size() - 8));
+    CHECK_EQ(c.size() % 2, 0u);
+    const auto f = infoFields(c, 8, le32At(c, 4));
+    CHECK(fieldValue(f, "INAM") == "Two");
+    CHECK(fieldValue(f, "IART") == "Guest");
+    CHECK(fieldValue(f, "IPRD") == "Album");
+    CHECK(fieldValue(f, "ITRK") == "2");
+    CHECK(fieldValue(f, "ICRD") == "1999");
+    CHECK(fieldValue(f, "IGNR") == "Hard Rock");
+    CHECK(fieldValue(f, "ICMT") == "CDDB disc ID 0A0B0C03");
+    // "Artist" is 6 bytes + NUL = 7: the size says 7 and a pad byte follows.
+    m.artist = "Artist";
+    const std::vector<uint8_t> c2 = cdr::riffInfoChunk(m);
+    CHECK(fieldValue(infoFields(c2, 8, le32At(c2, 4)), "IART") == "Artist");
+}
+
+TEST(tags_skipped_without_metadata) {
+    CHECK(cdr::riffInfoChunk(cdr::TrackMetadata{}).empty());
+    CHECK(cdr::id3v2Tag(cdr::TrackMetadata{}).empty());
+}
+
+TEST(id3v2_tag_frames) {
+    cdr::TrackMetadata m = sampleAlbum().forTrack(2, 3);
+    m.title = std::string(200, 'x');  // frame size above 127 needs the syncsafe encoding
+    const std::vector<uint8_t> tag = cdr::id3v2Tag(m);
+    CHECK_EQ(size_t(syncsafe(tag, 6)) + 10, tag.size());
+    for (size_t i = 6; i < 10; ++i) CHECK(tag[i] < 0x80);
+    const auto f = id3Frames(tag, 0);
+    CHECK(fieldValue(f, "TIT2") == m.title);
+    CHECK(fieldValue(f, "TPE1") == "Guest");
+    CHECK(fieldValue(f, "TALB") == "Album");
+    CHECK(fieldValue(f, "TPE2") == "Artist");
+    CHECK(fieldValue(f, "TRCK") == "2/3");
+    CHECK(fieldValue(f, "TDRC") == "1999");
+    CHECK(fieldValue(f, "TCON") == "Hard Rock");
+    CHECK(fieldValue(f, "TXXX") == std::string("DISCID") + '\0' + "0A0B0C03");
+}
+
+TEST(wav_writer_writes_tags_after_data) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test_tags.wav";
+    cdr::TrackMetadata m = sampleAlbum().forTrack(1, 3);
+    m.title = "日本語のタイトル";
+    for (size_t dataSize : {size_t(2 * cdr::kSectorBytes), size_t(1001)}) {  // odd size needs a pad byte
+        const std::vector<uint8_t> pcm = expectedTrackData(10, 2);
+        {
+            cdr::WavWriter wav;
+            wav.open(path, m);
+            wav.write(pcm.data(), dataSize);
+            wav.close();
+        }
+        const std::vector<uint8_t> file = readFile(path);
+        std::filesystem::remove(path);
+        if (dataSize % 2 == 0) keepSample("tagged.wav", file);
+
+        const std::vector<Chunk> chunks = riffChunks(file);
+        CHECK_EQ(chunks.size(), 4u);
+        if (chunks.size() != 4) continue;
+        CHECK(chunks[0].id == "fmt " && chunks[0].size == 16 && chunks[0].offset == 20);
+        CHECK(chunks[1].id == "data" && chunks[1].offset == 44 && chunks[1].size == dataSize);
+        CHECK(std::equal(pcm.begin(), pcm.begin() + ptrdiff_t(dataSize), file.begin() + 44));
+        CHECK(chunks[2].id == "LIST");
+        CHECK(chunks[2].offset % 2 == 0);
+        const auto info = infoFields(file, chunks[2].offset, chunks[2].size);
+        CHECK(fieldValue(info, "INAM") == m.title);
+        CHECK(fieldValue(info, "ITRK") == "1");
+        CHECK(chunks[3].id == "id3 ");
+        const auto id3 = id3Frames(file, chunks[3].offset);
+        CHECK(fieldValue(id3, "TIT2") == m.title);
+        CHECK(fieldValue(id3, "TRCK") == "1/3");
+    }
+}
+
+TEST(cue_sheet_single_file) {
+    std::vector<cdr::Track> tracks = {{1, 0, 300}, {2, 300, 150}, {3, 450, 300 + 75 * 60 * 2 + 7}};
+    tracks[1].preEmphasis = true;
+    tracks[2].copyPermitted = true;
+    tracks[2].preEmphasis = true;
+    const cdr::AlbumMetadata album = sampleAlbum();
+    const std::string cue = cdr::formatCueSheet(album, cdr::singleFileCueTracks(tracks, "Artist - Album.wav", album));
+    const std::string expected =
+        "REM COMMENT \"cdreader\"\r\n"
+        "REM GENRE \"Hard Rock\"\r\n"
+        "REM DATE 1999\r\n"
+        "REM DISCID 0A0B0C03\r\n"
+        "PERFORMER \"Artist\"\r\n"
+        "TITLE \"Album\"\r\n"
+        "FILE \"Artist - Album.wav\" WAVE\r\n"
+        "  TRACK 01 AUDIO\r\n"
+        "    TITLE \"One\"\r\n"
+        "    PERFORMER \"Artist\"\r\n"
+        "    INDEX 01 00:00:00\r\n"
+        "  TRACK 02 AUDIO\r\n"
+        "    TITLE \"Two '2'\"\r\n"
+        "    PERFORMER \"Guest\"\r\n"
+        "    FLAGS PRE\r\n"
+        "    INDEX 01 00:04:00\r\n"
+        "  TRACK 03 AUDIO\r\n"
+        "    TITLE \"Three\"\r\n"
+        "    PERFORMER \"Artist\"\r\n"
+        "    FLAGS DCP PRE\r\n"
+        "    INDEX 01 00:06:00\r\n";
+    CHECK(cue == expected);
+    keepSample("ascii.cue", std::vector<uint8_t>(cue.begin(), cue.end()));
+}
+
+TEST(cue_sheet_rejects_non_adjacent_tracks) {
+    const std::vector<cdr::Track> tracks = {{1, 0, 300}, {3, 450, 300}};
+    bool threw = false;
+    try {
+        cdr::singleFileCueTracks(tracks, "x.wav", {});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+    // A data track in between (mixed mode / CD-Extra layout) is a gap too.
+    const std::vector<cdr::Track> gap = {{1, 0, 300}, {2, 300 + cdr::kSessionGapSectors, 300}};
+    threw = false;
+    try {
+        cdr::singleFileCueTracks(gap, "x.wav", {});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(cue_sheet_per_track_and_encoding) {
+    const std::vector<cdr::Track> tracks = {{1, 0, 300}, {2, 300, 150}};
+    cdr::AlbumMetadata album;  // nothing known: only the comment line and tracks
+    std::string cue = cdr::formatCueSheet(album, cdr::perTrackCueTracks(tracks, {"Track01.flac", "Track02.flac"}, album));
+    CHECK(cue ==
+          "REM COMMENT \"cdreader\"\r\n"
+          "FILE \"Track01.flac\" WAVE\r\n"
+          "  TRACK 01 AUDIO\r\n"
+          "    INDEX 01 00:00:00\r\n"
+          "FILE \"Track02.flac\" WAVE\r\n"
+          "  TRACK 02 AUDIO\r\n"
+          "    INDEX 01 00:00:00\r\n");
+    CHECK(cue.compare(0, 3, "\xEF\xBB\xBF") != 0);  // ASCII only: no BOM
+
+    album.title = "アルバム\r\nTITLE \"injected\"";
+    cue = cdr::formatCueSheet(album, cdr::singleFileCueTracks(tracks, "a.wav", album));
+    CHECK(cue.compare(0, 3, "\xEF\xBB\xBF") == 0);
+    CHECK(cue.find("TITLE \"アルバム  TITLE 'injected'\"\r\n") != std::string::npos);
+    keepSample("utf8.cue", std::vector<uint8_t>(cue.begin(), cue.end()));
+
+    CHECK(cdr::cueFileType("WAV") == "WAVE");
+    CHECK(cdr::cueFileType("mp3") == "MP3");
+    CHECK(cdr::cueFileType("aiff") == "AIFF");
+    CHECK(cdr::formatCueTime(0) == "00:00:00");
+    CHECK(cdr::formatCueTime(75 * 60 * 100 + 75 * 59 + 74) == "100:59:74");
+}
+
+// With read offset correction every track is cut from the drive's data
+// shifted by the same offset, so tracks ripped back to back must join without
+// gaps or overlaps: the image equals the shifted disc.
+TEST(single_file_rip_is_contiguous_with_offset) {
+    for (int offset : {0, 6, -472, 667, 1206}) {
+        FakeDrive fake = makeAudioDisc();
+        cdr::CdDrive drive(fake);
+        const cdr::Toc toc = drive.readToc();
+        cdr::RipOptions options;
+        options.readOffsetSamples = offset;
+        cdr::Ripper ripper(drive, toc, options);
+
+        const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test_image.wav";
+        std::vector<uint8_t> concatenated;
+        {
+            cdr::WavWriter image;
+            image.open(path, cdr::AlbumMetadata{}.forTrack(0, 3));
+            for (const cdr::Track& t : toc.tracks) {
+                Collected single;
+                ripper.ripTrack(t, [&](const uint8_t* p, size_t n) {
+                    image.write(p, n);
+                    single.bytes.insert(single.bytes.end(), p, p + n);
+                });
+                concatenated.insert(concatenated.end(), single.bytes.begin(), single.bytes.end());
+            }
+            image.close();
+        }
+        const std::vector<uint8_t> file = readFile(path);
+        std::filesystem::remove(path);
+
+        const std::vector<uint8_t> expected = expectedWithOffset(0, 750, offset, 0, 750);
+        CHECK(concatenated == expected);
+        CHECK_EQ(file.size(), 44u + expected.size());
+        CHECK(std::equal(expected.begin(), expected.end(), file.begin() + 44));
+        // ...and each track's INDEX 01 is where that track's data starts in the file.
+        const auto cue = cdr::singleFileCueTracks(toc.tracks, "image.wav", {});
+        for (size_t i = 0; i < cue.size(); ++i) {
+            const size_t at = size_t(cue[i].startSectors) * cdr::kSectorBytes;
+            const OffsetRip alone = ripWithOffset(fake, cue[i].number, offset);
+            CHECK(std::equal(alone.bytes.begin(), alone.bytes.end(), file.begin() + 44 + ptrdiff_t(at)));
+        }
+    }
+}
+
+TEST(file_names_are_sanitized) {
+    CHECK(cdr::safeFileName("AC/DC: Back <in> \"Black\"?", "x") == "AC_DC_ Back _in_ _Black__");
+    CHECK(cdr::safeFileName("  Title...  ", "x") == "Title");
+    CHECK(cdr::safeFileName(" . ", "fallback") == "fallback");
+    CHECK(cdr::safeFileName("con", "x") == "_con");
+    CHECK(cdr::safeFileName("LPT1.txt", "x") == "_LPT1.txt");
+    CHECK(cdr::safeFileName("COM10", "x") == "COM10");
+    const std::string longName = cdr::safeFileName(std::string(149, 'a') + "あいう", "x");
+    CHECK(longName == std::string(149, 'a'));  // not cut inside a UTF-8 sequence
+    cdr::AlbumMetadata album;
+    CHECK(cdr::albumFileBase(album, "CDImage") == "CDImage");
+    album.title = "Album";
+    CHECK(cdr::albumFileBase(album, "CDImage") == "Album");
+    album.artist = "A/B";
+    CHECK(cdr::albumFileBase(album, "CDImage") == "A_B - Album");
+}
+
+TEST(ogg_crc_check_value) {
+    const char* text = "123456789";
+    // CRC-32 with polynomial 0x04C11DB7, init 0, no reflection, no final XOR.
+    CHECK_EQ(cdr::oggCrc32(reinterpret_cast<const uint8_t*>(text), 9), 0x89A1897Fu);
+    const uint32_t part = cdr::oggCrc32(reinterpret_cast<const uint8_t*>(text), 4);
+    CHECK_EQ(cdr::oggCrc32(reinterpret_cast<const uint8_t*>(text) + 4, 5, part), 0x89A1897Fu);
+}
+
+TEST(ogg_single_page_known_bytes) {
+    std::vector<uint8_t> out;
+    cdr::OggStreamWriter ogg(0x12345678, [&](const uint8_t* p, size_t n) { out.insert(out.end(), p, p + n); });
+    ogg.writePacket(std::vector<uint8_t>{'a', 'b', 'c'}, 0, true);
+    // Computed independently (Python reference implementation of RFC 3533).
+    const std::vector<uint8_t> expected = {0x4F, 0x67, 0x67, 0x53, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                           0x00, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
+                                           0x1A, 0xAD, 0x3C, 0x30, 0x01, 0x03, 0x61, 0x62, 0x63};
+    CHECK(out == expected);
+    CHECK(ogg.finished());
+    bool threw = false;
+    try {
+        ogg.writePacket(std::vector<uint8_t>{1}, 1);
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(ogg_lacing_spanning_and_flags) {
+    std::vector<uint8_t> out;
+    cdr::OggStreamWriter ogg(7, [&](const uint8_t* p, size_t n) { out.insert(out.end(), p, p + n); });
+    std::vector<std::vector<uint8_t>> packets;
+    for (size_t size : {size_t(19), size_t(0), size_t(254), size_t(255), size_t(256), size_t(510), size_t(200000),
+                        size_t(3), size_t(255 * 255), size_t(100)}) {
+        std::vector<uint8_t> p(size);
+        for (size_t i = 0; i < size; ++i) p[i] = uint8_t(i * 31 + packets.size());
+        packets.push_back(p);
+    }
+    ogg.writePacket(packets[0], 0);
+    ogg.flush();  // a header packet alone on the first page
+    ogg.flush();  // nothing buffered: no empty page
+    for (size_t i = 1; i < packets.size(); ++i)
+        ogg.writePacket(packets[i], int64_t(i * 1000), i + 1 == packets.size());
+    keepSample("stream.ogg", out);
+
+    const std::vector<OggPage> pages = parseOgg(out);
+    CHECK(oggPackets(pages) == packets);
+    CHECK_EQ(pages.size(), size_t(ogg.pagesWritten()));
+    CHECK(pages.size() > 4);
+    CHECK_EQ(pages[0].lacing.size(), 1u);
+    CHECK_EQ(pages[0].flags, 0x02);  // BOS only
+    CHECK_EQ(pages[0].granule, 0);
+    int64_t lastGranule = 0;
+    for (size_t i = 0; i < pages.size(); ++i) {
+        const OggPage& p = pages[i];
+        CHECK_EQ(p.serial, 7u);
+        CHECK_EQ(p.sequence, uint32_t(i));
+        CHECK(p.lacing.size() <= 255);
+        CHECK_EQ(bool(p.flags & 0x02), i == 0);
+        CHECK_EQ(bool(p.flags & 0x04), i + 1 == pages.size());
+        // Granule: -1 when no packet ends on the page, else non-decreasing.
+        const bool packetEnds = std::any_of(p.lacing.begin(), p.lacing.end(), [](uint8_t l) { return l < 255; });
+        if (!packetEnds) {
+            CHECK_EQ(p.granule, -1);
+        } else {
+            CHECK(p.granule >= lastGranule);
+            lastGranule = p.granule;
+        }
+    }
+    CHECK_EQ(pages.back().granule, 9000);
+    // The 200000-byte packet spans several pages, so some page has only 255s
+    // and continued pages must exist.
+    CHECK(std::any_of(pages.begin(), pages.end(), [](const OggPage& p) { return p.granule == -1; }));
+    CHECK(std::any_of(pages.begin(), pages.end(), [](const OggPage& p) { return p.flags & 0x01; }));
+}
+
+TEST(ogg_target_page_size) {
+    int pages = 0;
+    cdr::OggStreamWriter ogg(1, [&](const uint8_t*, size_t) { ++pages; }, 10);
+    ogg.writePacket(std::vector<uint8_t>(9), 1);
+    CHECK_EQ(pages, 0);
+    ogg.writePacket(std::vector<uint8_t>(1), 2);  // body reaches 10 bytes
+    CHECK_EQ(pages, 1);
+}
+
+TEST(ogg_eos_on_full_page) {
+    // A packet of exactly 254 * 255 bytes uses 254 lacing values of 255 plus a
+    // final 0: the page is full (255 values) when the packet ends.
+    std::vector<uint8_t> out;
+    cdr::OggStreamWriter ogg(1, [&](const uint8_t* p, size_t n) { out.insert(out.end(), p, p + n); });
+    const std::vector<uint8_t> packet(254 * 255, 0x5A);
+    ogg.writePacket(packet, 42, true);
+    const std::vector<OggPage> pages = parseOgg(out);
+    CHECK_EQ(pages.size(), 1u);
+    CHECK_EQ(pages[0].lacing.size(), 255u);
+    CHECK_EQ(pages[0].flags, 0x06);
+    CHECK_EQ(pages[0].granule, 42);
 }
 
 int main() {
