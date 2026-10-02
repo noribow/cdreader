@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "cdreader/cue_sheet.h"
 #include "cdreader/metadata.h"
 
 // Building blocks of the FLAC encoder (https://www.rfc-editor.org/rfc/rfc9639),
@@ -72,6 +73,18 @@ private:
 };
 
 // Body of a VORBIS_COMMENT metadata block (without the 4-byte block header).
-std::vector<uint8_t> vorbisComment(const TrackMetadata& metadata, const std::string& vendor);
+// A non-empty `cueSheet` is added as a CUESHEET comment (the embedded CUE
+// sheet read by foobar2000 and others).
+std::vector<uint8_t> vorbisComment(const TrackMetadata& metadata, const std::string& vendor,
+                                   const std::string& cueSheet = {});
+
+// Body of a CUESHEET metadata block for a CD image: one track per CueTrack
+// with INDEX 01 at its start, then the lead-out track (number 170) at
+// `leadOutSamples`. Offsets are in samples (588 per CD frame); the block is
+// marked as CD-DA when every offset is a multiple of 588.
+std::vector<uint8_t> cueSheet(const EmbeddedCueSheet& cue, uint64_t leadOutSamples);
+
+// Position of the lead-out track's 64-bit offset inside a cueSheet() body.
+size_t cueSheetLeadOutOffsetPosition(size_t tracks);
 
 }  // namespace cdr::flac

@@ -59,7 +59,9 @@ void printUsage() {
         "                        (same value as EAC / AccurateRip; default: 0)\n"
         "      --verify          Read everything twice and compare (slower)\n"
         "      --single-file     Rip the tracks into one file (an image of the disc);\n"
-        "                        the CUE sheet then marks the track positions\n"
+        "                        the CUE sheet then marks the track positions. FLAC\n"
+        "                        images also carry the CUE sheet inside the file\n"
+        "      --no-cue-file     Do not write the external .cue file\n"
         "\n"
         "<drive> is a drive letter such as D or D:\n",
         kVersion, formatList().c_str());
@@ -186,6 +188,7 @@ int cmdRip(const std::vector<std::string>& args) {
     std::set<int> wanted;
     cdr::RipOptions options;
     bool singleFile = false;
+    bool cueFile = true;
 
     for (size_t i = 2; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -198,6 +201,7 @@ int cmdRip(const std::vector<std::string>& args) {
         else if (a == "-t" || a == "--tracks") wanted = parseTrackList(value());
         else if (a == "-r" || a == "--retries") options.maxRetries = parseInt(value(), "retry count");
         else if (a == "--offset") options.readOffsetSamples = parseSignedInt(value(), "read offset");
+        else if (a == "--no-cue-file") cueFile = false;
         else if (a == "--verify") options.verify = true;
         else if (a == "--single-file") singleFile = true;
         else throw UsageError("unknown option '" + a + "'");
@@ -276,8 +280,19 @@ int cmdRip(const std::vector<std::string>& args) {
     std::vector<std::string> trackFiles;
     if (singleFile) {
         writer = cdr::createAudioWriter(format);
+        if (writer->canEmbedCueSheet()) {
+            cdr::EmbeddedCueSheet embedded;
+            embedded.tracks = cueTracks;
+            for (const cdr::Track& t : selected) embedded.totalSectors += t.lengthSectors;
+            embedded.text = cdr::formatCueSheet(album, cueTracks);
+            writer->setEmbeddedCueSheet(embedded);
+        }
         writer->open(dir / fs::u8path(imageName), album.forTrack(0, toc.lastTrack));
         log << "Single file: " << imageName << "\n";
+        if (writer->canEmbedCueSheet()) {
+            std::printf("Embedded CUE sheet: CUESHEET block and tag in %s\n\n", imageName.c_str());
+            log << "Embedded CUE sheet: CUESHEET block and tag\n";
+        }
     }
     for (const cdr::Track& t : selected) {
         char base[32];
@@ -320,13 +335,15 @@ int cmdRip(const std::vector<std::string>& args) {
         log << imageName << "  CRC32 " << hex32(imageCrc.value()) << "\n";
     }
 
-    const std::string cueName = albumBase + ".cue";
-    const std::string cue =
-        cdr::formatCueSheet(album, singleFile ? cueTracks : cdr::perTrackCueTracks(selected, trackFiles, album));
-    std::ofstream cueFile(dir / fs::u8path(cueName), std::ios::binary);
-    cueFile << cue;
-    if (!cueFile.flush()) throw std::runtime_error("failed to write " + cueName);
-    std::printf("CUE sheet: %s\n", cueName.c_str());
+    if (cueFile) {
+        const std::string cueName = albumBase + ".cue";
+        const std::string cue =
+            cdr::formatCueSheet(album, singleFile ? cueTracks : cdr::perTrackCueTracks(selected, trackFiles, album));
+        std::ofstream out(dir / fs::u8path(cueName), std::ios::binary);
+        out << cue;
+        if (!out.flush()) throw std::runtime_error("failed to write " + cueName);
+        std::printf("CUE sheet: %s\n", cueName.c_str());
+    }
 
     log << "\n" << (problems ? "Finished with errors" : "All tracks ripped without errors") << "\n";
     std::printf("\n%s\n", problems ? "Finished with errors - see rip.log" : "Done.");

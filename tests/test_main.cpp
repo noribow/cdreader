@@ -1173,6 +1173,205 @@ TEST(ogg_eos_on_full_page) {
     CHECK_EQ(pages[0].granule, 42);
 }
 
+// --- FLAC embedded CUE sheet (#16) ---------------------------------------------
+
+namespace {
+
+// Independent reader for the CUESHEET metadata block (FLAC format spec).
+struct ParsedCueSheet {
+    uint64_t leadIn = 0;
+    bool isCd = false;
+    struct Index {
+        uint64_t offset;
+        int number;
+    };
+    struct CueTrackEntry {
+        uint64_t offset;
+        int number;
+        bool audio;
+        bool preEmphasis;
+        std::vector<Index> indexes;
+    };
+    std::vector<CueTrackEntry> tracks;
+};
+
+uint64_t be64At(const std::vector<uint8_t>& v, size_t o) {
+    uint64_t x = 0;
+    for (int i = 0; i < 8; ++i) x = x << 8 | v[o + size_t(i)];
+    return x;
+}
+
+// Returns the body of the first metadata block of `type`, or an empty vector.
+std::vector<uint8_t> flacBlock(const std::vector<uint8_t>& file, int type) {
+    size_t pos = 4;
+    for (bool last = false; !last && pos + 4 <= file.size();) {
+        last = (file[pos] & 0x80) != 0;
+        const size_t length = size_t(file[pos + 1]) << 16 | size_t(file[pos + 2]) << 8 | file[pos + 3];
+        if ((file[pos] & 0x7F) == type) return std::vector<uint8_t>(file.begin() + long(pos + 4), file.begin() + long(pos + 4 + length));
+        pos += 4 + length;
+    }
+    return {};
+}
+
+ParsedCueSheet parseCueSheet(const std::vector<uint8_t>& b) {
+    ParsedCueSheet c;
+    size_t pos = 128;
+    c.leadIn = be64At(b, pos);
+    pos += 8;
+    c.isCd = (b[pos] & 0x80) != 0;
+    pos += 1 + 258;
+    const int count = b[pos++];
+    for (int t = 0; t < count; ++t) {
+        ParsedCueSheet::CueTrackEntry e;
+        e.offset = be64At(b, pos);
+        e.number = b[pos + 8];
+        e.audio = (b[pos + 21] & 0x80) == 0;
+        e.preEmphasis = (b[pos + 21] & 0x40) != 0;
+        const int indexes = b[pos + 35];
+        pos += 36;
+        for (int i = 0; i < indexes; ++i, pos += 12) e.indexes.push_back({be64At(b, pos), b[pos + 8]});
+        c.tracks.push_back(e);
+    }
+    if (pos != b.size()) throw std::runtime_error("CUESHEET block has trailing bytes");
+    return c;
+}
+
+cdr::EmbeddedCueSheet sampleEmbeddedCue() {
+    cdr::EmbeddedCueSheet cue;
+    cue.tracks = {{1, "Image.flac", 0, false, false, "One", ""},
+                  {2, "Image.flac", 30, true, true, "Two", ""},
+                  {3, "Image.flac", 75, false, false, "Three", ""}};
+    cue.totalSectors = 100;
+    cue.text = "\xEF\xBB\xBF" "FILE \"Image.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
+    return cue;
+}
+
+}  // namespace
+
+TEST(flac_cuesheet_block_layout) {
+    const cdr::EmbeddedCueSheet cue = sampleEmbeddedCue();
+    const std::vector<uint8_t> block = cdr::flac::cueSheet(cue, 100 * 588);
+    CHECK_EQ(block.size(), size_t(396 + 3 * 48 + 36));
+    CHECK(std::all_of(block.begin(), block.begin() + 128, [](uint8_t b) { return b == 0; }));  // no MCN
+    const ParsedCueSheet c = parseCueSheet(block);
+    CHECK(c.isCd);
+    CHECK_EQ(c.leadIn, 88200u);
+    CHECK_EQ(c.tracks.size(), 4u);
+    if (c.tracks.size() == 4) {
+        const uint64_t starts[] = {0, 30 * 588, 75 * 588};
+        for (int i = 0; i < 3; ++i) {
+            CHECK_EQ(c.tracks[size_t(i)].offset, starts[i]);
+            CHECK_EQ(c.tracks[size_t(i)].number, i + 1);
+            CHECK(c.tracks[size_t(i)].audio);
+            CHECK_EQ(c.tracks[size_t(i)].indexes.size(), 1u);
+            CHECK(c.tracks[size_t(i)].indexes[0].offset == 0 && c.tracks[size_t(i)].indexes[0].number == 1);
+        }
+        CHECK(c.tracks[1].preEmphasis && !c.tracks[0].preEmphasis);
+        CHECK_EQ(c.tracks[3].number, 170);
+        CHECK_EQ(c.tracks[3].offset, uint64_t(100 * 588));
+        CHECK(c.tracks[3].indexes.empty());
+    }
+    CHECK_EQ(be64At(block, cdr::flac::cueSheetLeadOutOffsetPosition(3)), uint64_t(100 * 588));
+
+    // Offsets that are not on CD frame boundaries: not marked as CD-DA.
+    CHECK(!parseCueSheet(cdr::flac::cueSheet(cue, 100 * 588 + 1)).isCd);
+    bool threw = false;
+    try {
+        cdr::flac::cueSheet(cue, 75 * 588);  // track 3 would start at the lead-out
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(flac_writer_embeds_cuesheet) {
+    // 100 sectors of audio announced, 99 actually written: the lead-out
+    // follows the real length.
+    const testsig::Signal music = testsig::music(99 * 588);
+    cdr::FlacWriter writer;
+    CHECK(writer.canEmbedCueSheet());
+    writer.setEmbeddedCueSheet(sampleEmbeddedCue());
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_cuesheet_test.flac";
+    cdr::TrackMetadata meta;
+    meta.album = "Album";
+    writer.open(path, meta);
+    writer.write(music.pcm.data(), music.pcm.size());
+    writer.close();
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    std::filesystem::remove(path);
+
+    const DecodedFlac d = decodeFlac(file);
+    CHECK(d.pcm == music.pcm);
+    CHECK(d.blockTypes == std::vector<int>({0, 4, 5, 3, 1}));  // CUESHEET after the tags
+    // The CUESHEET tag holds the sheet without the .cue file's BOM.
+    const std::string tag = "CUESHEET=FILE \"Image.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
+    CHECK(std::find(d.comments.begin(), d.comments.end(), tag) != d.comments.end());
+    CHECK(std::find(d.comments.begin(), d.comments.end(), "ALBUM=Album") != d.comments.end());
+
+    const ParsedCueSheet c = parseCueSheet(flacBlock(file, 5));
+    CHECK_EQ(c.tracks.size(), 4u);
+    if (c.tracks.size() == 4) {
+        CHECK_EQ(c.tracks[2].offset, uint64_t(75 * 588));
+        CHECK_EQ(c.tracks[3].number, 170);
+        CHECK_EQ(c.tracks[3].offset, uint64_t(99 * 588));
+    }
+
+    // Without a CUE sheet nothing changes.
+    CHECK(cdr::WavWriter().canEmbedCueSheet() == false);
+    const DecodedFlac plain = decodeFlac(encodeFlac(music.pcm, meta, 4096));
+    CHECK(plain.blockTypes == std::vector<int>({0, 4, 3, 1}));
+}
+
+TEST(single_file_flac_rip_with_embedded_cuesheet) {
+    // Whole disc into one FLAC with read offset correction: the CUESHEET
+    // track positions point at each track's data, as in the per-track rips.
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::RipOptions options;
+    options.readOffsetSamples = 667;
+    cdr::Ripper ripper(drive, toc, options);
+    cdr::AlbumMetadata album;
+    album.title = "Album";
+    const std::vector<cdr::CueTrack> tracks = cdr::singleFileCueTracks(toc.tracks, "Album.flac", album);
+    cdr::EmbeddedCueSheet cue;
+    cue.tracks = tracks;
+    for (const cdr::Track& t : toc.tracks) cue.totalSectors += t.lengthSectors;
+    cue.text = cdr::formatCueSheet(album, tracks);
+
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_image_test.flac";
+    cdr::FlacWriter writer;
+    writer.setEmbeddedCueSheet(cue);
+    writer.open(path, album.forTrack(0, toc.lastTrack));
+    std::vector<std::vector<uint8_t>> perTrack;
+    for (const cdr::Track& t : toc.tracks) {
+        perTrack.emplace_back();
+        ripper.ripTrack(t, [&](const uint8_t* p, size_t n) {
+            writer.write(p, n);
+            perTrack.back().insert(perTrack.back().end(), p, p + n);
+        });
+    }
+    writer.close();
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    std::filesystem::remove(path);
+
+    const DecodedFlac d = decodeFlac(file);
+    const ParsedCueSheet c = parseCueSheet(flacBlock(file, 5));
+    CHECK_EQ(c.tracks.size(), toc.tracks.size() + 1);
+    CHECK_EQ(c.tracks.back().offset, d.totalSamples);
+    for (size_t i = 0; i < toc.tracks.size() && i < c.tracks.size(); ++i) {
+        const size_t start = size_t(c.tracks[i].offset) * cdr::kBytesPerSample;
+        CHECK_EQ(c.tracks[i].number, toc.tracks[i].number);
+        CHECK(start + perTrack[i].size() <= d.pcm.size());
+        if (start + perTrack[i].size() <= d.pcm.size())
+            CHECK(std::equal(perTrack[i].begin(), perTrack[i].end(), d.pcm.begin() + long(start)));
+    }
+}
+
 int main() {
     for (auto& [name, fn] : registry()) {
         const int before = failures;
