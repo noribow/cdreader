@@ -20,4 +20,9 @@ std::string trackFileBaseName(const TrackMetadata& track);
 // "Artist - Album" (or just the album title) when known, otherwise "cd_<disc id>".
 std::string albumDirectoryName(const AlbumMetadata& album);
 
+// Base name (without extension) for files that cover the whole album, such as
+// a single-file image and its CUE sheet: "Artist - Album" (or just the album
+// title) when known, otherwise `fallback`.
+std::string albumFileBase(const AlbumMetadata& album, const std::string& fallback);
+
 }  // namespace cdr

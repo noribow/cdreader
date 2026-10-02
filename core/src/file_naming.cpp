@@ -53,14 +53,22 @@ std::string trackFileBaseName(const TrackMetadata& track) {
     return std::string(number) + " - " + title;
 }
 
-std::string albumDirectoryName(const AlbumMetadata& album) {
+// "Artist - Album", the album title alone, or "" when the title is unknown.
+static std::string albumName(const AlbumMetadata& album) {
     const std::string artist = sanitizeFileName(album.artist);
     const std::string title = sanitizeFileName(album.title);
-    std::string name;
-    if (!artist.empty() && !title.empty() && artist != title) name = sanitizeFileName(album.artist + " - " + album.title);
-    else if (!title.empty()) name = title;
-    if (!name.empty()) return name;
-    return "cd_" + album.discId;
+    if (!artist.empty() && !title.empty() && artist != title) return sanitizeFileName(album.artist + " - " + album.title);
+    return title;
+}
+
+std::string albumDirectoryName(const AlbumMetadata& album) {
+    const std::string name = albumName(album);
+    return name.empty() ? "cd_" + album.discId : name;
+}
+
+std::string albumFileBase(const AlbumMetadata& album, const std::string& fallback) {
+    const std::string name = albumName(album);
+    return name.empty() ? fallback : name;
 }
 
 }  // namespace cdr

@@ -25,13 +25,16 @@ add_library(cdreader_core STATIC
   core/src/cddb.cpp
   core/src/cd_drive.cpp
   core/src/crc32.cpp
+  core/src/cue_sheet.cpp
   core/src/file_naming.cpp
   core/src/flac_encoder.cpp
   core/src/flac_writer.cpp
   core/src/md5.cpp
   core/src/metadata.cpp
+  core/src/ogg.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp
+  core/src/tags.cpp
   core/src/toc.cpp
   core/src/wav_writer.cpp
 )

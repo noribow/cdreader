@@ -19,6 +19,8 @@
 #include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
+#include "cdreader/crc32.h"
+#include "cdreader/cue_sheet.h"
 #include "cdreader/file_naming.h"
 #include "cdreader/metadata.h"
 #include "cdreader/ripper.h"
@@ -55,6 +57,7 @@ void printUsage() {
         "Rip options:\n"
         "  -o, --output <dir>    Output directory (default: \"Artist - Album\" from CDDB,\n"
         "                        otherwise cd_<CDDB id>)\n"
+        "                        A CUE sheet (<album>.cue) is written next to the audio\n"
         "  -f, --format <name>   Output format: %s (default: wav)\n"
         "  -t, --tracks <list>   Tracks to rip, e.g. 1,3-5 (default: all audio tracks)\n"
         "  -r, --retries <n>     Retries per failing read (default: 5)\n"
@@ -62,6 +65,8 @@ void printUsage() {
         "                        (same value as EAC / AccurateRip; default: 0)\n"
         "      --verify          Read everything twice and compare (slower)\n"
         "      --no-accuraterip  Do not look up the AccurateRip database after ripping\n"
+        "      --single-file     Rip the tracks into one file (an image of the disc);\n"
+        "                        the CUE sheet then marks the track positions\n"
         "\n"
         "Offset options:\n"
         "  -t, --track <n>       Track to compare (default: the best known track)\n"
@@ -372,6 +377,7 @@ int cmdRip(const std::vector<std::string>& args) {
     cdr::RipOptions options;
     CddbSettings cddb;
     bool accurateRip = true;
+    bool singleFile = false;
 
     for (size_t i = 2; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -387,6 +393,7 @@ int cmdRip(const std::vector<std::string>& args) {
         else if (a == "--verify") options.verify = true;
         else if (parseCddbOption(args, i, cddb)) continue;
         else if (a == "--no-accuraterip") accurateRip = false;
+        else if (a == "--single-file") singleFile = true;
         else throw UsageError("unknown option '" + a + "'");
     }
 
@@ -422,6 +429,20 @@ int cmdRip(const std::vector<std::string>& args) {
         printAlbum(album, stdout);
     }
     album.discId = hex32(toc.cddbId());
+
+    // In single-file mode the tracks are written back to back, which is only
+    // an image of the disc if they are adjacent on it.
+    const std::string extension = cdr::createAudioWriter(format)->extension();
+    const std::string albumBase = cdr::albumFileBase(album, "CDImage");
+    const std::string imageName = albumBase + "." + extension;
+    std::vector<cdr::CueTrack> cueTracks;
+    if (singleFile) {
+        try {
+            cueTracks = cdr::singleFileCueTracks(selected, imageName, album);
+        } catch (const std::invalid_argument& e) {
+            throw UsageError(std::string("--single-file needs consecutive audio tracks (") + e.what() + ")");
+        }
+    }
 
     const fs::path dir = fs::u8path(outputDir.empty() ? cdr::albumDirectoryName(album) : outputDir);
     fs::create_directories(dir);
@@ -470,13 +491,27 @@ int cmdRip(const std::vector<std::string>& args) {
     cdr::Ripper ripper(*d.drive, toc, options);
     int problems = 0;
     std::vector<ArTrack> arTracks;
+    std::unique_ptr<cdr::AudioWriter> writer;
+    cdr::Crc32 imageCrc;
+    std::vector<std::string> trackFiles;
+    if (singleFile) {
+        writer = cdr::createAudioWriter(format);
+        writer->open(dir / fs::u8path(imageName), album.forTrack(0, toc.lastTrack));
+        log << "Single file: " << imageName << "\n";
+    }
     for (const cdr::Track& t : selected) {
-        std::unique_ptr<cdr::AudioWriter> writer = cdr::createAudioWriter(format);
-        const cdr::TrackMetadata metadata = album.forTrack(t.number, toc.lastTrack);
-        const std::string name = cdr::trackFileBaseName(metadata) + "." + writer->extension();
-        const fs::path file = dir / fs::u8path(name);
-
-        writer->open(file, metadata);
+        std::string name;
+        if (singleFile) {
+            char base[32];
+            std::snprintf(base, sizeof base, "Track %02d", t.number);
+            name = base;
+        } else {
+            writer = cdr::createAudioWriter(format);
+            const cdr::TrackMetadata metadata = album.forTrack(t.number, toc.lastTrack);
+            name = cdr::trackFileBaseName(metadata) + "." + extension;
+            writer->open(dir / fs::u8path(name), metadata);
+            trackFiles.push_back(name);
+        }
         int lastPercent = -1;
         cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, t);
         cdr::TrackRipResult r = ripper.ripTrack(
@@ -484,6 +519,7 @@ int cmdRip(const std::vector<std::string>& args) {
             [&](const uint8_t* pcm, size_t bytes) {
                 writer->write(pcm, bytes);
                 ar.update(pcm, bytes);
+                if (singleFile) imageCrc.update(pcm, bytes);
             },
             [&](uint32_t done, uint32_t total) {
                 int percent = total ? int(uint64_t(done) * 100 / total) : 100;
@@ -493,7 +529,7 @@ int cmdRip(const std::vector<std::string>& args) {
                     lastPercent = percent;
                 }
             });
-        writer->close();
+        if (!singleFile) writer->close();
 
         const std::string status = r.clean() ? "OK" : std::to_string(r.unreadableSectors) + " unreadable sector(s)";
         std::printf("  CRC32 %s  %s%s\n", hex32(r.crc32).c_str(), status.c_str(),
@@ -504,6 +540,18 @@ int cmdRip(const std::vector<std::string>& args) {
         if (!r.clean()) ++problems;
         arTracks.push_back({t, ar.v1(), ar.v2()});
     }
+    if (singleFile) {
+        writer->close();
+        log << imageName << "  CRC32 " << hex32(imageCrc.value()) << "\n";
+    }
+
+    const std::string cueName = albumBase + ".cue";
+    const std::string cue =
+        cdr::formatCueSheet(album, singleFile ? cueTracks : cdr::perTrackCueTracks(selected, trackFiles, album));
+    std::ofstream cueFile(dir / fs::u8path(cueName), std::ios::binary);
+    cueFile << cue;
+    if (!cueFile.flush()) throw std::runtime_error("failed to write " + cueName);
+    std::printf("CUE sheet: %s\n", cueName.c_str());
 
     reportAccurateRip(toc, arTracks, accurateRip, letter, log);
 
