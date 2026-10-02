@@ -1,7 +1,7 @@
 #pragma once
 
 // Ripping workflow of the Android app, kept free of JNI so that it can be
-// unit tested on any platform: CDDB lookup, per-track ripping to WAV / FLAC / Opus / Vorbis
+// unit tested on any platform: CDDB lookup, per-track ripping to WAV / FLAC / Ogg FLAC / ALAC / Opus / Vorbis
 // with tags and CDDB based file names, AccurateRip checksums and lookup, and
 // the rip.log text. jni_bridge.cpp only converts arguments and results.
 //
@@ -128,8 +128,8 @@ public:
     void beginRip(const RipSettings& settings);
     const RipSettings& ripSettings() const { return settings_; }
 
-    // Rips one audio track to `path` (a seekable local file: WAV and FLAC
-    // headers are patched when the file is closed), computing its AccurateRip
+    // Rips one audio track to `path` (a seekable local file: WAV, FLAC and Ogg
+    // FLAC headers are patched when the file is closed), computing its AccurateRip
     // checksums from the same PCM stream. Throws RipCancelled after cancel()
     // and std::runtime_error / ScsiError on errors; a partial file is left
     // for the caller to delete. Exceptions thrown by `progress` propagate.

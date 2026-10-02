@@ -29,10 +29,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Reference tools for the external decoder tests (flac_roundtrip, flac_cuesheet, lossy_decode).
-      # libopus / libogg / libvorbis themselves are fetched by CMake (cmake/Codecs.cmake).
-      - name: Install reference decoders (flac, opus-tools, vorbis-tools)
-        run: sudo apt-get update && sudo apt-get install -y flac opus-tools vorbis-tools
+      # Reference tools for the external decoder tests (flac_roundtrip, flac_cuesheet, lossy_decode,
+      # mka_check, alac_ffmpeg). libopus / libogg / libvorbis themselves are fetched by CMake (cmake/Codecs.cmake).
+      - name: Install reference decoders (flac, opus-tools, vorbis-tools, mkvtoolnix, ffmpeg)
+        run: sudo apt-get update && sudo apt-get install -y flac opus-tools vorbis-tools mkvtoolnix ffmpeg
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
       - name: Build

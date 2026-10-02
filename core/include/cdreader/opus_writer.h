@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -39,12 +40,69 @@ std::vector<uint8_t> tagsPacket(const TrackMetadata& metadata, const std::string
 // "libopus 1.5.2"
 std::string libraryVersion();
 
+// The Opus encoding without a container (shared by OpusWriter for Ogg Opus
+// and MkaWriter for Opus in Matroska): CD-DA PCM in, 20 ms packets out.
+//
+// The 44.1 kHz input is resampled to 48 kHz (Resampler) and encoded with
+// libopus (VBR, the "audio" application). The decoder output starts with
+// preSkip() samples of the encoder's look-ahead; after the input has ended
+// the signal is padded with silence until the output covers pre-skip + the
+// resampled length, so the last packet holds padding to be trimmed.
+class PacketEncoder {
+public:
+    struct Packet {
+        const uint8_t* data;
+        size_t size;
+        uint64_t start;    // first 48 kHz sample of the packet's output (pre-skip included)
+        uint64_t end;      // start + kFrameSamples
+        uint64_t granule;  // end, or for the last packet where the signal ends (end trimming)
+        bool last;
+    };
+    using PacketSink = std::function<void(const Packet&)>;
+
+    explicit PacketEncoder(int bitrateKbps);  // the range is checked by the writers
+    ~PacketEncoder();
+    PacketEncoder(const PacketEncoder&) = delete;
+    PacketEncoder& operator=(const PacketEncoder&) = delete;
+
+    // Creates the encoder (throws std::runtime_error); preSkip() is known afterwards.
+    void start();
+    void write(const uint8_t* pcm, size_t bytes, const PacketSink& sink);
+    // Ends the input and emits the remaining packets, the last one with `last`.
+    // Throws when the input ended in the middle of a sample.
+    void finish(const PacketSink& sink);
+    void release();  // frees the encoder (also done by finish())
+
+    bool started() const { return encoder_ != nullptr; }
+    bool hasPartialSample() const { return !partial_.empty(); }
+    uint16_t preSkip() const { return preSkip_; }
+    uint64_t inputSamples() const { return resampler_ ? resampler_->inputFrames() : 0; }    // 44.1 kHz
+    uint64_t outputSamples() const { return resampler_ ? resampler_->outputFrames() : 0; }  // 48 kHz, without pre-skip
+    uint64_t finalGranulePosition() const { return finalGranule_; }
+
+private:
+    void encodeAvailable(bool final, const PacketSink& sink);
+    void emit(const PacketSink& sink, uint64_t granule, bool last);
+
+    int bitrateKbps_;
+    OpusEncoder* encoder_ = nullptr;
+    uint16_t preSkip_ = 0;
+    std::unique_ptr<Resampler> resampler_;
+    std::vector<uint8_t> partial_;     // bytes of an incomplete input sample
+    std::vector<float> input_;         // converted input for the resampler
+    std::vector<float> pending_;       // 48 kHz samples not yet encoded (interleaved)
+    std::vector<uint8_t> packet_;      // encoded packet waiting to be emitted
+    bool havePacket_ = false;
+    uint64_t encodedSamples_ = 0;      // 48 kHz samples given to the encoder (padding included)
+    uint64_t finalGranule_ = 0;
+};
+
 }  // namespace opus
 
 // Writes CD-DA PCM as an Ogg Opus file (RFC 7845, extension .opus).
 //
 // The 44.1 kHz input is resampled to 48 kHz (Resampler) and encoded in 20 ms
-// packets with libopus (VBR, the "audio" application). Granule positions
+// packets with libopus (VBR, the "audio" application; opus::PacketEncoder). Granule positions
 // count 48 kHz samples including the pre-skip (the encoder's look-ahead); the
 // last page carries the EOS flag and a granule position of exactly
 // pre-skip + the resampled length, so that decoders trim the padding of the
@@ -63,29 +121,18 @@ public:
     void close() override;
 
     int bitrateKbps() const { return bitrateKbps_; }
-    uint16_t preSkip() const { return preSkip_; }
-    uint64_t inputSamples() const { return resampler_ ? resampler_->inputFrames() : 0; }  // 44.1 kHz
-    uint64_t finalGranulePosition() const { return finalGranule_; }
+    uint16_t preSkip() const { return encoder_.preSkip(); }
+    uint64_t inputSamples() const { return encoder_.inputSamples(); }  // 44.1 kHz
+    uint64_t finalGranulePosition() const { return encoder_.finalGranulePosition(); }
 
 private:
-    void encodeAvailable(bool final);
-    void emitPacket(const uint8_t* data, size_t size, bool last);
+    void writePacket(const opus::PacketEncoder::Packet& packet);
     void writeBytes(const uint8_t* data, size_t size);
-    void release();
 
     int bitrateKbps_;
-    OpusEncoder* encoder_ = nullptr;
-    uint16_t preSkip_ = 0;
+    opus::PacketEncoder encoder_;
     std::ofstream out_;
     std::unique_ptr<OggStreamWriter> ogg_;
-    std::unique_ptr<Resampler> resampler_;
-    std::vector<uint8_t> partial_;     // bytes of an incomplete input sample
-    std::vector<float> input_;         // converted input for the resampler
-    std::vector<float> pending_;       // 48 kHz samples not yet encoded (interleaved)
-    std::vector<uint8_t> packet_;      // encoded packet waiting to be written
-    bool havePacket_ = false;
-    uint64_t encodedSamples_ = 0;      // 48 kHz samples given to the encoder (padding included)
-    uint64_t finalGranule_ = 0;
 };
 
 }  // namespace cdr

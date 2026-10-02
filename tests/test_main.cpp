@@ -11,11 +11,15 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "cdreader/accuraterip.h"
+#include "cdreader/alac_encoder.h"
+#include "cdreader/alac_writer.h"
 #include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
@@ -28,7 +32,9 @@
 #include "cdreader/http.h"
 #include "cdreader/md5.h"
 #include "cdreader/metadata.h"
+#include "cdreader/mp4.h"
 #include "cdreader/ogg.h"
+#include "cdreader/ogg_flac_writer.h"
 #include "cdreader/resampler.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
@@ -46,6 +52,7 @@
 
 #include "cdreader/vorbis_writer.h"
 #endif
+#include "alac_decoder.h"
 #include "fake_drive.h"
 #include "flac_decoder.h"
 #include "test_signals.h"
@@ -422,7 +429,8 @@ TEST(audio_writer_factory) {
     CHECK(std::find(formats.begin(), formats.end(), "wav") != formats.end());
     for (const std::string& f : formats) {
         std::unique_ptr<cdr::AudioWriter> w = cdr::createAudioWriter(f);
-        CHECK(w != nullptr && w->extension() == (f == "vorbis" ? "ogg" : f));
+        const std::string extension = f == "vorbis" ? "ogg" : f == "oggflac" ? "oga" : f == "alac" ? "m4a" : f.rfind("mka", 0) == 0 ? "mka" : f;
+        CHECK(w != nullptr && w->extension() == extension);
     }
     CHECK(cdr::createAudioWriter("no-such-format") == nullptr);
 }
@@ -2112,7 +2120,7 @@ TEST(flac_cuesheet_block_layout) {
         CHECK_EQ(c.tracks[3].offset, uint64_t(100 * 588));
         CHECK(c.tracks[3].indexes.empty());
     }
-    CHECK_EQ(be64At(block, cdr::flac::cueSheetLeadOutOffsetPosition(3)), uint64_t(100 * 588));
+    CHECK_EQ(be64At(block, cdr::flac::cueSheetLeadOutOffsetPosition(cue)), uint64_t(100 * 588));
 
     // Offsets that are not on CD frame boundaries: not marked as CD-DA.
     CHECK(!parseCueSheet(cdr::flac::cueSheet(cue, 100 * 588 + 1)).isCd);
@@ -2211,6 +2219,274 @@ TEST(single_file_flac_rip_with_embedded_cuesheet) {
         if (start + perTrack[i].size() <= d.pcm.size())
             CHECK(std::equal(perTrack[i].begin(), perTrack[i].end(), d.pcm.begin() + long(start)));
     }
+}
+
+// --- Ogg FLAC (FLAC-to-Ogg mapping 1.0) -----------------------------------------
+
+namespace {
+
+// Number of packets that end on each page.
+size_t packetsEndingOn(const OggPage& p) {
+    size_t n = 0;
+    for (uint8_t l : p.lacing) n += l < 255 ? 1 : 0;
+    return n;
+}
+
+struct OggFlac {
+    std::vector<OggPage> pages;
+    std::vector<std::vector<uint8_t>> packets;
+    size_t headerPackets = 0;     // packets before the audio, the first one included
+    std::vector<uint8_t> native;  // the same stream as a native FLAC file, for decodeFlac()
+};
+
+// Checks the Ogg FLAC structure of `file` (header packets, pages, granule
+// positions, BOS / EOS) and rebuilds the native FLAC stream from its packets.
+OggFlac demuxOggFlac(const std::vector<uint8_t>& file) {
+    OggFlac o;
+    o.pages = parseOgg(file);
+    o.packets = oggPackets(o.pages);
+    CHECK(!o.pages.empty() && o.packets.size() >= 2);
+    if (o.pages.empty() || o.packets.size() < 2) return o;
+
+    // First packet: 0x7F "FLAC" 1.0, header packet count, "fLaC", STREAMINFO;
+    // alone on the BOS page, granule position 0.
+    const std::vector<uint8_t>& first = o.packets[0];
+    CHECK_EQ(first.size(), cdr::oggflac::kFirstPacketBytes);
+    CHECK(first.size() == 51 && first[0] == 0x7F && str(first, 1, 4) == "FLAC" && first[5] == 1 && first[6] == 0);
+    CHECK(str(first, 9, 4) == "fLaC");
+    CHECK_EQ(first[13] & 0x7F, 0);  // STREAMINFO
+    CHECK(first[14] == 0 && first[15] == 0 && first[16] == 34);
+    o.headerPackets = 1 + (size_t(first[7]) << 8 | first[8]);
+    CHECK(o.headerPackets <= o.packets.size());
+    if (o.headerPackets > o.packets.size()) return o;
+    CHECK(o.pages[0].lacing == std::vector<uint8_t>({51}));
+    CHECK_EQ(o.pages[0].granule, 0);
+
+    // The header packets hold one metadata block each; only the last is flagged last.
+    o.native = {'f', 'L', 'a', 'C'};
+    o.native.insert(o.native.end(), first.begin() + 13, first.end());
+    for (size_t i = 0; i < o.headerPackets; ++i) {
+        const std::vector<uint8_t>& p = o.packets[i];
+        const size_t block = i == 0 ? 13 : 0;
+        CHECK(p.size() >= block + 4);
+        if (p.size() < block + 4) return o;
+        CHECK_EQ(p.size() - block - 4, size_t(p[block + 1]) << 16 | size_t(p[block + 2]) << 8 | p[block + 3]);
+        CHECK_EQ(bool(p[block] & 0x80), i + 1 == o.headerPackets);
+        if (i > 0) o.native.insert(o.native.end(), p.begin(), p.end());
+    }
+    for (size_t i = o.headerPackets; i < o.packets.size(); ++i)
+        o.native.insert(o.native.end(), o.packets[i].begin(), o.packets[i].end());
+
+    // Pages: the header pages (granule 0) end with the last header packet, the
+    // audio starts on a new page; BOS first, EOS last; serial and sequence.
+    size_t completed = 0;
+    bool headerEnd = false;
+    for (size_t i = 0; i < o.pages.size(); ++i) {
+        const OggPage& p = o.pages[i];
+        CHECK_EQ(p.serial, o.pages[0].serial);
+        CHECK_EQ(p.sequence, uint32_t(i));
+        CHECK_EQ(bool(p.flags & 0x02), i == 0);
+        CHECK_EQ(bool(p.flags & 0x04), i + 1 == o.pages.size());
+        if (completed < o.headerPackets) {
+            CHECK_EQ(p.granule, 0);
+            completed += packetsEndingOn(p);
+            if (completed >= o.headerPackets) {
+                CHECK_EQ(completed, o.headerPackets);
+                CHECK_EQ(p.lacing.back() < 255, true);
+                headerEnd = true;
+            }
+        } else {
+            completed += packetsEndingOn(p);
+        }
+    }
+    CHECK(headerEnd);
+    CHECK_EQ(completed, o.packets.size());
+    return o;
+}
+
+// Granule positions of the audio pages: the samples of the frames completed
+// so far (-1 on pages where no frame ends).
+void checkOggFlacGranules(const OggFlac& o, uint64_t totalSamples) {
+    const size_t frames = o.packets.size() - o.headerPackets;
+    auto samplesThrough = [&](size_t framesDone) {
+        return std::min<uint64_t>(uint64_t(framesDone) * cdr::flac::kBlockSize, totalSamples);
+    };
+    size_t completed = 0;
+    for (const OggPage& p : o.pages) {
+        const size_t ending = packetsEndingOn(p);
+        const bool header = completed < o.headerPackets;
+        completed += ending;
+        if (header) continue;
+        if (ending == 0) {
+            CHECK_EQ(p.granule, -1);
+        } else {
+            CHECK_EQ(uint64_t(p.granule), samplesThrough(completed - o.headerPackets));
+        }
+    }
+    CHECK_EQ(completed - o.headerPackets, frames);
+    if (frames > 0) CHECK_EQ(uint64_t(o.pages.back().granule), totalSamples);
+}
+
+std::vector<uint8_t> encodeOggFlac(const std::vector<uint8_t>& pcm, const cdr::TrackMetadata& meta,
+                                   const cdr::EmbeddedCueSheet* cue = nullptr, size_t chunk = cdr::kSectorBytes) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.oga";
+    {
+        cdr::OggFlacWriter writer;
+        CHECK(writer.canEmbedCueSheet());
+        if (cue) writer.setEmbeddedCueSheet(*cue);
+        writer.open(path, meta);
+        size_t pos = 0;
+        if (pcm.size() > 7) {  // an odd split to exercise partial samples
+            writer.write(pcm.data(), 7);
+            pos = 7;
+        }
+        for (; pos < pcm.size(); pos += chunk) writer.write(pcm.data() + pos, std::min(chunk, pcm.size() - pos));
+        writer.close();
+        CHECK_EQ(writer.totalSamples(), uint64_t(pcm.size() / 4));
+    }
+    std::vector<uint8_t> file = readFile(path);
+    std::filesystem::remove(path);
+    return file;
+}
+
+}  // namespace
+
+TEST(oggflac_first_packet_layout) {
+    std::vector<uint8_t> info(34);
+    for (size_t i = 0; i < info.size(); ++i) info[i] = uint8_t(0xA0 + i);
+    const std::vector<uint8_t> p = cdr::oggflac::firstPacket(2, info);
+    std::vector<uint8_t> expected = {0x7F, 'F', 'L', 'A', 'C', 0x01, 0x00, 0x00, 0x02,
+                                     'f',  'L', 'a', 'C', 0x00, 0x00, 0x00, 0x22};
+    expected.insert(expected.end(), info.begin(), info.end());
+    CHECK(p == expected);
+    CHECK_EQ(p.size(), cdr::oggflac::kFirstPacketBytes);
+    CHECK_EQ(cdr::oggflac::firstPacket(0, info)[13], 0x80);  // no other block: STREAMINFO is the last
+    CHECK_EQ(cdr::oggflac::firstPacket(258, info)[7], 1);
+    CHECK_EQ(cdr::oggflac::firstPacket(258, info)[8], 2);
+    bool threw = false;
+    try {
+        cdr::oggflac::firstPacket(1, std::vector<uint8_t>(33));
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(oggflac_writer_stream_structure_and_pcm) {
+    cdr::TrackMetadata meta = sampleAlbum().forTrack(2, 3);
+    for (size_t samples : {size_t(0), size_t(1), size_t(4096), size_t(4097), size_t(4096 * 25 + 1000)}) {
+        const testsig::Signal music = testsig::music(samples);
+        const std::vector<uint8_t> file = encodeOggFlac(music.pcm, meta, nullptr, 1000);
+        if (samples == 4096 * 25 + 1000) keepSample("music.oga", file);
+        const OggFlac o = demuxOggFlac(file);
+        CHECK_EQ(o.headerPackets, 2u);  // STREAMINFO, VORBIS_COMMENT
+        if (o.native.empty()) continue;
+        const DecodedFlac d = decodeFlac(o.native);
+        CHECK(d.pcm == music.pcm);
+        CHECK(d.md5 == md5Of(music.pcm));
+        CHECK_EQ(d.totalSamples, uint64_t(samples));
+        CHECK_EQ(d.sampleRate, 44100u);
+        CHECK_EQ(d.channels, 2u);
+        CHECK_EQ(d.bitsPerSample, 16u);
+        const unsigned block = samples > 4096 ? 4096u : unsigned(std::max<size_t>(samples, 16));
+        CHECK(d.minBlockSize == block && d.maxBlockSize == block);
+        CHECK(d.blockTypes == std::vector<int>({0, 4}));  // no SEEKTABLE / PADDING in Ogg
+        CHECK(d.vendor.rfind("cdreader ", 0) == 0);
+        CHECK(std::find(d.comments.begin(), d.comments.end(), "TITLE=Two \"2\"") != d.comments.end());
+        CHECK(std::find(d.comments.begin(), d.comments.end(), "ARTIST=Guest") != d.comments.end());
+
+        // One frame per audio packet, the frame size bounds of STREAMINFO match.
+        const size_t frames = o.packets.size() - o.headerPackets;
+        CHECK_EQ(size_t(d.frames), frames);
+        CHECK_EQ(frames, (samples + 4095) / 4096);
+        uint64_t offset = 0;
+        uint32_t minFrame = UINT32_MAX, maxFrame = 0;
+        for (size_t i = 0; i < frames && i < d.frameOffsets.size(); ++i) {
+            const std::vector<uint8_t>& packet = o.packets[o.headerPackets + i];
+            CHECK_EQ(d.frameOffsets[i], offset);
+            offset += packet.size();
+            minFrame = std::min(minFrame, uint32_t(packet.size()));
+            maxFrame = std::max(maxFrame, uint32_t(packet.size()));
+        }
+        CHECK_EQ(d.minFrameSize, frames ? minFrame : 0u);
+        CHECK_EQ(d.maxFrameSize, maxFrame);
+        checkOggFlacGranules(o, samples);
+        if (samples == 0) CHECK_EQ(o.pages.size(), 2u);  // the header pages, the last one with EOS
+
+        // The frames are exactly those of the native FLAC writer.
+        const std::vector<uint8_t> flac = encodeFlac(music.pcm, meta);
+        const DecodedFlac nd = decodeFlac(flac);
+        CHECK(std::equal(o.native.begin() + ptrdiff_t(d.firstFrame), o.native.end(),
+                         flac.begin() + ptrdiff_t(nd.firstFrame), flac.end()));
+        CHECK(d.md5 == nd.md5 && d.minFrameSize == nd.minFrameSize && d.maxFrameSize == nd.maxFrameSize);
+    }
+}
+
+TEST(oggflac_writer_round_trip_synthetic_signals) {
+    for (const testsig::Signal& s : testsig::all()) {
+        const OggFlac o = demuxOggFlac(encodeOggFlac(s.pcm, {}));
+        if (o.native.empty()) continue;
+        const DecodedFlac d = decodeFlac(o.native);
+        const bool ok = d.pcm == s.pcm && d.md5 == md5Of(s.pcm) && d.totalSamples == s.pcm.size() / 4;
+        if (!ok) std::fprintf(stderr, "  Ogg FLAC round trip failed: %s\n", s.name.c_str());
+        CHECK(ok);
+        checkOggFlacGranules(o, s.pcm.size() / 4);
+    }
+}
+
+TEST(oggflac_writer_embeds_cuesheet) {
+    // As with native FLAC: 100 sectors announced, 99 written; the lead-out follows the real length.
+    const testsig::Signal music = testsig::music(99 * 588);
+    const cdr::EmbeddedCueSheet cue = sampleEmbeddedCue();
+    cdr::TrackMetadata meta;
+    meta.album = "Album";
+    const std::vector<uint8_t> file = encodeOggFlac(music.pcm, meta, &cue);
+    keepSample("image.oga", file);
+    const OggFlac o = demuxOggFlac(file);
+    CHECK_EQ(o.headerPackets, 3u);  // STREAMINFO, VORBIS_COMMENT, CUESHEET
+    if (o.native.empty()) return;
+    const DecodedFlac d = decodeFlac(o.native);
+    CHECK(d.pcm == music.pcm);
+    CHECK(d.blockTypes == std::vector<int>({0, 4, 5}));
+    const std::string tag = "CUESHEET=FILE \"Image.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
+    CHECK(std::find(d.comments.begin(), d.comments.end(), tag) != d.comments.end());
+    const ParsedCueSheet c = parseCueSheet(flacBlock(o.native, 5));
+    CHECK_EQ(c.tracks.size(), 4u);
+    if (c.tracks.size() == 4) {
+        CHECK_EQ(c.tracks[1].offset, uint64_t(30 * 588));
+        CHECK_EQ(c.tracks[2].offset, uint64_t(75 * 588));
+        CHECK_EQ(c.tracks[3].number, 170);
+        CHECK_EQ(c.tracks[3].offset, uint64_t(99 * 588));
+    }
+    // The CUESHEET block is the same as in the native FLAC file.
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_cuesheet_test.flac";
+    {
+        cdr::FlacWriter flac;
+        flac.setEmbeddedCueSheet(cue);
+        flac.open(path, meta);
+        flac.write(music.pcm.data(), music.pcm.size());
+        flac.close();
+    }
+    CHECK(flacBlock(readFile(path), 5) == flacBlock(o.native, 5));
+    std::filesystem::remove(path);
+}
+
+TEST(oggflac_writer_rejects_partial_sample) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_partial.oga";
+    bool threw = false;
+    {
+        cdr::OggFlacWriter writer;
+        writer.open(path, {});
+        const uint8_t pcm[6] = {1, 2, 3, 4, 5, 6};
+        writer.write(pcm, sizeof pcm);
+        try {
+            writer.close();
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+    }
+    std::filesystem::remove(path);
+    CHECK(threw);
 }
 
 namespace {
@@ -2332,13 +2608,6 @@ std::vector<uint8_t> encodeWith(cdr::AudioWriter& writer, const std::filesystem:
     return readFile(path);
 }
 
-// Number of packets that end on each page.
-size_t packetsEndingOn(const OggPage& p) {
-    size_t n = 0;
-    for (uint8_t l : p.lacing) n += l < 255 ? 1 : 0;
-    return n;
-}
-
 cdr::TrackMetadata lossyMetadata() {
     cdr::TrackMetadata m;
     m.trackNumber = 3;
@@ -2376,7 +2645,12 @@ TEST(audio_writer_settings_validation) {
     CHECK(throws("wav", bitrate));
     CHECK(throws("flac", quality));
     CHECK(!throws("flac", {}));
-    CHECK(!cdr::isLossyFormat("flac") && !cdr::isLossyFormat("wav"));
+    CHECK(throws("oggflac", bitrate));
+    CHECK(throws("oggflac", quality));
+    CHECK(!throws("oggflac", {}));
+    CHECK(cdr::createAudioWriter("oggflac")->encoderDescription() == "Ogg FLAC (built-in encoder), lossless");
+    CHECK(cdr::createAudioWriter("oggflac")->canEmbedCueSheet());
+    CHECK(!cdr::isLossyFormat("flac") && !cdr::isLossyFormat("wav") && !cdr::isLossyFormat("oggflac"));
     CHECK(cdr::isLossyFormat("opus") && cdr::isLossyFormat("vorbis"));
 #ifdef CDREADER_HAVE_OPUS
     CHECK(!throws("opus", bitrate));
@@ -2730,6 +3004,427 @@ TEST(vorbis_writer_decodes_close_to_input) {
 }
 
 #endif  // CDREADER_HAVE_VORBIS
+
+// --- ALAC / M4A (#24) ----------------------------------------------------------
+
+void splitPcm(const std::vector<uint8_t>& pcm, std::vector<int32_t>& l, std::vector<int32_t>& r) {
+    const size_t n = pcm.size() / 4;
+    l.resize(n);
+    r.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        l[i] = int16_t(uint16_t(pcm[4 * i] | pcm[4 * i + 1] << 8));
+        r[i] = int16_t(uint16_t(pcm[4 * i + 2] | pcm[4 * i + 3] << 8));
+    }
+}
+
+cdr::TrackMetadata alacSampleMetadata() {
+    cdr::TrackMetadata m;
+    m.trackNumber = 3;
+    m.trackTotal = 12;
+    m.title = "\xE6\x9B\xB2\xE5\x90\x8D \xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88";  // 曲名 テスト
+    m.artist = "Artist";
+    m.album = "Album";
+    m.albumArtist = "Album Artist";
+    m.year = "1999";
+    m.genre = "Rock";
+    m.discId = "0A0B0C03";
+    return m;
+}
+
+std::vector<uint8_t> writeM4a(const std::vector<uint8_t>& pcm, const cdr::TrackMetadata& meta,
+                              cdr::alac::EncoderOptions options = {}, const std::string& name = "alac.m4a",
+                              unsigned* escaped = nullptr) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / ("cdreader_test_" + name);
+    {
+        cdr::AlacWriter w(options);
+        w.open(path, meta);
+        // CD sector sized chunks, after an odd split in the middle of a sample.
+        size_t pos = std::min<size_t>(pcm.size(), 7);
+        w.write(pcm.data(), pos);
+        for (; pos < pcm.size(); pos += 2352) w.write(pcm.data() + pos, std::min<size_t>(2352, pcm.size() - pos));
+        w.close();
+        CHECK_EQ(w.totalSamples(), uint64_t(pcm.size() / 4));
+        if (escaped) *escaped = w.escapedFrames();
+    }
+    std::vector<uint8_t> file = readFile(path);
+    std::filesystem::remove(path);
+    return file;
+}
+
+TEST(alac_magic_cookie_bytes) {
+    cdr::alac::SpecificConfig c;
+    c.maxFrameBytes = 0x00012345;
+    c.avgBitRate = 0x000ABCDE;
+    const std::array<uint8_t, 24> cookie = cdr::alac::magicCookie(c);
+    const std::array<uint8_t, 24> expected = {
+        0x00, 0x00, 0x10, 0x00,  // frameLength 4096
+        0x00,                    // compatibleVersion
+        0x10,                    // bitDepth 16
+        0x28, 0x0A, 0x0E,        // pb 40, mb 10, kb 14
+        0x02,                    // numChannels
+        0x00, 0xFF,              // maxRun 255
+        0x00, 0x01, 0x23, 0x45,  // maxFrameBytes
+        0x00, 0x0A, 0xBC, 0xDE,  // avgBitRate
+        0x00, 0x00, 0xAC, 0x44,  // sampleRate 44100
+    };
+    CHECK(cookie == expected);
+}
+
+TEST(alac_adaptive_golomb_codes) {
+    // History starts at mb = 10: k = log2(10 / 512 + 3) = 1, modulus 1.
+    cdr::flac::BitWriter bw;
+    const int32_t zero[] = {0};
+    CHECK_EQ(cdr::alac::adaptiveGolomb(zero, 1, 17, &bw), uint64_t(1));  // "0"
+    bw.alignToByte();
+    CHECK(bw.bytes() == std::vector<uint8_t>(1, 0x00));
+
+    // 3 -> 6: six 1-bits and the 0-bit; -1 -> 1: "10" (history 10 + 40 * 6 = 250).
+    cdr::flac::BitWriter b2;
+    const int32_t small[] = {3, -1};
+    CHECK_EQ(cdr::alac::adaptiveGolomb(small, 2, 17, &b2), uint64_t(7 + 2));
+    b2.alignToByte();
+    CHECK(b2.bytes() == (std::vector<uint8_t>{0xFD, 0x00}));
+
+    // A large first value is escaped: nine 1-bits and the value in 17 bits.
+    cdr::flac::BitWriter b3;
+    const int32_t large[] = {-65536};
+    CHECK_EQ(cdr::alac::adaptiveGolomb(large, 1, 17, &b3), uint64_t(9 + 17));
+    b3.alignToByte();
+    // 1 1111 1111 | 1 1111 1111 1111 1111 (131071) -> 26 bits, padded
+    CHECK(b3.bytes() == (std::vector<uint8_t>{0xFF, 0xFF, 0xFF, 0xC0}));
+
+    // A long run of zeros costs a few bits after the history has decayed.
+    std::vector<int32_t> zeros(4096, 0);
+    CHECK(cdr::alac::adaptiveGolomb(zeros.data(), 4096, 17, nullptr) < 40);
+}
+
+TEST(alac_frames_round_trip_synthetic_signals) {
+    int compressed = 0, escaped = 0;
+    std::set<unsigned> mixResSeen, ordersSeen;
+    for (const testsig::Signal& s : testsig::all()) {
+        if (s.pcm.empty()) continue;
+        std::vector<int32_t> l, r;
+        splitPcm(s.pcm, l, r);
+        cdr::alac::FrameEncoder enc;
+        std::vector<uint8_t> decoded;
+        bool ok = true;
+        for (size_t pos = 0; pos < l.size(); pos += cdr::alac::kFrameLength) {
+            const unsigned n = unsigned(std::min<size_t>(cdr::alac::kFrameLength, l.size() - pos));
+            const std::vector<uint8_t> frame = enc.encode(l.data() + pos, r.data() + pos, n);
+            const AlacFrameInfo info = decodeAlacFrame(frame.data(), frame.size(), 4096, 40, 10, 14, decoded);
+            ok = ok && info.samples == n && info.partial == (n != 4096) && info.escaped == enc.lastFrame().escaped;
+            // An escape frame is the bound: 23 header bits, 32 bits per sample, end tag.
+            ok = ok && frame.size() <= (23 + (n != 4096 ? 32 : 0) + 32 * size_t(n) + 3 + 7) / 8;
+            if (!info.escaped) {
+                ok = ok && info.mixBits == 2 && info.mixRes == enc.lastFrame().mixRes && info.mixRes <= 4;
+                ok = ok && info.orderU == enc.lastFrame().orderU && info.orderV == enc.lastFrame().orderV;
+                ok = ok && info.denShiftU == 9 && info.denShiftV == 9 && info.pbFactorU == 4 && info.modeU == 0;
+                mixResSeen.insert(info.mixRes);
+                ordersSeen.insert(info.orderU);
+                ordersSeen.insert(info.orderV);
+                ++compressed;
+            } else {
+                ++escaped;
+            }
+        }
+        ok = ok && decoded == s.pcm;
+        if (!ok) std::fprintf(stderr, "  ALAC round trip failed: %s\n", s.name.c_str());
+        CHECK(ok);
+    }
+    CHECK(compressed > 0);
+    CHECK(escaped > 0);  // white noise
+    // The search uses every stereo matrix and predictor order on these signals.
+    CHECK(mixResSeen == (std::set<unsigned>{0, 1, 2, 3, 4}));
+    CHECK(ordersSeen == (std::set<unsigned>{0, 4, 8, 16}));
+}
+
+TEST(alac_uncompressed_fallback) {
+    // Full-scale white noise does not compress: escape frames of 16-bit samples.
+    testsig::Noise n(11);
+    const testsig::Signal noise = testsig::make("noise", 4096 + 100, [&](size_t, int16_t& l, int16_t& r) {
+        l = testsig::clamp16(n.next() * 32768);
+        r = testsig::clamp16(n.next() * 32768);
+    });
+    std::vector<int32_t> l, r;
+    splitPcm(noise.pcm, l, r);
+    cdr::alac::FrameEncoder enc;
+    std::vector<uint8_t> frame = enc.encode(l.data(), r.data(), 4096);
+    CHECK(enc.lastFrame().escaped);
+    CHECK_EQ(frame.size(), size_t((23 + 4096 * 32 + 3 + 7) / 8));
+    CHECK_EQ(frame[0], 0x20);  // channel pair (001), instance 0, 12 zero bits ...
+    CHECK_EQ((frame[2] >> 1) & 0x0F, 0x01);  // ... no partial frame, no shift, escape flag
+    // First sample right after the 23-bit header.
+    const uint32_t first = uint32_t(frame[2] & 0x01) << 15 | uint32_t(frame[3]) << 7 | frame[4] >> 1;
+    CHECK_EQ(int16_t(first), int16_t(l[0]));
+    std::vector<uint8_t> decoded;
+    decodeAlacFrame(frame.data(), frame.size(), 4096, 40, 10, 14, decoded);
+    frame = enc.encode(l.data() + 4096, r.data() + 4096, 100);  // partial: 32-bit length
+    CHECK(enc.lastFrame().escaped);
+    CHECK_EQ(frame.size(), size_t((23 + 32 + 100 * 32 + 3 + 7) / 8));
+    CHECK_EQ(decodeAlacFrame(frame.data(), frame.size(), 4096, 40, 10, 14, decoded).samples, 100u);
+    CHECK(decoded == noise.pcm);
+
+    // Compression switched off: every frame escaped, still exact.
+    cdr::alac::EncoderOptions off;
+    off.compress = false;
+    const testsig::Signal music = testsig::music(10000);
+    unsigned escapedFrames = 0;
+    const DecodedM4a d = decodeM4a(writeM4a(music.pcm, {}, off, "alac_raw.m4a", &escapedFrames));
+    CHECK_EQ(escapedFrames, 3u);
+    CHECK(d.pcm == music.pcm);
+    for (const AlacFrameInfo& f : d.frames) CHECK(f.escaped);
+}
+
+TEST(alac_predictor_extreme_coefficients) {
+    // Hand-built frames with extreme starting coefficients (wrapping int16
+    // adaptation, large prediction sums): the decoder must reproduce the
+    // samples whenever the encoder does not flag the frame as ambiguous.
+    testsig::Noise noise(21);
+    std::vector<int32_t> l(4096), r(4096);
+    for (size_t i = 0; i < l.size(); ++i) {
+        l[i] = testsig::clamp16(30000 * std::sin(testsig::kTwoPi * 50 * double(i) / 44100) + noise.next() * 2000);
+        r[i] = i % 64 < 32 ? 32767 : -32768;
+    }
+    int checked = 0;
+    for (int16_t start : {int16_t(32767), int16_t(-32768), int16_t(12345), int16_t(-300)}) {
+        for (unsigned order : {1u, 4u, 8u, 16u, 30u}) {
+            std::vector<int16_t> cu(order, start), cv(order, int16_t(-start));
+            std::vector<int16_t> au = cu, av = cv;
+            std::vector<int32_t> ru(4096), rv(4096);
+            bool ok = cdr::alac::predict(l.data(), 4096, au.data(), order, 17, ru.data());
+            ok = cdr::alac::predict(r.data(), 4096, av.data(), order, 17, rv.data()) && ok;
+            cdr::flac::BitWriter bw;
+            bw.writeBits(1, 3);
+            bw.writeBits(0, 4 + 12 + 4);
+            bw.writeBits(2, 8);  // mixBits
+            bw.writeBits(0, 8);  // mixRes: L / R
+            for (const std::vector<int16_t>* c : {&cu, &cv}) {
+                bw.writeBits(9, 8);
+                bw.writeBits(4 << 5 | order, 8);
+                for (int16_t x : *c) bw.writeSigned(x, 16);
+            }
+            bool ambiguous = false;
+            cdr::alac::adaptiveGolomb(ru.data(), 4096, 17, &bw, &ambiguous);
+            cdr::alac::adaptiveGolomb(rv.data(), 4096, 17, &bw, &ambiguous);
+            bw.writeBits(7, 3);
+            bw.alignToByte();
+            if (!ok || ambiguous) continue;
+            ++checked;
+            std::vector<uint8_t> decoded;
+            decodeAlacFrame(bw.bytes().data(), bw.bytes().size(), 4096, 40, 10, 14, decoded);
+            std::vector<int32_t> dl, dr;
+            splitPcm(decoded, dl, dr);
+            CHECK(dl == l && dr == r);
+        }
+    }
+    CHECK(checked > 10);
+}
+
+TEST(alac_m4a_box_structure_and_tables) {
+    const testsig::Signal s = testsig::music(44100 * 2 + 1000);  // 22 frames, the last one partial
+    const std::vector<uint8_t> file = writeM4a(s.pcm, alacSampleMetadata());
+    keepSample("alac.m4a", file);
+    const DecodedM4a d = decodeM4a(file);
+
+    std::vector<std::string> top;
+    for (const Mp4Box& b : d.root.children) top.push_back(b.type);
+    CHECK(top == (std::vector<std::string>{"ftyp", "wide", "mdat", "moov"}));
+    CHECK(d.majorBrand == "M4A ");
+    CHECK(d.compatibleBrands == (std::vector<std::string>{"M4A ", "mp42", "isom"}));
+    for (const char* path : {"moov/mvhd", "moov/trak/tkhd", "moov/trak/mdia/mdhd", "moov/trak/mdia/hdlr",
+                             "moov/trak/mdia/minf/smhd", "moov/trak/mdia/minf/dinf/dref/url ",
+                             "moov/trak/mdia/minf/stbl/stsd/alac/alac", "moov/trak/mdia/minf/stbl/stts",
+                             "moov/trak/mdia/minf/stbl/stsc", "moov/trak/mdia/minf/stbl/stsz",
+                             "moov/trak/mdia/minf/stbl/stco", "moov/udta/meta/hdlr", "moov/udta/meta/ilst"})
+        CHECK(d.root.find(path) != nullptr);
+
+    const uint64_t samples = s.pcm.size() / 4;
+    CHECK_EQ(d.movieTimescale, 44100u);
+    CHECK_EQ(d.mediaTimescale, 44100u);
+    CHECK_EQ(d.movieDuration, samples);
+    CHECK_EQ(d.trackDuration, samples);
+    CHECK_EQ(d.mediaDuration, samples);
+    CHECK(d.handlerType == "soun");
+    CHECK(d.sampleEntryType == "alac");
+    CHECK_EQ(d.entryChannels, 2u);
+    CHECK_EQ(d.entrySampleSize, 16u);
+    CHECK_EQ(d.entrySampleRate, 44100u);
+    CHECK_EQ(d.frameLength, 4096u);
+    CHECK_EQ(d.bitDepth, 16u);
+    CHECK_EQ(d.channels, 2u);
+    CHECK_EQ(d.sampleRate, 44100u);
+    CHECK_EQ(d.compatibleVersion, 0u);
+    CHECK_EQ(d.pb, 40u);
+    CHECK_EQ(d.mb, 10u);
+    CHECK_EQ(d.kb, 14u);
+    CHECK_EQ(d.maxRun, 255u);
+
+    // stts: 21 frames of 4096, one of the rest.
+    const size_t frames = (samples + 4095) / 4096;
+    CHECK_EQ(d.stts.size(), size_t(2));
+    CHECK(d.stts[0] == std::make_pair(uint32_t(frames - 1), uint32_t(4096)));
+    CHECK(d.stts[1] == std::make_pair(uint32_t(1), uint32_t(samples - (frames - 1) * 4096)));
+    CHECK_EQ(d.sampleSizes.size(), frames);
+    CHECK_EQ(d.stszSampleSize, 0u);  // sizes differ: listed per frame
+    // stsc: 10 frames per chunk, then the remainder; stco points at each chunk.
+    CHECK_EQ(d.stsc.size(), size_t(2));
+    CHECK((d.stsc[0] == std::array<uint32_t, 3>{1, 10, 1}));
+    CHECK((d.stsc[1] == std::array<uint32_t, 3>{3, uint32_t(frames - 20), 1}));
+    CHECK_EQ(d.chunkOffsets.size(), size_t(3));
+    CHECK(!d.co64);
+    // Frames fill mdat back to back from its start.
+    uint64_t offset = d.mdatDataOffset, total = 0;
+    uint32_t largest = 0;
+    for (size_t i = 0; i < frames; ++i) {
+        CHECK_EQ(d.frameOffsets[i], offset);
+        offset += d.sampleSizes[i];
+        total += d.sampleSizes[i];
+        largest = std::max(largest, d.sampleSizes[i]);
+    }
+    CHECK_EQ(total, d.mdatDataSize);
+    CHECK_EQ(d.maxFrameBytes, largest);
+    CHECK_EQ(d.avgBitRate, uint32_t(total * 8 * 44100 / samples));
+    CHECK(total < s.pcm.size() / 2);  // the music signal compresses well
+
+    CHECK(d.pcm == s.pcm);
+    CHECK(d.metaHandler == "mdir");
+    CHECK(d.tags.at("\xA9nam") == alacSampleMetadata().title);
+    CHECK(d.tags.at("\xA9" "ART") == "Artist");
+    CHECK(d.tags.at("\xA9" "alb") == "Album");
+    CHECK(d.tags.at("aART") == "Album Artist");
+    CHECK(d.tags.at("trkn") == "3/12");
+    CHECK(d.tags.at("\xA9" "day") == "1999");
+    CHECK(d.tags.at("\xA9gen") == "Rock");
+    CHECK(d.tags.at("\xA9too").rfind("cdreader ", 0) == 0);
+    CHECK(d.tags.at("----:com.apple.iTunes:CDDB") == "0A0B0C03");
+    CHECK_EQ(d.tags.size(), size_t(9));
+}
+
+TEST(alac_m4a_isrc_and_barcode_tags) {
+    cdr::TrackMetadata m = alacSampleMetadata();
+    m.isrc = "JPXX01234567";
+    m.mcn = "4988000000017";
+    const DecodedM4a d = decodeM4a(writeM4a(std::vector<uint8_t>(4 * 4096, 0), m, {}, "alac_isrc.m4a"));
+    CHECK(d.tags.at("----:com.apple.iTunes:ISRC") == "JPXX01234567");
+    CHECK(d.tags.at("----:com.apple.iTunes:BARCODE") == "4988000000017");
+    CHECK_EQ(d.tags.size(), size_t(11));
+}
+
+TEST(alac_m4a_edge_cases) {
+    // No audio: valid boxes, no frames.
+    const DecodedM4a empty = decodeM4a(writeM4a({}, {}, {}, "alac_empty.m4a"));
+    CHECK_EQ(empty.movieDuration, uint64_t(0));
+    CHECK(empty.stts.empty() && empty.sampleSizes.empty() && empty.chunkOffsets.empty());
+    CHECK_EQ(empty.mdatDataSize, uint64_t(0));
+    CHECK(empty.tags.count("\xA9too") == 1);
+    CHECK_EQ(empty.tags.size(), size_t(1));  // only the encoder without metadata
+
+    // Exactly one and exactly ten frames: a single stts / stsc entry.
+    for (size_t n : {size_t(4096), size_t(40960)}) {
+        const testsig::Signal s = testsig::music(n);
+        const DecodedM4a d = decodeM4a(writeM4a(s.pcm, {}, {}, "alac_full.m4a"));
+        CHECK_EQ(d.stts.size(), size_t(1));
+        CHECK(d.stts[0] == std::make_pair(uint32_t(n / 4096), uint32_t(4096)));
+        CHECK_EQ(d.stsc.size(), size_t(1));
+        CHECK_EQ(d.chunkOffsets.size(), size_t(1));
+        CHECK(d.pcm == s.pcm);
+        for (const AlacFrameInfo& f : d.frames) CHECK(!f.partial);
+    }
+
+    // A single sample.
+    const testsig::Signal one = testsig::make("one", 1, [](size_t, int16_t& l, int16_t& r) {
+        l = -32768;
+        r = 32767;
+    });
+    const DecodedM4a d1 = decodeM4a(writeM4a(one.pcm, {}, {}, "alac_one.m4a"));
+    CHECK(d1.pcm == one.pcm);
+    CHECK(d1.frames.size() == 1 && d1.frames[0].partial && d1.frames[0].samples == 1);
+    CHECK_EQ(d1.stszSampleSize, d1.sampleSizes[0]);  // a constant size (FFmpeg needs it here)
+
+    // Track number without total.
+    cdr::TrackMetadata m;
+    m.trackNumber = 7;
+    CHECK(decodeM4a(writeM4a(one.pcm, m, {}, "alac_trk.m4a")).tags.at("trkn") == "7/0");
+
+    // Input ending in the middle of a sample is an error.
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test_alac_partial.m4a";
+    cdr::AlacWriter w;
+    w.open(path, {});
+    const uint8_t bytes[6] = {};
+    w.write(bytes, sizeof bytes);
+    bool threw = false;
+    try {
+        w.close();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    std::filesystem::remove(path);
+}
+
+TEST(mp4_sample_table_chunks_and_64bit_offsets) {
+    // Frames beyond 4 GB need co64; a gap in the file starts a new chunk.
+    cdr::mp4::AudioTrack t;
+    t.duration = 4096 * 3 + 5;
+    t.sampleEntry = cdr::mp4::audioSampleEntry("alac", 2, 16, 44100, {});
+    t.frameSizes = {100, 200, 300, 50};
+    const uint64_t base = (uint64_t(1) << 32) + 16;
+    t.frameOffsets = {base, base + 100, base + 1000, base + 1300};
+    t.framesPerChunk = 10;
+    const std::vector<uint8_t> moov = cdr::mp4::movie(t, {});
+    const std::string text(moov.begin(), moov.end());
+    CHECK(text.find("stco") == std::string::npos);
+    const size_t co64 = text.find("co64");
+    CHECK(co64 != std::string::npos);
+    if (co64 != std::string::npos) {
+        auto be = [&](size_t pos, int n) {
+            uint64_t v = 0;
+            for (int i = 0; i < n; ++i) v = v << 8 | moov[pos + size_t(i)];
+            return v;
+        };
+        CHECK_EQ(be(co64 - 4, 4), uint64_t(8 + 4 + 4 + 2 * 8));  // two chunks
+        CHECK_EQ(be(co64 + 8, 4), uint64_t(2));
+        CHECK_EQ(be(co64 + 12, 8), base);
+        CHECK_EQ(be(co64 + 20, 8), base + 1000);
+        const size_t stsc = text.find("stsc");
+        CHECK_EQ(be(stsc + 8, 4), uint64_t(1));  // one run: 2 frames per chunk
+        CHECK_EQ(be(stsc + 12, 4), uint64_t(1));
+        CHECK_EQ(be(stsc + 16, 4), uint64_t(2));
+        const size_t stts = text.find("stts");
+        CHECK_EQ(be(stts + 8, 4), uint64_t(2));
+        CHECK_EQ(be(stts + 12, 4), uint64_t(3));
+        CHECK_EQ(be(stts + 16, 4), uint64_t(4096));
+        CHECK_EQ(be(stts + 20, 4), uint64_t(1));
+        CHECK_EQ(be(stts + 24, 4), uint64_t(5));
+    }
+    // The duration must match the frames.
+    t.duration = 4096 * 4 + 1;
+    bool threw = false;
+    try {
+        cdr::mp4::movie(t, {});
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(alac_compression_against_flac) {
+    // Our ALAC should be in the same league as our FLAC on music-like audio.
+    const testsig::Signal s = testsig::music(44100 * 3);
+    const DecodedM4a d = decodeM4a(writeM4a(s.pcm, {}, {}, "alac_ratio.m4a"));
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test_ratio.flac";
+    {
+        cdr::FlacWriter w;
+        w.open(path, {});
+        w.write(s.pcm.data(), s.pcm.size());
+        w.close();
+    }
+    const uintmax_t flacBytes = std::filesystem::file_size(path);
+    std::filesystem::remove(path);
+    std::printf("  music 3 s: PCM %zu, ALAC frames %ju, FLAC file %ju bytes\n", s.pcm.size(),
+                uintmax_t(d.mdatDataSize), flacBytes);
+    CHECK(d.mdatDataSize < flacBytes * 13 / 10);
+}
 
 }  // namespace
 
@@ -3618,6 +4313,74 @@ TEST(single_file_image_with_htoa_and_gaps) {
             CHECK(std::equal(alone.bytes.begin(), alone.bytes.end(), concatenated.begin() + ptrdiff_t(at)));
         }
     }
+}
+
+// #25 with the other formats: the image with an HTOA and pregaps (CUE sheet
+// as in single_file_image_with_htoa_and_gaps) as Ogg FLAC carries the same
+// CUESHEET block as the native FLAC (index points 0 / 1 / 2, lead-out patched
+// on close after the extra index points); ALAC (no embedded CUE sheet) just
+// holds the image. One sector less than announced, so the lead-out moves.
+TEST(single_file_htoa_gaps_in_ogg_flac_and_alac) {
+    FakeDrive fake = makeDisc({300, 900, 1200}, 1500);
+    fake.pregaps = {{2, 150}, {3, 7}};
+    fake.laterIndexes[2] = {1000};
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc);
+    cdr::Ripper ripper(drive, toc, cdr::RipOptions{});
+    cdr::AlbumMetadata album;
+    cdr::EmbeddedCueSheet cue;
+    cue.tracks = cdr::singleFileCueTracks(toc.tracks, "image.oga", album, gaps, true);
+    cue.totalSectors = toc.leadOutLba;
+    cue.text = cdr::formatCueSheet(album, cue.tracks);
+    std::vector<uint8_t> image;
+    std::vector<cdr::Track> parts = {cdr::htoaTrack(toc)};
+    parts.insert(parts.end(), toc.tracks.begin(), toc.tracks.end());
+    for (const cdr::Track& t : parts)
+        ripper.ripTrack(t, [&](const uint8_t* p, size_t n) { image.insert(image.end(), p, p + n); });
+    CHECK_EQ(image.size(), size_t(1500) * cdr::kSectorBytes);
+    image.resize(image.size() - cdr::kSectorBytes);
+
+    auto encode = [&](const std::string& format, const std::string& name) {
+        std::unique_ptr<cdr::AudioWriter> w = cdr::createAudioWriter(format);
+        if (w->canEmbedCueSheet()) w->setEmbeddedCueSheet(cue);
+        const std::filesystem::path path = std::filesystem::temp_directory_path() / name;
+        w->open(path, album.forTrack(0, 3));
+        for (size_t pos = 0; pos < image.size(); pos += 4000)
+            w->write(image.data() + pos, std::min<size_t>(4000, image.size() - pos));
+        w->close();
+        std::vector<uint8_t> file = readFile(path);
+        std::filesystem::remove(path);
+        return file;
+    };
+    const std::vector<uint8_t> native = encode("flac", "cdreader_gaps_image.flac");
+    const std::vector<uint8_t> ogg = encode("oggflac", "cdreader_gaps_image.oga");
+    keepSample("gaps_htoa_image.oga", ogg);
+    const OggFlac o = demuxOggFlac(ogg);
+    CHECK_EQ(o.headerPackets, 3u);
+    if (!o.native.empty()) {
+        const DecodedFlac d = decodeFlac(o.native);
+        CHECK(d.pcm == image);
+        const std::vector<uint8_t> block = flacBlock(o.native, 5);
+        CHECK(block == flacBlock(native, 5));
+        const ParsedCueSheet c = parseCueSheet(block);
+        CHECK_EQ(c.tracks.size(), 4u);
+        if (c.tracks.size() == 4) {
+            CHECK(c.tracks[0].offset == 0 && c.tracks[0].indexes.size() == 2);
+            CHECK(c.tracks[0].indexes[0].number == 0 && c.tracks[0].indexes[1].offset == 300 * 588);
+            CHECK_EQ(c.tracks[1].offset, uint64_t(750 * 588));
+            CHECK_EQ(c.tracks[1].indexes.size(), 3u);
+            CHECK_EQ(c.tracks[2].offset, uint64_t(1193 * 588));
+            CHECK_EQ(c.tracks[3].number, 170);
+            CHECK_EQ(c.tracks[3].offset, uint64_t(1499 * 588));  // the written length, not the announced one
+        }
+        const std::string tag = "CUESHEET=" + cdr::flac::cueSheetTagText(cue.text);
+        CHECK(std::find(d.comments.begin(), d.comments.end(), tag) != d.comments.end());
+    }
+
+    CHECK(!cdr::createAudioWriter("alac")->canEmbedCueSheet());
+    const DecodedM4a m = decodeM4a(encode("alac", "cdreader_gaps_image.m4a"));
+    CHECK(m.pcm == image);
 }
 
 int main() {

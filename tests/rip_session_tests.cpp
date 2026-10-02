@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "alac_decoder.h"
 #include "bot_transport.h"
 #include "cdreader/accuraterip.h"
 #include "cdreader/cd_drive.h"
@@ -341,6 +342,105 @@ TEST(flac_rip_carries_cddb_tags_and_exact_audio) {
     CHECK(hasComment(d2, "ARTIST=Guest"));
     CHECK_EQ(rig.session.rippedTracks().size(), size_t(3));
     CHECK_EQ(rig.session.problemTracks(), 0);
+}
+
+// Packets of an Ogg FLAC file put back together as a native FLAC stream:
+// "fLaC" + the metadata blocks (the first packet's from offset 13) + the frames.
+std::vector<uint8_t> oggFlacAsNative(const std::vector<uint8_t>& ogg) {
+    std::vector<std::vector<uint8_t>> packets(1);
+    for (size_t pos = 0; pos + 27 <= ogg.size();) {
+        if (std::memcmp(&ogg[pos], "OggS", 4) != 0) throw std::runtime_error("bad Ogg page");
+        const size_t segments = ogg[pos + 26];
+        size_t body = pos + 27 + segments;
+        for (size_t i = 0; i < segments; ++i) {
+            const size_t length = ogg[pos + 27 + i];
+            packets.back().insert(packets.back().end(), ogg.begin() + long(body), ogg.begin() + long(body + length));
+            body += length;
+            if (length < 255) packets.emplace_back();
+        }
+        pos = body;
+    }
+    packets.pop_back();
+    if (packets.empty() || packets[0].size() != 51 || packets[0][0] != 0x7F) throw std::runtime_error("not Ogg FLAC");
+    std::vector<uint8_t> native(packets[0].begin() + 9, packets[0].end());
+    for (size_t i = 1; i < packets.size(); ++i) native.insert(native.end(), packets[i].begin(), packets[i].end());
+    return native;
+}
+
+TEST(oggflac_rip_carries_tags_and_exact_audio) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    rig.session.beginRip(settings("oggflac"));
+    TempDir dir;
+    const fs::path path = dir.path / "track";
+    const cdr::RippedTrack& r = rig.session.ripTrack(2, path);
+    const Reference ref = referenceRip(2);
+    CHECK_EQ(r.result.crc32, ref.crc32);
+    CHECK_EQ(r.accurateRipV2, ref.v2);
+    CHECK_STR(r.fileName, "02 - \xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91.oga");
+    CHECK_STR(r.fileName, rig.session.trackFileName(2, "oggflac"));
+    // STREAMINFO is patched at close (the first page rewritten): the total is right.
+    const DecodedFlac d = decodeFlac(oggFlacAsNative(readFile(path)));
+    CHECK_EQ(d.totalSamples, uint64_t(ref.pcm.size() / 4));
+    CHECK(d.pcm == ref.pcm);
+    CHECK(hasComment(d, "TITLE=\xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91"));
+    CHECK(hasComment(d, "ARTIST=Guest"));
+    CHECK(hasComment(d, "TRACKNUMBER=2"));
+    CHECK(contains(rig.session.ripLog(), "Format: oggflac\nEncoder: Ogg FLAC (built-in encoder), lossless"));
+}
+
+TEST(mka_rip_writes_matroska_with_tags) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    rig.session.beginRip(settings("mka"));
+    TempDir dir;
+    const fs::path path = dir.path / "track1.mka";
+    const cdr::RippedTrack& r = rig.session.ripTrack(1, path);
+    CHECK(r.result.clean());
+    CHECK_STR(r.fileName, "01 - Opening.mka");
+    const std::vector<uint8_t> bytes = readFile(path);
+    const std::string text(bytes.begin(), bytes.end());
+    CHECK(text.compare(0, 4, "\x1A\x45\xDF\xA3") == 0);  // EBML header
+    CHECK(contains(text, "matroska"));
+    CHECK(contains(text, "A_FLAC"));
+    CHECK(contains(text, "Album: Live"));
+    CHECK(contains(text, "Opening"));
+    CHECK(contains(rig.session.ripLog(), "Format: mka\nEncoder: FLAC (built-in encoder) in Matroska"));
+}
+
+TEST(alac_rip_carries_cddb_tags_and_exact_audio) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    rig.session.beginRip(settings("alac"));
+    TempDir dir;
+    const fs::path path = dir.path / "track2.m4a";
+    const cdr::RippedTrack& r = rig.session.ripTrack(2, path);
+    const Reference ref = referenceRip(2);
+    CHECK(r.result.clean());
+    CHECK_EQ(r.result.crc32, ref.crc32);
+    CHECK_EQ(r.accurateRipV2, ref.v2);
+    CHECK_STR(r.fileName, "02 - \xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91.m4a");
+    CHECK_STR(r.fileName, rig.session.trackFileName(2, "alac"));
+
+    const DecodedM4a d = decodeM4a(readFile(path));
+    CHECK(d.sampleEntryType == "alac");
+    CHECK_EQ(d.mediaDuration, uint64_t(ref.pcm.size() / 4));
+    CHECK(d.pcm == ref.pcm);
+    CHECK_STR(d.tags.at("\xA9nam"), "\xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91");
+    CHECK_STR(d.tags.at("\xA9" "ART"), "Guest");
+    CHECK_STR(d.tags.at("\xA9" "alb"), "Album: Live");
+    CHECK_STR(d.tags.at("aART"), "Various");
+    CHECK_STR(d.tags.at("trkn"), "2/3");
+    CHECK_STR(d.tags.at("\xA9" "day"), "1999");
+    CHECK_STR(d.tags.at("\xA9gen"), "Rock");
+    CHECK_STR(d.tags.at("----:com.apple.iTunes:CDDB"), rig.session.album().discId);
+    CHECK(contains(rig.session.ripLog(), "Format: alac\nEncoder: ALAC (built-in encoder), lossless"));
 }
 
 #if defined(CDREADER_HAVE_OPUS) || defined(CDREADER_HAVE_VORBIS)

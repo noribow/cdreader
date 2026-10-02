@@ -10,9 +10,12 @@
     <string name="verify">2 回読みして比較 (低速)</string>
     <string name="format">形式</string>
     <string name="format_flac">FLAC</string>
+    <string name="format_oggflac">Ogg FLAC</string>
+    <string name="format_alac">ALAC (M4A)</string>
     <string name="format_wav">WAV</string>
     <string name="format_opus">Opus</string>
     <string name="format_vorbis">Vorbis</string>
+    <string name="format_mka">MKA (FLAC)</string>
     <string name="use_cddb">CDDB で曲名を取得</string>
     <string name="use_accuraterip">AccurateRip で照合</string>
     <string name="no_drive">USB CD ドライブが見つかりません。OTG ケーブルとドライブの電源を確認してください。</string>

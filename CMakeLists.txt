@@ -31,6 +31,8 @@ endif()
 # --- Platform independent core (shared by Windows and Android) --------------
 add_library(cdreader_core STATIC
   core/src/accuraterip.cpp
+  core/src/alac_encoder.cpp
+  core/src/alac_writer.cpp
   core/src/audio_writer.cpp
   core/src/cddb.cpp
   core/src/cd_drive.cpp
@@ -40,9 +42,13 @@ add_library(cdreader_core STATIC
   core/src/flac_encoder.cpp
   core/src/flac_writer.cpp
   core/src/gaps.cpp
+  core/src/matroska.cpp
   core/src/md5.cpp
   core/src/metadata.cpp
+  core/src/mka_writer.cpp
+  core/src/mp4.cpp
   core/src/ogg.cpp
+  core/src/ogg_flac_writer.cpp
   core/src/resampler.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp
@@ -111,6 +117,7 @@ endif()
 if(CDREADER_BUILD_TESTS)
   enable_testing()
   add_executable(cdreader_tests
+    tests/alac_decoder.cpp
     tests/fake_drive.cpp
     tests/flac_decoder.cpp
     tests/test_main.cpp
@@ -130,6 +137,7 @@ if(CDREADER_BUILD_TESTS)
 
   # The Android rip workflow over the BOT fake USB device and canned HTTP.
   add_executable(cdreader_rip_session_tests
+    tests/alac_decoder.cpp
     tests/fake_drive.cpp
     tests/fake_usb_device.cpp
     tests/flac_decoder.cpp
@@ -138,6 +146,12 @@ if(CDREADER_BUILD_TESTS)
   target_include_directories(cdreader_rip_session_tests PRIVATE tests)
   target_link_libraries(cdreader_rip_session_tests PRIVATE cdreader_rip_session cdreader_usb)
   add_test(NAME cdreader_rip_session_tests COMMAND cdreader_rip_session_tests)
+
+  # Matroska writer (#23): EBML layout and the codecs inside, decoded in process.
+  add_executable(cdreader_mka_tests tests/flac_decoder.cpp tests/mka_tests.cpp)
+  target_include_directories(cdreader_mka_tests PRIVATE tests)
+  target_link_libraries(cdreader_mka_tests PRIVATE cdreader_core)
+  add_test(NAME cdreader_mka_tests COMMAND cdreader_mka_tests)
 
   # Round trip through the reference FLAC tool (skipped when `flac` is not installed).
   add_executable(cdreader_flac_roundtrip tests/flac_roundtrip.cpp)
@@ -185,4 +199,51 @@ if(CDREADER_BUILD_TESTS)
   endforeach()
   add_test(NAME lossy_decode COMMAND cdreader_lossy_decode_check ${_lossy_tools})
   set_tests_properties(lossy_decode PROPERTIES SKIP_RETURN_CODE 77)
+
+  # Ogg FLAC output checked with flac (decoding, CUESHEET through --cue),
+  # ogginfo, ffmpeg and ffprobe; the missing tools are skipped (all: 77).
+  add_executable(cdreader_ogg_flac_check tests/ogg_flac_check.cpp)
+  target_include_directories(cdreader_ogg_flac_check PRIVATE tests)
+  target_link_libraries(cdreader_ogg_flac_check PRIVATE cdreader_core)
+  find_program(FFMPEG_EXECUTABLE ffmpeg)
+  set(_oggflac_tools)
+  foreach(_tool flac ogginfo ffmpeg ffprobe)
+    string(TOUPPER "${_tool}" _var)
+    if(${_var}_EXECUTABLE)
+      list(APPEND _oggflac_tools --${_tool} "${${_var}_EXECUTABLE}")
+    endif()
+  endforeach()
+  add_test(NAME ogg_flac_check COMMAND cdreader_ogg_flac_check ${_oggflac_tools})
+  set_tests_properties(ogg_flac_check PROPERTIES SKIP_RETURN_CODE 77)
+
+  # Matroska output checked with mkvinfo (mkvtoolnix), ffprobe and ffmpeg.
+  # Skipped when none is installed.
+  add_executable(cdreader_mka_check tests/mka_check.cpp)
+  target_include_directories(cdreader_mka_check PRIVATE tests)
+  target_link_libraries(cdreader_mka_check PRIVATE cdreader_core)
+  set(_mka_tools)
+  foreach(_tool mkvinfo ffprobe ffmpeg)
+    string(TOUPPER "${_tool}" _var)
+    find_program(${_var}_EXECUTABLE ${_tool})
+    if(${_var}_EXECUTABLE)
+      list(APPEND _mka_tools --${_tool} "${${_var}_EXECUTABLE}")
+    endif()
+  endforeach()
+  add_test(NAME mka_check COMMAND cdreader_mka_check ${_mka_tools})
+  set_tests_properties(mka_check PROPERTIES SKIP_RETURN_CODE 77)
+  # ALAC (.m4a) decoded by FFmpeg (bit-exact PCM, tags via ffprobe); also
+  # compares the size with our FLAC and FFmpeg's ALAC encoder. Skipped without ffmpeg.
+  add_executable(cdreader_alac_ffmpeg_check tests/alac_ffmpeg_check.cpp tests/alac_decoder.cpp)
+  target_include_directories(cdreader_alac_ffmpeg_check PRIVATE tests)
+  target_link_libraries(cdreader_alac_ffmpeg_check PRIVATE cdreader_core)
+  set(_alac_tools)
+  foreach(_tool ffmpeg ffprobe)
+    string(TOUPPER "${_tool}" _var)
+    find_program(${_var}_EXECUTABLE ${_tool})
+    if(${_var}_EXECUTABLE)
+      list(APPEND _alac_tools --${_tool} "${${_var}_EXECUTABLE}")
+    endif()
+  endforeach()
+  add_test(NAME alac_ffmpeg COMMAND cdreader_alac_ffmpeg_check ${_alac_tools})
+  set_tests_properties(alac_ffmpeg PROPERTIES SKIP_RETURN_CODE 77)
 endif()

@@ -109,6 +109,18 @@
                     android:text="@string/format_flac" />
 
                 <RadioButton
+                    android:id="@+id/radioOggFlac"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/format_oggflac" />
+
+                <RadioButton
+                    android:id="@+id/radioAlac"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/format_alac" />
+
+                <RadioButton
                     android:id="@+id/radioWav"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
@@ -125,6 +137,12 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="@string/format_vorbis" />
+
+                <RadioButton
+                    android:id="@+id/radioMka"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/format_mka" />
             </RadioGroup>
         </HorizontalScrollView>
     </LinearLayout>
