@@ -26,16 +26,26 @@ endif()
 
 # --- Platform independent core (shared by Windows and Android) --------------
 add_library(cdreader_core STATIC
+  core/src/accuraterip.cpp
   core/src/audio_writer.cpp
+  core/src/cddb.cpp
   core/src/cd_drive.cpp
   core/src/crc32.cpp
+  core/src/cue_sheet.cpp
+  core/src/file_naming.cpp
+  core/src/flac_encoder.cpp
+  core/src/flac_writer.cpp
+  core/src/md5.cpp
   core/src/metadata.cpp
+  core/src/ogg.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp
+  core/src/tags.cpp
   core/src/toc.cpp
   core/src/wav_writer.cpp
 )
 target_include_directories(cdreader_core PUBLIC core/include)
+target_compile_definitions(cdreader_core PRIVATE CDREADER_VERSION="${PROJECT_VERSION}")
 
 # --- Windows: SCSI pass-through transport + command line front end ---------
 if(WIN32)
@@ -79,6 +89,7 @@ if(CDREADER_BUILD_TESTS)
   enable_testing()
   add_executable(cdreader_tests
     tests/fake_drive.cpp
+    tests/flac_decoder.cpp
     tests/test_main.cpp
   )
   target_include_directories(cdreader_tests PRIVATE tests)
@@ -93,4 +104,17 @@ if(CDREADER_BUILD_TESTS)
   target_include_directories(cdreader_usb_tests PRIVATE tests)
   target_link_libraries(cdreader_usb_tests PRIVATE cdreader_usb)
   add_test(NAME cdreader_usb_tests COMMAND cdreader_usb_tests)
+
+  # Round trip through the reference FLAC tool (skipped when `flac` is not installed).
+  add_executable(cdreader_flac_roundtrip tests/flac_roundtrip.cpp)
+  target_include_directories(cdreader_flac_roundtrip PRIVATE tests)
+  target_link_libraries(cdreader_flac_roundtrip PRIVATE cdreader_core)
+  find_program(FLAC_EXECUTABLE flac)
+  if(FLAC_EXECUTABLE)
+    add_test(NAME flac_roundtrip COMMAND cdreader_flac_roundtrip "${FLAC_EXECUTABLE}")
+  else()
+    message(STATUS "flac not found: the FLAC reference round trip test will be skipped")
+    add_test(NAME flac_roundtrip COMMAND cdreader_flac_roundtrip)
+  endif()
+  set_tests_properties(flac_roundtrip PROPERTIES SKIP_RETURN_CODE 77)
 endif()
