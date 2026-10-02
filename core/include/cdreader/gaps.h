@@ -30,8 +30,9 @@
 // wider window, then windows further away, then asks the other Q sources
 // (raw P-W, READ SUB-CHANNEL) before giving up. A constant offset between the
 // sector read and the position in its Q frame ("Q delay", seen on many
-// drives) is measured on CRC-checked frames and the reads are placed to make
-// up for it. The positions found are always those of the Q frames (the time
+// drives) is measured on the position frames read with READ CD (a frame
+// whose CRC is wrong is never counted; 90 % must agree) and the reads are
+// placed to make up for it. The positions found are always those of the Q frames (the time
 // written in them), so the delay does not shift the result. Up to 3 sectors
 // whose Q frames never carry a position (a mode 2 / 3 frame right at the
 // boundary) leave the boundary known only to within them: the first sector
