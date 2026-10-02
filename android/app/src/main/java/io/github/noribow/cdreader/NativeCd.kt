@@ -29,10 +29,18 @@ object NativeCd {
     ): Array<String>
     @JvmStatic external fun nativeAlbumFolderName(handle: Long): String
     @JvmStatic external fun nativeTrackFileName(handle: Long, track: Int, format: String): String
-    @JvmStatic external fun nativeBeginRip(handle: Long, format: String, readOffset: Int, maxRetries: Int, verify: Boolean)
+    @JvmStatic external fun nativeBeginRip(
+        handle: Long,
+        format: String,
+        readOffset: Int,
+        maxRetries: Int,
+        verify: Boolean,
+        useC2: Boolean,
+    )
     @JvmStatic external fun nativeRipTrack(handle: Long, track: Int, path: String, listener: RipProgressListener?): IntArray
     @JvmStatic external fun nativeCheckAccurateRip(handle: Long, enabled: Boolean, http: HttpGet?): IntArray
     @JvmStatic external fun nativeAccurateRipError(handle: Long): String
+    @JvmStatic external fun nativeC2Status(handle: Long): Int
     @JvmStatic external fun nativeRipLog(handle: Long): String
 }
 
@@ -81,9 +89,21 @@ data class RipResult(
     val crc32: Int,
     val accurateRipV1: Int,
     val accurateRipV2: Int,
+    /** Read with C2 error pointers (#33). */
+    val c2: Boolean,
+    /** Sectors the drive flagged with C2 errors (each re-read on its own). */
+    val c2ErrorSectors: Int,
+    val c2Rereads: Int,
+    /** Still C2 errors after the retries: the best read was kept. */
+    val c2Unresolved: Int,
+    /** Output sectors at suspicious positions (listed in rip.log). */
+    val suspiciousSectors: Int,
 ) {
-    val clean: Boolean get() = unreadableSectors == 0
+    val clean: Boolean get() = unreadableSectors == 0 && suspiciousSectors == 0
 }
+
+/** C2 error pointers of a rip (see [CdSession.c2Status]). */
+enum class C2Status { DISABLED, NOT_SUPPORTED, USED, GIVEN_UP }
 
 enum class AccurateRipStatus { FOUND, NOT_FOUND, ERROR, DISABLED }
 
@@ -168,9 +188,20 @@ class CdSession private constructor(private val handle: Long) : Closeable {
     /** "NN - Title.flac" from CDDB, otherwise "TrackNN.flac". */
     fun trackFileName(track: Int, format: String): String = NativeCd.nativeTrackFileName(handle, track, format)
 
-    /** Starts a rip ([format]: a name from [NativeCd.nativeFormats]); forgets the results of the previous one. */
-    fun beginRip(format: String, readOffset: Int, maxRetries: Int, verify: Boolean) =
-        NativeCd.nativeBeginRip(handle, format, readOffset, maxRetries, verify)
+    /**
+     * Starts a rip ([format]: a name from [NativeCd.nativeFormats]); forgets the results of the previous one.
+     * [useC2]: read with C2 error pointers when the drive supports them.
+     */
+    fun beginRip(format: String, readOffset: Int, maxRetries: Int, verify: Boolean, useC2: Boolean) =
+        NativeCd.nativeBeginRip(handle, format, readOffset, maxRetries, verify, useC2)
+
+    /** Whether the current rip reads with C2 error pointers (known after [beginRip]). */
+    fun c2Status(): C2Status = when (NativeCd.nativeC2Status(handle)) {
+        1 -> C2Status.NOT_SUPPORTED
+        2 -> C2Status.USED
+        3 -> C2Status.GIVEN_UP
+        else -> C2Status.DISABLED
+    }
 
     /**
      * Rips a track to the local file [path] (seekable: headers are patched at
@@ -179,7 +210,7 @@ class CdSession private constructor(private val handle: Long) : Closeable {
      */
     fun ripTrack(track: Int, path: String, listener: RipProgressListener?): RipResult {
         val v = NativeCd.nativeRipTrack(handle, track, path, listener)
-        return RipResult(v[0], v[1], v[2], v[3], v[4], v[5], v[6])
+        return RipResult(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7] != 0, v[8], v[9], v[10], v[11])
     }
 
     /** Compares the tracks ripped since [beginRip] with the AccurateRip database. Never fails for network problems. */

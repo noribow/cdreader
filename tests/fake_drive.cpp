@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "cdreader/cd_drive.h"
 #include "cdreader/subchannel.h"
 
 cdr::ScsiResult FakeDrive::checkCondition(uint8_t key, uint8_t asc, uint8_t ascq) {
@@ -228,9 +229,26 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
             return ok;
         }
 
+        case 0x5A: {  // MODE SENSE(10)
+            if (!modeSenseSupported) return checkCondition(0x5, 0x20, 0x00);
+            if ((cdb[2] & 0x3F) != 0x2A) return checkCondition(0x5, 0x24, 0x00);
+            uint8_t response[8 + 28] = {};
+            response[1] = sizeof response - 2;  // mode data length
+            uint8_t* page = response + 8;       // DBD: no block descriptors
+            page[0] = 0x2A;
+            page[1] = 26;
+            page[5] = uint8_t(0x01 | 0x02 | (c2Supported ? 0x10 : 0x00));  // CD-DA commands, accurate stream, C2
+            const size_t allocation = size_t(cdb[7]) << 8 | cdb[8];
+            const size_t n = std::min({sizeof response, allocation, dataLength});
+            std::memcpy(out, response, n);
+            ok.transferred = n;
+            return ok;
+        }
+
         case 0xBE: {  // READ CD
             const uint8_t selection = cdb[10] & 0x07;
             const bool userData = (cdb[9] & 0x10) != 0;
+            const uint8_t errorField = (cdb[9] >> 1) & 0x03;
             if (selection != 0) {
                 ++subQReads;
                 lastReadCdCdb.assign(cdb, cdb + 12);
@@ -239,11 +257,17 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
                     return checkCondition(0x5, 0x24, 0x00);
             } else {
                 ++readCommands;
+                lastAudioCdb.assign(cdb, cdb + 12);
+            }
+            if (errorField != 0) {
+                ++c2ReadCommands;
+                if (!c2ReadsSupported || errorField == 3 || selection != 0) return checkCondition(0x5, 0x24, 0x00);
             }
             const uint32_t lba = (uint32_t(cdb[2]) << 24) | (uint32_t(cdb[3]) << 16) | (uint32_t(cdb[4]) << 8) | cdb[5];
             const uint32_t count = (uint32_t(cdb[6]) << 16) | (uint32_t(cdb[7]) << 8) | cdb[8];
             const size_t subBytes = selection == 1 ? 96 : selection == 2 ? 16 : 0;
-            const size_t perSector = (userData ? cdr::kSectorBytes : 0) + subBytes;
+            const size_t c2Bytes = errorField == 1 ? cdr::kC2BytesPerSector : errorField == 2 ? 296 : 0;
+            const size_t perSector = (userData ? cdr::kSectorBytes : 0) + subBytes + c2Bytes;
             if (dataLength != size_t(count) * perSector) return checkCondition(0x5, 0x24, 0x00);
             if (lba + count > leadOut_) return checkCondition(0x5, 0x21, 0x00);
             for (uint32_t s = lba; s < lba + count; ++s) {
@@ -261,8 +285,23 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
                     if (unstableSectors.count(s)) sector[0] = uint8_t(++unstableCounter_);
                 }
                 if (selection != 0) subQ(s, selection, sector + (userData ? cdr::kSectorBytes : 0));
+                if (selection != 0 || !userData) continue;
+                uint8_t* c2 = c2Bytes ? sector + cdr::kSectorBytes : nullptr;
+                if (c2) std::memset(c2, 0, c2Bytes);
+                auto it = c2Faults.find(s);
+                if (it == c2Faults.end() || it->second.reads == 0) continue;
+                C2Fault& f = it->second;
+                if (f.reads > 0) --f.reads;
+                const uint8_t noise = f.varying ? uint8_t(++c2Counter_ % 255 + 1) : uint8_t(0x55);
+                const size_t end = std::min(size_t(cdr::kSectorBytes), f.firstByte + f.byteCount);
+                for (size_t b = f.firstByte; b < end; ++b) {
+                    if (f.corrupt) sector[b] ^= noise;
+                    if (c2 && f.flagged) c2[b >> 3] |= uint8_t(0x80 >> (b & 7));
+                }
+                if (c2 && f.flagged && c2Bytes == 296) c2[294] = 0xFF;  // block error byte
             }
             lastReadLba_ = lba;
+            if (errorField != 0 && c2IgnoresErrorField) ok.transferred = size_t(count) * cdr::kSectorBytes;
             return ok;
         }
     }

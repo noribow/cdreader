@@ -379,15 +379,18 @@ JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTrackFi
 
 // Starts a rip with these settings: forgets earlier results, clears a cancel.
 // Lossy formats use their default settings (Opus VBR 160 kbit/s, Vorbis q5).
+// `useC2`: read with C2 error pointers if the drive supports them (#33).
 JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(JNIEnv* env, jclass, jlong handle,
                                                                                jstring format, jint readOffset,
-                                                                               jint maxRetries, jboolean verify) {
+                                                                               jint maxRetries, jboolean verify,
+                                                                               jboolean useC2) {
     try {
         cdr::RipSettings settings;
         if (!fromJava(env, format, settings.format)) return;
         settings.options.readOffsetSamples = readOffset;
         settings.options.maxRetries = maxRetries;
         settings.options.verify = verify == JNI_TRUE;
+        settings.useC2 = useC2 == JNI_TRUE;
         session(handle)->rip.beginRip(settings);
     } catch (const std::exception& e) {
         throwJava(env, "java/lang/IllegalArgumentException", e.what());
@@ -397,7 +400,8 @@ JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(J
 // Rips one track to a local file at `path` (in the format given to
 // nativeBeginRip), calling listener.onProgress(done, total) in sectors.
 // Returns [sectors, unreadableSectors, retries, paddedSamples, crc32,
-// accurateRipV1, accurateRipV2]. Throws
+// accurateRipV1, accurateRipV2, c2 (1: read with C2 pointers), C2 error
+// sectors, C2 re-reads, unresolved C2 sectors, suspicious sectors]. Throws
 // java.util.concurrent.CancellationException after nativeCancel() and
 // IOException on errors; the partial file is left for the caller to delete.
 JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTrack(JNIEnv* env, jclass,
@@ -423,7 +427,10 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTr
             });
         return toJavaArray(env, std::vector<jint>{jint(r.result.sectors), jint(r.result.unreadableSectors),
                                                   jint(r.result.retries), jint(r.result.paddedSamples),
-                                                  jint(r.result.crc32), jint(r.accurateRipV1), jint(r.accurateRipV2)});
+                                                  jint(r.result.crc32), jint(r.accurateRipV1), jint(r.accurateRipV2),
+                                                  jint(r.result.c2 ? 1 : 0), jint(r.result.c2ErrorSectors),
+                                                  jint(r.result.c2Rereads), jint(r.result.c2Unresolved),
+                                                  jint(r.result.suspiciousSectors.size())});
     } catch (const cdr::RipCancelled&) {
         throwJava(env, "java/util/concurrent/CancellationException", "rip cancelled");
     } catch (const JavaExceptionPending&) {
@@ -474,6 +481,18 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeCheck
 JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeAccurateRipError(JNIEnv* env, jclass,
                                                                                           jlong handle) {
     return toJava(env, session(handle)->rip.accurateRipReport().error);
+}
+
+// C2 error pointers of the current rip: 0 disabled, 1 not supported by the
+// drive, 2 used, 3 supported but given up (the drive rejected C2 reads).
+JNIEXPORT jint JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeC2Status(JNIEnv*, jclass, jlong handle) {
+    const cdr::RipSession& rip = session(handle)->rip;
+    switch (rip.c2Availability().mode) {
+        case cdr::C2Availability::Mode::Disabled: return 0;
+        case cdr::C2Availability::Mode::NotSupported: return 1;
+        case cdr::C2Availability::Mode::Supported: break;
+    }
+    return rip.c2Fallback().empty() ? 2 : 3;
 }
 
 // rip.log text for the current rip.

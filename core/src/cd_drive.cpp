@@ -49,39 +49,84 @@ Toc CdDrive::readToc() {
     return Toc::parse(data.data(), data.size());
 }
 
-ScsiResult CdDrive::readAudio(uint32_t lba, uint32_t count, uint8_t* out) {
-    // READ CD: expected sector type CD-DA, user data only, no sub-channel.
-    uint8_t cdb[12] = {
+namespace {
+
+// READ CD (BEh), expected sector type CD-DA. Byte 9: 0x10 = user data, plus
+// the error field in bits 2..1 (01b = C2 error pointers); byte 10: the
+// sub-channel selection. `perSector` is what the drive returns per sector.
+ScsiResult readCd(ScsiTransport& transport, uint32_t lba, uint32_t count, uint8_t byte9, uint8_t byte10,
+                  size_t perSector, uint8_t* out) {
+    const uint8_t cdb[12] = {
         0xBE, 0x04,
         uint8_t(lba >> 24), uint8_t(lba >> 16), uint8_t(lba >> 8), uint8_t(lba),
         uint8_t(count >> 16), uint8_t(count >> 8), uint8_t(count),
-        0x10, 0x00, 0x00,
+        byte9, byte10, 0x00,
     };
-    const size_t bytes = size_t(count) * kSectorBytes;
-    ScsiResult r = transport_.execute(cdb, sizeof cdb, out, bytes, DataDirection::In, kReadTimeout);
+    const size_t bytes = size_t(count) * perSector;
+    ScsiResult r = transport.execute(cdb, sizeof cdb, out, bytes, DataDirection::In, kReadTimeout);
     if (r.ok() && r.transferred != bytes) {
         r.transportOk = false;
+        r.shortRead = true;
         r.error = "short read (" + std::to_string(r.transferred) + " of " + std::to_string(bytes) + " bytes)";
     }
     return r;
 }
 
+}  // namespace
+
+ScsiResult CdDrive::readAudio(uint32_t lba, uint32_t count, uint8_t* out) {
+    // User data only, no error field, no sub-channel.
+    return readCd(transport_, lba, count, 0x10, 0x00, kSectorBytes, out);
+}
+
+ScsiResult CdDrive::readAudioWithC2(uint32_t lba, uint32_t count, uint8_t* out) {
+    // Error field 01b (C2 error block data, 294 bytes): the format every C2
+    // capable drive implements. 10b adds a block error byte and a pad byte
+    // (296 bytes) that we would not use, and fewer drives accept it.
+    return readCd(transport_, lba, count, 0x10 | 0x02, 0x00, kSectorWithC2Bytes, out);
+}
+
 ScsiResult CdDrive::readAudioWithSubChannel(uint32_t lba, uint32_t count, SubChannelSelection selection,
                                             uint8_t* out) {
-    // READ CD: expected sector type CD-DA, user data, sub-channel selection.
-    uint8_t cdb[12] = {
-        0xBE, 0x04,
-        uint8_t(lba >> 24), uint8_t(lba >> 16), uint8_t(lba >> 8), uint8_t(lba),
-        uint8_t(count >> 16), uint8_t(count >> 8), uint8_t(count),
-        0x10, uint8_t(selection), 0x00,
-    };
-    const size_t bytes = size_t(count) * (kSectorBytes + subChannelBytesPerSector(selection));
-    ScsiResult r = transport_.execute(cdb, sizeof cdb, out, bytes, DataDirection::In, kReadTimeout);
-    if (r.ok() && r.transferred != bytes) {
-        r.transportOk = false;
-        r.error = "short read (" + std::to_string(r.transferred) + " of " + std::to_string(bytes) + " bytes)";
+    return readCd(transport_, lba, count, 0x10, uint8_t(selection),
+                  kSectorBytes + subChannelBytesPerSector(selection), out);
+}
+
+DriveCapabilities DriveCapabilities::parse(const uint8_t* data, size_t length) {
+    DriveCapabilities caps;
+    if (length < 8) {
+        caps.error = "MODE SENSE response too short";
+        return caps;
     }
-    return r;
+    // Mode parameter header (10): mode data length (excluding itself), ...,
+    // block descriptor length in bytes 6..7.
+    const size_t end = std::min(length, (size_t(data[0]) << 8 | data[1]) + 2);
+    const size_t page = 8 + (size_t(data[6]) << 8 | data[7]);
+    if (page + 6 > end) {
+        caps.error = "MODE SENSE response without capabilities page";
+        return caps;
+    }
+    if ((data[page] & 0x3F) != 0x2A || data[page + 1] < 4) {
+        caps.error = "MODE SENSE returned another page";
+        return caps;
+    }
+    caps.valid = true;
+    caps.c2Pointers = (data[page + 5] & 0x10) != 0;
+    return caps;
+}
+
+DriveCapabilities CdDrive::readCapabilities() {
+    // MODE SENSE(10), DBD = 1 (no block descriptors), current values of page 2Ah.
+    std::vector<uint8_t> data(256);
+    const uint8_t cdb[10] = {0x5A, 0x08, 0x2A, 0, 0, 0, 0, uint8_t(data.size() >> 8), uint8_t(data.size()), 0};
+    const ScsiResult r =
+        transport_.execute(cdb, sizeof cdb, data.data(), data.size(), DataDirection::In, kCommandTimeout);
+    if (!r.ok()) {
+        DriveCapabilities caps;
+        caps.error = "MODE SENSE failed: " + r.describe();
+        return caps;
+    }
+    return DriveCapabilities::parse(data.data(), std::min(r.transferred, data.size()));
 }
 
 ScsiResult CdDrive::readSubChannel(SubChannelFormat format, int track, uint8_t* out, size_t length, bool msf) {

@@ -4384,6 +4384,451 @@ TEST(single_file_htoa_gaps_in_ogg_flac_and_alac) {
     CHECK(m.pcm == image);
 }
 
+// --- C2 error pointers (#33) -------------------------------------------------
+
+namespace {
+
+FakeDrive makeC2Disc() {
+    FakeDrive fake = makeAudioDisc();
+    fake.c2Supported = true;
+    return fake;
+}
+
+struct C2Rip {
+    cdr::TrackRipResult result;
+    std::vector<uint8_t> bytes;
+    bool c2Active = false;
+};
+
+C2Rip ripC2(FakeDrive& fake, int track, cdr::RipOptions options) {
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::Ripper ripper(drive, toc, options);
+    C2Rip out;
+    out.result = ripper.ripTrack(*toc.findTrack(track), [&](const uint8_t* p, size_t n) {
+        out.bytes.insert(out.bytes.end(), p, p + n);
+    });
+    out.c2Active = ripper.c2Active();
+    return out;
+}
+
+cdr::RipOptions c2Options(int retries = 3, bool verify = false, int offset = 0) {
+    cdr::RipOptions o;
+    o.maxRetries = retries;
+    o.verify = verify;
+    o.readOffsetSamples = offset;
+    o.useC2 = true;
+    return o;
+}
+
+// A permanent C2 error over bytes [first, first + count) of a sector, with
+// different wrong data on every read.
+FakeDrive::C2Fault c2Fault(size_t first = 1000, size_t count = 16, int reads = -1) {
+    FakeDrive::C2Fault f;
+    f.reads = reads;
+    f.firstByte = first;
+    f.byteCount = count;
+    return f;
+}
+
+}  // namespace
+
+TEST(c2_read_cd_cdb_and_layout) {
+    FakeDrive fake = makeC2Disc();
+    cdr::CdDrive drive(fake);
+    std::vector<uint8_t> buf(2 * cdr::kSectorWithC2Bytes, 0xEE);
+    CHECK(drive.readAudioWithC2(0x0123, 2, buf.data()).ok());
+    CHECK(fake.lastAudioCdb == (std::vector<uint8_t>{0xBE, 0x04, 0x00, 0x00, 0x01, 0x23, 0, 0, 2, 0x12, 0x00, 0}));
+    CHECK_EQ(cdr::kSectorWithC2Bytes, size_t(2646));
+    CHECK(cdr::kMaxSectorsPerC2Read * cdr::kSectorWithC2Bytes <= 65536u);
+    // Audio, then 294 bytes of C2 bits per sector (none on a clean disc).
+    CHECK_EQ(buf[0], FakeDrive::sampleByte(0x0123, 0));
+    CHECK_EQ(buf[cdr::kSectorWithC2Bytes], FakeDrive::sampleByte(0x0124, 0));
+    CHECK(std::all_of(buf.begin() + cdr::kSectorBytes, buf.begin() + cdr::kSectorWithC2Bytes,
+                      [](uint8_t b) { return b == 0; }));
+
+    // C2 bits: one per byte, MSB first.
+    fake.c2Faults[10] = c2Fault(9, 2);
+    std::vector<uint8_t> one(cdr::kSectorWithC2Bytes);
+    CHECK(drive.readAudioWithC2(10, 1, one.data()).ok());
+    CHECK_EQ(one[cdr::kSectorBytes + 1], 0x60);  // bytes 9 and 10
+    CHECK_EQ(one[cdr::kSectorBytes + 0], 0x00);
+
+    // Plain reads keep byte 9 = 0x10 (user data only).
+    CHECK(drive.readAudio(20, 1, one.data()).ok());
+    CHECK_EQ(fake.lastAudioCdb[9], 0x10);
+    CHECK_EQ(fake.c2ReadCommands, 2);
+}
+
+TEST(c2_short_read_is_flagged) {
+    FakeDrive fake = makeC2Disc();
+    fake.c2IgnoresErrorField = true;
+    cdr::CdDrive drive(fake);
+    std::vector<uint8_t> buf(cdr::kSectorWithC2Bytes);
+    const cdr::ScsiResult r = drive.readAudioWithC2(0, 1, buf.data());
+    CHECK(!r.ok());
+    CHECK(r.shortRead);
+    CHECK(r.describe().find("short read") != std::string::npos);
+}
+
+TEST(mode_sense_capabilities) {
+    FakeDrive fake = makeC2Disc();
+    cdr::CdDrive drive(fake);
+    cdr::DriveCapabilities caps = drive.readCapabilities();
+    CHECK(caps.valid);
+    CHECK(caps.c2Pointers);
+    fake.c2Supported = false;
+    caps = drive.readCapabilities();
+    CHECK(caps.valid);
+    CHECK(!caps.c2Pointers);
+    fake.modeSenseSupported = false;
+    caps = drive.readCapabilities();
+    CHECK(!caps.valid);
+    CHECK(!caps.c2Pointers);
+    CHECK(caps.error.find("MODE SENSE failed") == 0);
+
+    // A block descriptor before the page, the PS bit set, byte 5 bit 4.
+    uint8_t data[8 + 8 + 8] = {};
+    data[1] = sizeof data - 2;
+    data[7] = 8;
+    data[16] = 0x80 | 0x2A;
+    data[17] = 6;
+    data[21] = 0x10;
+    caps = cdr::DriveCapabilities::parse(data, sizeof data);
+    CHECK(caps.valid && caps.c2Pointers);
+    data[21] = 0xEF;  // every other bit
+    CHECK(!cdr::DriveCapabilities::parse(data, sizeof data).c2Pointers);
+    data[16] = 0x0E;  // another page
+    CHECK(!cdr::DriveCapabilities::parse(data, sizeof data).valid);
+    data[16] = 0x2A;
+    CHECK(!cdr::DriveCapabilities::parse(data, 20).valid);  // truncated
+    data[1] = 10;  // mode data length says the page is cut off
+    CHECK(!cdr::DriveCapabilities::parse(data, sizeof data).valid);
+    CHECK(!cdr::DriveCapabilities::parse(data, 4).valid);
+}
+
+TEST(c2_availability_and_log_line) {
+    FakeDrive fake = makeC2Disc();
+    cdr::CdDrive drive(fake);
+    cdr::C2Availability a = cdr::checkC2(drive, true);
+    CHECK(a.usable());
+    CHECK(a.logLine() == "C2 pointers: supported");
+    a = cdr::checkC2(drive, false);
+    CHECK(a.mode == cdr::C2Availability::Mode::Disabled);
+    CHECK(a.logLine() == "C2 pointers: disabled");
+    fake.c2Supported = false;
+    a = cdr::checkC2(drive, true);
+    CHECK(!a.usable());
+    CHECK(a.logLine() == "C2 pointers: not supported");
+    fake.modeSenseSupported = false;
+    a = cdr::checkC2(drive, true);
+    CHECK(a.mode == cdr::C2Availability::Mode::NotSupported);
+    CHECK(a.logLine().rfind("C2 pointers: not supported (MODE SENSE failed: ", 0) == 0);
+}
+
+// Without C2 (disabled, or a drive without support) the ripper sends exactly
+// the plain reads it always did; with C2 on a clean disc the audio is the same.
+TEST(c2_disabled_or_clean_gives_identical_output) {
+    FakeDrive plain = makeAudioDisc();
+    plain.c2Faults[310] = c2Fault();  // corrupt data the drive would flag
+    const C2Rip reference = ripC2(plain, 2, cdr::RipOptions{});
+    CHECK_EQ(plain.c2ReadCommands, 0);
+    const int plainReads = plain.readCommands;
+    CHECK_EQ(plainReads, int((150 + cdr::kMaxSectorsPerRead - 1) / cdr::kMaxSectorsPerRead));
+
+    FakeDrive off = makeC2Disc();
+    off.c2Faults[310] = c2Fault();
+    cdr::RipOptions disabled = c2Options();
+    disabled.useC2 = false;
+    const C2Rip a = ripC2(off, 2, disabled);
+    CHECK(a.bytes == reference.bytes);
+    CHECK_EQ(a.result.crc32, reference.result.crc32);
+    CHECK_EQ(off.readCommands, plainReads);
+    CHECK_EQ(off.c2ReadCommands, 0);
+    CHECK(!a.result.c2);
+    CHECK(a.result.clean());  // nothing noticed without C2
+    CHECK(cdr::c2LogLines(a.result).empty());
+
+    FakeDrive clean = makeC2Disc();
+    const C2Rip b = ripC2(clean, 2, c2Options());
+    CHECK(b.bytes == expectedTrackData(300, 150));
+    CHECK(b.result.c2);
+    CHECK(b.c2Active);
+    CHECK_EQ(b.result.c2ErrorSectors, 0u);
+    CHECK_EQ(clean.c2ReadCommands, int((150 + cdr::kMaxSectorsPerC2Read - 1) / cdr::kMaxSectorsPerC2Read));
+    CHECK(cdr::c2LogLines(b.result) == std::vector<std::string>{"  C2 errors: none"});
+}
+
+TEST(c2_transient_error_is_reread) {
+    FakeDrive fake = makeC2Disc();
+    fake.c2Faults[310] = c2Fault(1000, 16, 1);  // wrong and flagged on the first read only
+    const C2Rip r = ripC2(fake, 2, c2Options());
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK_EQ(r.result.c2ErrorSectors, 1u);
+    CHECK_EQ(r.result.c2Rereads, 1u);
+    CHECK_EQ(r.result.c2Recovered, 1u);
+    CHECK_EQ(r.result.c2Unresolved, 0u);
+    CHECK_EQ(r.result.retries, 0u);
+    CHECK(r.result.suspiciousSectors.empty());
+    CHECK(r.result.clean());
+}
+
+TEST(c2_permanent_error_becomes_suspicious) {
+    FakeDrive fake = makeC2Disc();
+    fake.c2Faults[310] = c2Fault();
+    const int before = fake.c2ReadCommands;
+    const C2Rip r = ripC2(fake, 2, c2Options(3));
+    CHECK_EQ(fake.c2ReadCommands - before, 7 + 3);  // 7 blocks, 3 re-reads
+    CHECK_EQ(r.result.c2ErrorSectors, 1u);
+    CHECK_EQ(r.result.c2Rereads, 3u);
+    CHECK_EQ(r.result.c2Unresolved, 1u);
+    CHECK(r.result.suspiciousSectors == std::vector<uint32_t>{10});
+    CHECK(!r.result.clean());
+    CHECK(r.result.status() == "1 suspicious sector(s)");
+    // Only the flagged bytes differ from the disc (the best read is kept).
+    const std::vector<uint8_t> expected = expectedTrackData(300, 150);
+    CHECK_EQ(r.bytes.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const size_t inSector = i - size_t(10) * cdr::kSectorBytes;
+        const bool flagged = i >= size_t(10) * cdr::kSectorBytes && inSector >= 1000 && inSector < 1016;
+        if (!flagged && r.bytes[i] != expected[i]) {
+            CHECK(false);
+            break;
+        }
+    }
+    const std::vector<std::string> log = cdr::c2LogLines(r.result);
+    CHECK_EQ(log.size(), size_t(2));
+    CHECK(log[0] == "  C2 errors: 1 sector(s), 3 re-read(s) (0 recovered, 0 identical re-reads with C2, 1 unresolved)");
+    CHECK(log[1] == "  Suspicious position 0:00:00 (sector 10)");
+
+    // No retries: suspicious right away.
+    FakeDrive none = makeC2Disc();
+    none.c2Faults[310] = c2Fault();
+    const C2Rip z = ripC2(none, 2, c2Options(0));
+    CHECK_EQ(z.result.c2Rereads, 0u);
+    CHECK_EQ(z.result.c2Unresolved, 1u);
+}
+
+TEST(c2_flagged_but_correct_data_matches) {
+    FakeDrive fake = makeC2Disc();
+    FakeDrive::C2Fault f = c2Fault();
+    f.corrupt = false;  // the drive reports C2 errors for good data
+    fake.c2Faults[310] = f;
+    const C2Rip r = ripC2(fake, 2, c2Options());
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK_EQ(r.result.c2ErrorSectors, 1u);
+    CHECK_EQ(r.result.c2Rereads, 1u);  // identical to the read that flagged it
+    CHECK_EQ(r.result.c2Matched, 1u);
+    CHECK(r.result.clean());
+
+    // The same wrong data on every read ends the same way: only AccurateRip /
+    // --verify against another drive can tell.
+    FakeDrive same = makeC2Disc();
+    FakeDrive::C2Fault g = c2Fault();
+    g.varying = false;
+    same.c2Faults[310] = g;
+    const C2Rip s = ripC2(same, 2, c2Options());
+    CHECK_EQ(s.result.c2Matched, 1u);
+    CHECK(s.bytes != expectedTrackData(300, 150));
+}
+
+TEST(c2_corruption_without_c2_bits_needs_verify_or_accuraterip) {
+    FakeDrive fake = makeC2Disc();
+    FakeDrive::C2Fault f = c2Fault();
+    f.flagged = false;
+    f.varying = false;
+    fake.c2Faults[310] = f;
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::Ripper ripper(drive, toc, c2Options());
+    cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, *toc.findTrack(2));
+    std::vector<uint8_t> bytes;
+    const cdr::TrackRipResult r = ripper.ripTrack(*toc.findTrack(2), [&](const uint8_t* p, size_t n) {
+        bytes.insert(bytes.end(), p, p + n);
+        ar.update(p, n);
+    });
+    CHECK(r.clean());  // nothing to see for the ripper
+    CHECK_EQ(r.c2ErrorSectors, 0u);
+    CHECK(bytes != expectedTrackData(300, 150));
+    const std::vector<uint8_t> good = expectedTrackData(300, 150);
+    cdr::AccurateRipChecksum ref = cdr::AccurateRipChecksum::forTrack(toc, *toc.findTrack(2));
+    ref.update(good.data(), good.size());
+    CHECK(ar.v2() != ref.v2());  // AccurateRip would not match
+
+    // Varying silent corruption is caught by --verify (as before C2).
+    FakeDrive unstable = makeC2Disc();
+    FakeDrive::C2Fault g = c2Fault();
+    g.flagged = false;
+    unstable.c2Faults[310] = g;
+    const C2Rip v = ripC2(unstable, 2, c2Options(2, true));
+    CHECK(v.result.retries > 0);
+    CHECK_EQ(v.result.unreadableSectors, 1u);
+    CHECK_EQ(v.result.c2ErrorSectors, 0u);
+}
+
+TEST(c2_verify_mode_needs_two_identical_rereads) {
+    FakeDrive fake = makeC2Disc();
+    FakeDrive::C2Fault f = c2Fault(1000, 16, 2);
+    f.varying = false;  // both block reads return the same wrong data
+    fake.c2Faults[310] = f;
+    const C2Rip r = ripC2(fake, 2, c2Options(3, true));
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK_EQ(r.result.retries, 0u);
+    CHECK_EQ(r.result.c2ErrorSectors, 1u);
+    CHECK_EQ(r.result.c2Rereads, 2u);  // a clean read, confirmed by a second one
+    CHECK_EQ(r.result.c2Recovered, 1u);
+    CHECK(r.result.clean());
+
+    FakeDrive flagged = makeC2Disc();
+    FakeDrive::C2Fault g = c2Fault();
+    g.corrupt = false;
+    flagged.c2Faults[310] = g;
+    const C2Rip m = ripC2(flagged, 2, c2Options(3, true));
+    CHECK_EQ(m.result.c2Rereads, 2u);
+    CHECK_EQ(m.result.c2Matched, 1u);
+    CHECK(m.bytes == expectedTrackData(300, 150));
+
+    // One re-read is never enough in verify mode.
+    FakeDrive once = makeC2Disc();
+    FakeDrive::C2Fault h = c2Fault(1000, 16, 2);
+    h.varying = false;
+    once.c2Faults[310] = h;
+    const C2Rip o = ripC2(once, 2, c2Options(1, true));
+    CHECK_EQ(o.result.c2Rereads, 1u);
+    CHECK_EQ(o.result.c2Unresolved, 1u);
+    CHECK(o.result.suspiciousSectors == std::vector<uint32_t>{10});
+}
+
+// C2 positions follow the read offset into the output track, also across a
+// sector boundary and into the neighbouring track.
+TEST(c2_positions_follow_read_offset) {
+    {
+        FakeDrive fake = makeC2Disc();
+        fake.c2Faults[310] = c2Fault(0, 16);  // +30 samples = 120 bytes: end of output sector 9
+        CHECK(ripC2(fake, 2, c2Options(1, false, 30)).result.suspiciousSectors == std::vector<uint32_t>{9});
+    }
+    {
+        FakeDrive fake = makeC2Disc();
+        fake.c2Faults[310] = c2Fault(100, 30);  // bytes 100..129 straddle output sectors 9 and 10
+        CHECK(ripC2(fake, 2, c2Options(1, false, 30)).result.suspiciousSectors == (std::vector<uint32_t>{9, 10}));
+    }
+    {
+        FakeDrive fake = makeC2Disc();
+        fake.c2Faults[310] = c2Fault(2200, 100);  // -30 samples: output sectors 10 and 11
+        const C2Rip r = ripC2(fake, 2, c2Options(1, false, -30));
+        CHECK(r.result.suspiciousSectors == (std::vector<uint32_t>{10, 11}));
+    }
+    {
+        // The first sector of track 2 is read for the end of track 1 at +30.
+        FakeDrive fake = makeC2Disc();
+        fake.c2Faults[300] = c2Fault(0, 16);
+        const C2Rip r1 = ripC2(fake, 1, c2Options(1, false, 30));
+        CHECK(r1.result.suspiciousSectors == std::vector<uint32_t>{299});
+        CHECK_EQ(r1.result.c2ErrorSectors, 1u);
+        // Bytes beyond the output only cost a re-read.
+        FakeDrive later = makeC2Disc();
+        later.c2Faults[300] = c2Fault(1000, 16);
+        const C2Rip r2 = ripC2(later, 1, c2Options(1, false, 30));
+        CHECK_EQ(r2.result.c2Unresolved, 1u);
+        CHECK(r2.result.suspiciousSectors.empty());
+        CHECK(r2.result.clean());
+    }
+}
+
+TEST(c2_with_read_errors_and_sector_fallback) {
+    FakeDrive fake = makeC2Disc();
+    fake.failuresBySector[320] = -1;            // unreadable: the block is read sector by sector
+    fake.c2Faults[321] = c2Fault(1000, 16, 2);  // flagged on its first two sector reads
+    const C2Rip r = ripC2(fake, 2, c2Options(2));
+    std::vector<uint8_t> expected = expectedTrackData(300, 150);
+    std::memset(expected.data() + size_t(20) * cdr::kSectorBytes, 0, cdr::kSectorBytes);
+    CHECK(r.bytes == expected);
+    CHECK_EQ(r.result.unreadableSectors, 1u);
+    CHECK_EQ(r.result.c2ErrorSectors, 1u);
+    CHECK_EQ(r.result.c2Recovered, 1u);
+    CHECK(r.result.status() == "1 unreadable sector(s)");
+
+    // A transient read error and a C2 error in the same block.
+    FakeDrive both = makeC2Disc();
+    both.failuresBySector[305] = 1;
+    both.c2Faults[306] = c2Fault(1000, 16, 1);
+    const C2Rip b = ripC2(both, 2, c2Options(2));
+    CHECK(b.bytes == expectedTrackData(300, 150));
+    CHECK_EQ(b.result.retries, 1u);
+    CHECK_EQ(b.result.c2ErrorSectors, 1u);
+    CHECK(b.result.clean());
+}
+
+TEST(c2_rejected_reads_fall_back_to_plain_reads) {
+    for (int variant = 0; variant < 2; ++variant) {
+        FakeDrive fake = makeC2Disc();
+        if (variant == 0) fake.c2ReadsSupported = false;  // ILLEGAL REQUEST
+        else fake.c2IgnoresErrorField = true;               // audio only
+        fake.c2Faults[310] = c2Fault();
+        cdr::CdDrive drive(fake);
+        const cdr::Toc toc = drive.readToc();
+        cdr::Ripper ripper(drive, toc, c2Options());
+        std::vector<uint8_t> bytes;
+        const cdr::TrackRipResult r1 = ripper.ripTrack(*toc.findTrack(1), [&](const uint8_t* p, size_t n) {
+            bytes.insert(bytes.end(), p, p + n);
+        });
+        CHECK(bytes == expectedTrackData(0, 300));
+        CHECK(r1.c2);
+        CHECK(!ripper.c2Active());
+        CHECK(r1.c2Fallback.find("READ CD with C2 error pointers failed at LBA 0") == 0);
+        CHECK_EQ(r1.retries, 0u);
+        CHECK_EQ(fake.c2ReadCommands, 1);  // given up after the first one
+        const std::vector<std::string> log = cdr::c2LogLines(r1);
+        CHECK(log.size() == 2 && log[1].rfind("  C2 reads given up: READ CD with C2", 0) == 0);
+
+        // The rest of the disc: plain reads, no C2 statistics.
+        const cdr::TrackRipResult r2 = ripper.ripTrack(*toc.findTrack(2), [](const uint8_t*, size_t) {});
+        CHECK(!r2.c2);
+        CHECK(r2.c2Fallback.empty());
+        CHECK_EQ(fake.c2ReadCommands, 1);
+        CHECK(r2.clean());
+    }
+
+    // A failing sector is not mistaken for a drive without C2 support.
+    FakeDrive fake = makeC2Disc();
+    fake.failuresBySector[5] = 1;
+    const C2Rip r = ripC2(fake, 1, c2Options());
+    CHECK(r.c2Active);
+    CHECK_EQ(r.result.retries, 1u);
+}
+
+TEST(c2_is_not_used_for_gap_detection) {
+    FakeDrive fake = makeC2Disc();
+    fake.pregaps[2] = 30;
+    fake.c2Faults[290] = c2Fault();
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc);
+    CHECK_EQ(fake.c2ReadCommands, 0);
+    CHECK_EQ(gaps.tracks.size(), size_t(3));
+}
+
+TEST(suspicious_position_formatting) {
+    CHECK(cdr::formatTrackTime(0) == "0:00:00");
+    CHECK(cdr::formatTrackTime(75 * 83 + 74) == "0:01:23");
+    CHECK(cdr::formatTrackTime(75 * 3600) == "1:00:00");
+    CHECK(cdr::suspiciousPositionLines({}).empty());
+    const std::vector<std::string> lines = cdr::suspiciousPositionLines({5, 6225, 6226, 6227, 6380});
+    CHECK_EQ(lines.size(), size_t(3));
+    CHECK(lines[0] == "Suspicious position 0:00:00 (sector 5)");
+    CHECK(lines[1] == "Suspicious position 0:01:23 - 0:01:23 (sectors 6225-6227)");
+    CHECK(lines[2] == "Suspicious position 0:01:25 (sector 6380)");
+    const std::vector<std::string> capped = cdr::suspiciousPositionLines({1, 3, 5, 7}, 2);
+    CHECK_EQ(capped.size(), size_t(3));
+    CHECK(capped[2] == "... and 2 more suspicious position(s)");
+
+    cdr::TrackRipResult r;
+    CHECK(r.status() == "OK");
+    r.unreadableSectors = 2;
+    r.suspiciousSectors = {1, 2, 3};
+    CHECK(r.status() == "2 unreadable sector(s), 3 suspicious sector(s)");
+}
+
 int main() {
     for (auto& [name, fn] : registry()) {
         const int before = failures;

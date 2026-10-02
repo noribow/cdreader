@@ -8,6 +8,9 @@
     <string name="cancel">キャンセル</string>
     <string name="read_offset">読み取りオフセット (サンプル)</string>
     <string name="verify">2 回読みして比較 (低速)</string>
+    <string name="advanced_collapsed">▶ 詳細設定</string>
+    <string name="advanced_expanded">▼ 詳細設定</string>
+    <string name="use_c2">C2 エラーポインタを使う (対応ドライブのみ)</string>
     <string name="format">形式</string>
     <string name="format_flac">FLAC</string>
     <string name="format_oggflac">Ogg FLAC</string>

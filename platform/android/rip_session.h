@@ -50,6 +50,9 @@ struct RipSettings {
     // Detect pregaps / index points / the HTOA from the Q sub-channel (once
     // per disc, #25). The app writes no CUE sheet yet: they go to rip.log.
     bool detectGaps = true;
+    // Read with C2 error pointers when the drive supports them (#33);
+    // beginRip() checks the drive and sets options.useC2 accordingly.
+    bool useC2 = true;
 };
 
 struct RippedTrack {
@@ -126,7 +129,13 @@ public:
     // if not done yet for this disc (settings.readDiscCodes / detectGaps).
     // Throws std::invalid_argument.
     void beginRip(const RipSettings& settings);
+    // As used: options.useC2 is what the drive allows (and false after a
+    // fallback to plain reads during the rip).
     const RipSettings& ripSettings() const { return settings_; }
+    // C2 support found by beginRip() (Disabled before it or when !useC2).
+    const C2Availability& c2Availability() const { return c2_; }
+    // Why C2 reads were given up during this rip (empty: they were not).
+    const std::string& c2Fallback() const { return c2Fallback_; }
 
     // Rips one audio track to `path` (a seekable local file: WAV, FLAC and Ogg
     // FLAC headers are patched when the file is closed), computing its AccurateRip
@@ -145,7 +154,7 @@ public:
     const AccurateRipReport& checkAccurateRip(HttpClient* http);
     const AccurateRipReport& accurateRipReport() const { return accurateRip_; }
 
-    // Tracks with unreadable sectors.
+    // Tracks with unreadable sectors or suspicious positions (C2).
     int problemTracks() const;
 
     // rip.log for the current rip (drive, settings, TOC, CDDB, tracks,
@@ -163,6 +172,8 @@ private:
     DiscCodes discCodes_;
     DiscGaps gaps_;
     RipSettings settings_;
+    C2Availability c2_;
+    std::string c2Fallback_;
     std::vector<RippedTrack> ripped_;
     AccurateRipReport accurateRip_;
     bool accurateRipChecked_ = false;

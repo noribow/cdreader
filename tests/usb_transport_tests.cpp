@@ -356,6 +356,32 @@ TEST(rip_over_bulk_only_transport_matches_direct_rip) {
     CHECK_EQ(rig.device.resets, 0);
 }
 
+// C2 reads (#33) move 24 * 2646 bytes per command through the BOT; MODE
+// SENSE page 2Ah reports the support.
+TEST(c2_reads_over_bulk_only_transport) {
+    Rig rig;
+    rig.drive.c2Supported = true;
+    FakeDrive::C2Fault fault;
+    fault.firstByte = 16;
+    fault.byteCount = 8;
+    rig.drive.c2Faults[5] = fault;
+    cdr::CdDrive drive(rig.bot);
+    CHECK(drive.readCapabilities().c2Pointers);
+    std::vector<uint8_t> buffer(size_t(cdr::kMaxSectorsPerC2Read) * cdr::kSectorWithC2Bytes);
+    const cdr::ScsiResult r = drive.readAudioWithC2(0, cdr::kMaxSectorsPerC2Read, buffer.data());
+    CHECK(r.ok());
+    CHECK_EQ(r.transferred, buffer.size());
+    CHECK_EQ(rig.device.lastTransferLength, uint32_t(63504));
+    CHECK_EQ(buffer[5 * cdr::kSectorWithC2Bytes + cdr::kSectorBytes + 2], 0xFF);  // bytes 16..23
+    CHECK_EQ(buffer[4 * cdr::kSectorWithC2Bytes + cdr::kSectorBytes + 2], 0x00);
+
+    // A drive that ignores the error field: a short transfer, then plain reads work.
+    rig.drive.c2IgnoresErrorField = true;
+    const cdr::ScsiResult s = drive.readAudioWithC2(0, 2, buffer.data());
+    CHECK(s.shortRead);
+    CHECK(rig.recovered());
+}
+
 int main() {
     for (auto& [name, fn] : registry()) {
         const int before = failures;

@@ -20,6 +20,7 @@ struct ScsiResult {
     uint8_t status = 0;        // SCSI status byte: 0x00 GOOD, 0x02 CHECK CONDITION
     SenseInfo sense;
     size_t transferred = 0;    // bytes actually moved by a data-in/out command
+    bool shortRead = false;    // set by CdDrive: GOOD status but fewer bytes than requested (then !ok())
     std::string error;         // transport-level error description
 
     bool ok() const { return transportOk && status == 0; }

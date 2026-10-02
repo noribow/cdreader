@@ -104,7 +104,10 @@ void FakeUsbDevice::receiveCbw(const uint8_t* cbw) {
         finish(r, 0);
         return;
     }
-    const size_t send = length - std::min<size_t>(injectShortBy, length);
+    // The target may move less than asked (e.g. a drive ignoring the READ CD
+    // error field); the rest is residue, as a real bridge reports it.
+    const size_t produced = std::min<size_t>(r.transferred, length);
+    const size_t send = produced - std::min<size_t>(injectShortBy, produced);
     injectShortBy = 0;
     buffer_.resize(send);
     status_ = 0;
