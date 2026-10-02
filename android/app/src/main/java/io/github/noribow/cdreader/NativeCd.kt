@@ -7,6 +7,11 @@ fun interface RipProgressListener {
     fun onProgress(doneSectors: Int, totalSectors: Int)
 }
 
+/** Progress of the read offset detection (#37): track [step] of at most [steps], in sectors. */
+fun interface OffsetProgressListener {
+    fun onProgress(step: Int, steps: Int, track: Int, doneSectors: Int, totalSectors: Int)
+}
+
 /** JNI entry points of libcdreader_jni (platform/android/jni_bridge.cpp). */
 object NativeCd {
     init {
@@ -18,6 +23,7 @@ object NativeCd {
     @JvmStatic external fun nativeClose(handle: Long)
     @JvmStatic external fun nativeCancel(handle: Long)
     @JvmStatic external fun nativeInquiry(handle: Long): String
+    @JvmStatic external fun nativeDriveInfo(handle: Long): Array<String>
     @JvmStatic external fun nativeIsReady(handle: Long): Boolean
     @JvmStatic external fun nativeReadToc(handle: Long): IntArray
     @JvmStatic external fun nativeLookupCddb(
@@ -37,14 +43,55 @@ object NativeCd {
         verify: Boolean,
         useC2: Boolean,
         cacheMode: Int,
+        offsetSource: Int,
+        offsetDetail: String,
     )
     @JvmStatic external fun nativeRipTrack(handle: Long, track: Int, path: String, listener: RipProgressListener?): IntArray
+    @JvmStatic external fun nativeDetectOffset(handle: Long, http: HttpGet?, listener: OffsetProgressListener?): Array<String>
     @JvmStatic external fun nativeCheckAccurateRip(handle: Long, enabled: Boolean, http: HttpGet?): IntArray
     @JvmStatic external fun nativeAccurateRipError(handle: Long): String
     @JvmStatic external fun nativeC2Status(handle: Long): Int
     @JvmStatic external fun nativeCacheStatus(handle: Long): IntArray
     @JvmStatic external fun nativeRipLog(handle: Long): String
 }
+
+/** INQUIRY strings; [offsetKey] identifies the drive model for the saved read offsets (#37). */
+data class DriveInfo(
+    val vendor: String,
+    val product: String,
+    val revision: String,
+    val displayName: String,
+    val offsetKey: String,
+)
+
+/** Where the read offset of a rip came from (rip.log); [code] is what nativeBeginRip expects. */
+enum class OffsetSource(val code: Int) { MANUAL(0), SAVED(1), DETECTED(2) }
+
+/** Result of [CdSession.detectOffset], in the order of the native status codes. */
+enum class OffsetDetectStatus {
+    DETECTED, NOT_IN_DATABASE, LOOKUP_FAILED, NO_USABLE_TRACKS, NO_MATCH, NOT_ENOUGH, CONFLICT, CANCELLED
+}
+
+data class OffsetDetection(
+    val status: OffsetDetectStatus,
+    /** DETECTED: the offset; otherwise the best candidate (if any track matched). */
+    val offset: Int,
+    val agreeingTracks: Int,
+    val testedTracks: Int,
+    val confidence: Int,
+    /** "v1", "v2" or "v1+v2". */
+    val version: String,
+    /** Confirmed by the disc's only track in the database. */
+    val singleTrack: Boolean,
+    val usableTracks: Int,
+    /** CONFLICT: the competing offsets. */
+    val candidates: List<Int>,
+    /** English one-line summary (as in rip.log). */
+    val summary: String,
+    /** "2 of 2 tracks agreed, v2" (rip.log, the saved note). */
+    val agreement: String,
+    val error: String,
+)
 
 data class TrackInfo(
     val number: Int,
@@ -187,6 +234,11 @@ class CdSession private constructor(private val handle: Long) : Closeable {
 
     fun inquiry(): String = NativeCd.nativeInquiry(handle)
 
+    fun driveInfo(): DriveInfo {
+        val v = NativeCd.nativeDriveInfo(handle)
+        return DriveInfo(v[0], v[1], v[2], v[3], v[4])
+    }
+
     fun isReady(): Boolean = NativeCd.nativeIsReady(handle)
 
     /** Also forgets the metadata and rip results of the previous disc. */
@@ -223,9 +275,35 @@ class CdSession private constructor(private val handle: Long) : Closeable {
      * Starts a rip ([format]: a name from [NativeCd.nativeFormats]); forgets the results of the previous one.
      * [useC2]: read with C2 error pointers when the drive supports them.
      * [cacheMode]: drive cache defeat; [CacheMode.AUTO] tests the drive once per disc (a few seconds).
+     * [offsetSource] / [offsetDetail]: where [readOffset] came from, for rip.log (#37).
      */
-    fun beginRip(format: String, readOffset: Int, maxRetries: Int, verify: Boolean, useC2: Boolean, cacheMode: CacheMode) =
-        NativeCd.nativeBeginRip(handle, format, readOffset, maxRetries, verify, useC2, cacheMode.code)
+    fun beginRip(
+        format: String,
+        readOffset: Int,
+        maxRetries: Int,
+        verify: Boolean,
+        useC2: Boolean,
+        cacheMode: CacheMode,
+        offsetSource: OffsetSource,
+        offsetDetail: String,
+    ) = NativeCd.nativeBeginRip(
+        handle, format, readOffset, maxRetries, verify, useC2, cacheMode.code, offsetSource.code, offsetDetail
+    )
+
+    /**
+     * Detects the read offset with AccurateRip (#37): reads up to 3 tracks of
+     * the disc; the offset is confirmed when 2 of them agree. Network and read
+     * problems end up in the status; [cancel] makes it return CANCELLED.
+     */
+    fun detectOffset(http: HttpGet, listener: OffsetProgressListener?): OffsetDetection {
+        val v = NativeCd.nativeDetectOffset(handle, http, listener)
+        return OffsetDetection(
+            OffsetDetectStatus.entries.getOrElse(v[0].toInt()) { OffsetDetectStatus.NO_MATCH },
+            v[1].toInt(), v[2].toInt(), v[3].toInt(), v[4].toInt(), v[5], v[6] == "1", v[7].toInt(),
+            if (v[8].isEmpty()) emptyList() else v[8].split(",").map { it.toInt() },
+            v[9], v[10], v[11],
+        )
+    }
 
     /** The drive cache check of the current rip (known after [beginRip]). */
     fun cacheStatus(): CacheStatus {
@@ -274,7 +352,7 @@ class CdSession private constructor(private val handle: Long) : Closeable {
     /** rip.log text of the current rip (same layout as the Windows CLI). */
     fun ripLog(): String = NativeCd.nativeRipLog(handle)
 
-    /** Thread-safe: makes a running [ripTrack] stop at the next block. */
+    /** Thread-safe: makes a running [ripTrack] or [detectOffset] stop at the next block. */
     fun cancel() = NativeCd.nativeCancel(handle)
 
     override fun close() {

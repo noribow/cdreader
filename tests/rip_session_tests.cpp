@@ -1026,6 +1026,100 @@ TEST(cache_fua_fallback_over_usb) {
     CHECK(rig.session.cacheFallback().empty());
 }
 
+// --- Read offset auto-detection over USB (#37) ------------------------------------
+
+TEST(offset_detection_over_usb_then_rip_matches) {
+    Rig rig;
+    FakeHttp http;
+    const cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(rig.session.toc());
+    // Everybody else ripped with +667 (v2: 5 submissions per track).
+    const int offset = 667;
+    const Reference t1 = referenceRip(1, offset), t2 = referenceRip(2, offset), t3 = referenceRip(3, offset);
+    http.accurateRip = reply(200, dbar(id, {{{5, t1.v2}, {7, t2.v2}, {5, t3.v2}}}));
+    CHECK_STR(rig.session.driveOffsetKey(), "FAKE|CD-ROM DRIVE|1.00");
+    CHECK_STR(rig.session.driveInfo().product, "CD-ROM DRIVE");
+
+    // A rip at offset 0 matches nothing (the case of #37).
+    rig.session.beginRip(settings("wav"));
+    TempDir dir;
+    rig.session.ripTrack(2, dir.path / "t.wav");
+    CHECK_EQ(rig.session.checkAccurateRip(&http).accurateTracks(), 0);
+
+    cdr::OffsetDetectOptions options;
+    options.minTrackSectors = 0;
+    int calls = 0;
+    options.progress = [&](const cdr::OffsetDetectProgress& p) {
+        ++calls;
+        CHECK(p.steps == 3 && p.step >= 1 && p.step <= 2);
+    };
+    const cdr::OffsetDetection& d = rig.session.detectReadOffset(&http, options);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, offset);
+    CHECK_EQ(d.testedTracks(), 2);
+    CHECK(d.tracks.size() == 2 && d.tracks[0].track == 2);  // inside the disc first
+    CHECK(calls > 0);
+    CHECK(rig.session.offsetDetection().has_value());
+
+    // Rip with the detected offset: AccurateRip now agrees.
+    cdr::RipSettings s = settings("wav", d.offset);
+    s.offsetSource.kind = cdr::ReadOffsetSource::Kind::Detected;
+    s.offsetSource.detail = d.agreement();
+    rig.session.beginRip(s);
+    for (int n = 1; n <= 3; ++n) rig.session.ripTrack(n, dir.path / "t.wav");
+    const cdr::AccurateRipReport& report = rig.session.checkAccurateRip(&http);
+    CHECK_EQ(report.accurateTracks(), 3);
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "\nRead offset correction: +667 samples (auto-detected: 2 of 2 tracks agreed, v2)\n"));
+    CHECK(contains(log, "\nRead offset detection (AccurateRip disc id " + id.toString()));
+    CHECK(contains(log, "\n  Track 02 (7 submissions): +667 v2 (confidence 7)\n"));
+    CHECK(contains(log, "\n  Result: Read offset +667 (2 of 2 tracks agreed, v2, confidence 12)\n"));
+    CHECK(contains(log, "AccurateRip: 3 of 3 track(s) accurately ripped (v2: 3)"));
+
+    // A saved value: no detection block in the log.
+    s.offsetSource.kind = cdr::ReadOffsetSource::Kind::Saved;
+    s.offsetSource.detail = rig.session.driveName() + "; auto-detected: 2 of 2 tracks agreed, v2";
+    rig.session.beginRip(s);
+    rig.session.ripTrack(2, dir.path / "t.wav");
+    const std::string saved = rig.session.ripLog();
+    CHECK(contains(saved, "Read offset correction: +667 samples (saved for drive FAKE CD-ROM DRIVE (1.00); "
+                          "auto-detected: 2 of 2 tracks agreed, v2)\n"));
+    CHECK(!contains(saved, "Read offset detection"));
+
+    // A new disc forgets the detection.
+    rig.session.readToc();
+    CHECK(!rig.session.offsetDetection().has_value());
+}
+
+TEST(offset_detection_over_usb_failures_and_cancel) {
+    Rig rig;
+    FakeHttp http;
+    cdr::OffsetDetectOptions options;
+    options.minTrackSectors = 0;
+    // Network failure (FakeHttp answers "no route"), disabled lookup, not in the database.
+    CHECK(rig.session.detectReadOffset(&http, options).status == cdr::OffsetDetection::Status::LookupFailed);
+    CHECK(rig.session.detectReadOffset(nullptr, options).status == cdr::OffsetDetection::Status::LookupFailed);
+    http.accurateRip = reply(404, "");
+    CHECK(rig.session.detectReadOffset(&http, options).status == cdr::OffsetDetection::Status::NotInDatabase);
+    CHECK_EQ(rig.fake.readCommands, 0);
+
+    // Cancel while reading; a cancel before the call is cleared by it.
+    const cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(rig.session.toc());
+    const Reference t2 = referenceRip(2, -30), t3 = referenceRip(3, -30);
+    http.accurateRip = reply(200, dbar(id, {{{5, 1}, {7, t2.v1}, {5, t3.v1}}}));
+    rig.session.cancel();
+    options.progress = [&](const cdr::OffsetDetectProgress&) { rig.session.cancel(); };
+    CHECK(rig.session.detectReadOffset(&http, options).status == cdr::OffsetDetection::Status::Cancelled);
+    options.progress = nullptr;
+    const cdr::OffsetDetection& d = rig.session.detectReadOffset(&http, options);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, -30);
+    CHECK_STR(d.matchedVersion(), "v1");
+    // Track 1's entry matches no offset: 2 of 3 tracks agree (the last
+    // track read up to its end, #37).
+    CHECK(d.tracks.size() == 3 && d.tracks[1].track == 1 && d.tracks[2].track == 3);
+    CHECK_STR(d.agreement(), "2 of 3 tracks agreed, v1");
+}
+
 int main() {
     for (auto& [name, fn] : registry()) {
         const int before = failures;

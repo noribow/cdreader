@@ -87,9 +87,32 @@ std::vector<std::string> AccurateRipReport::logLines() const {
 
 // --- RipSession --------------------------------------------------------------
 
+const DriveInfo& RipSession::driveInfo() {
+    if (!driveInfo_) driveInfo_ = drive_.inquiry();
+    return *driveInfo_;
+}
+
 const std::string& RipSession::driveName() {
-    if (!driveName_) driveName_ = drive_.inquiry().displayName();
+    if (!driveName_) driveName_ = driveInfo().displayName();
     return *driveName_;
+}
+
+const OffsetDetection& RipSession::detectReadOffset(HttpClient* http, OffsetDetectOptions options) {
+    const Toc& t = toc();
+    cancelled_ = false;
+    options.cancelled = [this] { return cancelled_.load(); };
+    detection_.reset();
+    if (http == nullptr) {
+        OffsetDetection d;
+        d.id = AccurateRipDiscId::fromToc(t);
+        d.maxOffset = options.maxOffset;
+        d.status = OffsetDetection::Status::LookupFailed;
+        d.error = "AccurateRip lookup disabled";
+        detection_ = std::move(d);
+        return *detection_;
+    }
+    detection_ = cdr::detectReadOffset(drive_, t, *http, options);
+    return *detection_;
 }
 
 const Toc& RipSession::readToc() {
@@ -105,6 +128,7 @@ const Toc& RipSession::readToc() {
     ripped_.clear();
     accurateRip_ = {};
     accurateRipChecked_ = false;
+    detection_.reset();
     return *toc_;
 }
 
@@ -310,9 +334,12 @@ std::string RipSession::ripLog() {
     for (const std::string& l : cacheCheck_.logLines()) log << l << "\n";
     log << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
-        << "Read offset correction: " << (options.readOffsetSamples > 0 ? "+" : "") << options.readOffsetSamples
-        << " samples\n"
-        << "Format: " << settings_.format << "\n";
+        << readOffsetLogLine(options.readOffsetSamples, settings_.offsetSource) << "\n";
+    // The detection behind an auto-detected offset (#37).
+    if (settings_.offsetSource.kind == ReadOffsetSource::Kind::Detected && detection_ && detection_->detected() &&
+        detection_->offset == options.readOffsetSamples)
+        for (const std::string& l : detection_->logLines()) log << l << "\n";
+    log << "Format: " << settings_.format << "\n";
     if (const std::unique_ptr<AudioWriter> writer = createAudioWriter(settings_.format, settings_.encoder)) {
         const std::string encoder = writer->encoderDescription();
         if (!encoder.empty()) log << "Encoder: " << encoder << "\n";

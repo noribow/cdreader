@@ -7,6 +7,8 @@
     <string name="rip">リッピング</string>
     <string name="cancel">キャンセル</string>
     <string name="read_offset">読み取りオフセット (サンプル)</string>
+    <string name="detect_offset">オフセットを自動検出</string>
+    <string name="detect_offset_cancel">検出を中止</string>
     <string name="verify">2 回読みして比較 (低速)</string>
     <string name="advanced_collapsed">▶ 詳細設定</string>
     <string name="advanced_expanded">▼ 詳細設定</string>

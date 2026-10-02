@@ -31,7 +31,8 @@
 - ドライブの読み取りオフセット補正 (`--offset`、EAC / AccurateRip と同じ値)
 - トラックごとの CRC32 と `rip.log` (TOC・結果) を出力
 - [AccurateRip](https://www.accuraterip.com/) データベースとの照合 (チェックサム v1 / v2、confidence を表示)
-- AccurateRip を使ったドライブの読み取りオフセットの自動検出 (`cdreader offset`)
+- AccurateRip を使ったドライブの読み取りオフセットの自動検出 (`cdreader offset`、`rip --offset auto`、Android は詳細設定)。
+  複数トラックが同じオフセットで一致したときだけ確定し、ドライブ (ベンダー・モデル・リビジョン) ごとに保存して次回から自動で適用
 - CD-Extra (エンハンスド CD) のデータトラック・セッション間ギャップを考慮
 - CDDB (既定は [gnudb.org](https://gnudb.org/)) からアルバム名・アーティスト・曲名などを取得し、
   フォルダ名・ファイル名・`rip.log` に使用
@@ -45,6 +46,7 @@ cdreader rip D:                     全オーディオトラックを "アーテ
 cdreader rip D: -t 1,3-5 -o out     トラック 1,3,4,5 を out\ に保存
 cdreader rip D: --verify -r 10      2 回読み比較、リトライ 10 回
 cdreader rip D: --offset 6          読み取りオフセット +6 サンプルで補正
+cdreader rip D: --offset auto       このドライブの保存済みオフセットを使う (なければ自動検出して保存)
 cdreader rip D: --no-c2             C2 エラーポインタを使わずに読み取る
 cdreader rip D: --verify --cache flush  2 回読み比較、キャッシュは追い出しで回避
 cdreader rip D: --single-file       全トラックを 1 つの WAV と CUE シートに保存
@@ -64,6 +66,8 @@ cdreader rip D: --no-isrc           MCN / ISRC を読み取らない (読み取�
 cdreader rip D: --no-gaps           プリギャップ (INDEX 00) を検出しない (時間短縮)
 cdreader rip D: -f flac --htoa      1 曲目の前の隠しトラック (HTOA) も 00 - Hidden Track.flac として保存
 cdreader offset D:                  読み取りオフセットを AccurateRip で検出
+cdreader offset D: --save           検出したオフセットをこのドライブの値として保存
+cdreader offsets                    保存済みのオフセット (ドライブごと) の一覧
 ```
 
 | オプション | 説明 |
@@ -78,6 +82,7 @@ cdreader offset D:                  読み取りオフセットを AccurateRip �
 | `--no-c2` | C2 エラーポインタを使わない (既定では対応ドライブなら使います。「C2 エラーポインタ」の節を参照) |
 | `--cache <mode>` | 再読込の前のドライブキャッシュ対策: `auto` (既定。ディスクごとにドライブを試験して選ぶ)・`fua`・`flush` (追い出し)・`none` (しない)。「ドライブキャッシュ対策」の節を参照 |
 | `--offset <n>` | 読み取りオフセット補正 (サンプル単位、負の値も可。既定: 0) |
+| `--offset auto` | このドライブの保存済みオフセットを使う。保存されていなければ AccurateRip で自動検出して保存してから読み取る (検出できなければリッピングせずに終了)。「読み取りオフセットの自動検出」の節を参照 |
 | `--single-file` | 選択したトラックを 1 つのファイルにつなげて保存 (ディスクイメージ + CUE シート。FLAC / Ogg FLAC ではファイル内にも CUE シートを埋め込み、MKA ではトラックごとのチャプターを記録) |
 | `--no-cue-file` | 外部の `.cue` ファイルを書かない |
 | `--no-accuraterip` | リッピング後に AccurateRip データベースを照会しない (チェックサムは `rip.log` に記録されます) |
@@ -124,6 +129,8 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - 値は [AccurateRip のドライブオフセット一覧](https://www.accuraterip.com/driveoffsets.htm) で
   `cdreader drives` に表示される機種名を探し、"Correction Offset" の値を `--offset` に指定します
   (EAC の「読み取りオフセット補正値」と同じ符号です。例: `+6`, `+667`, `-472`)。
+- 値が分からない場合は自動検出できます (`cdreader offset D: --save`、`rip --offset auto`。次の節を参照)。
+  `rip.log` には補正値とその出所 (`manual` / `saved for drive …` / `auto-detected: 2 of 2 tracks agreed, v2`) が記録されます。
 - 1 サンプル = 4 バイト (16 bit ステレオ)。`+N` の場合、各トラックはドライブが返すデータの N サンプル後ろから切り出されます。
 - 補正によってディスクの先頭より前・リードアウトより後 (CD-Extra ではデータセッションとの間) にはみ出した部分は、
   多くのドライブで読めないため無音で埋めます。その数は `rip.log` に記録されます。
@@ -413,25 +420,51 @@ AccurateRip v2 は v1 の計算上の弱点 (サンプル値と位置の積の�
 
 ### 読み取りオフセットの自動検出
 
-`cdreader offset D:` は、AccurateRip に登録されているディスク (よく売れた CD ほど登録が多い) を入れて実行すると、
-1 トラックを前後に広めに読み取り、-3000〜+3000 サンプルの各オフセットで v1 / v2 チェックサムを計算してデータベースと照合し、一致したオフセットを表示します。
+AccurateRip に登録されているディスク (よく売れた CD ほど登録が多い) を入れて `cdreader offset D:` を実行すると、
+数トラックを前後に広めに読み取り、-3000〜+3000 サンプルの各オフセットで v1 / v2 チェックサムを計算してデータベースと照合します
+([#37](https://github.com/noribow/cdreader/issues/37)。Android 版も同じ処理を使います)。
 
 ```
-Checking track 3 (confidence 25) at offsets -3000..+3000
-Matching offsets (submissions whose checksum matches at that offset):
-  offset    +6  v1+v2  v2  18  v1   7  (2 of 3 pressing(s))
-  offset  +667  v2     v2   2  v1   0  (1 of 3 pressing(s))
+Drive: HL-DT-ST BD-RE BP71N (1.03)
+Detecting the read offset with AccurateRip (offsets -3000..+3000)...
+Reading track 07 (2 of at most 3)  100%
 
-Read offset: +6  (matched v1+v2, confidence 25; use: cdreader rip D: --offset 6)
+Read offset detection (AccurateRip disc id 039-..., 5 pressing(s), offsets -3000..+3000)
+  Track 12 (41 submissions): +6 v1+v2 (confidence 38)
+  Track 07 (40 submissions): +6 v2 (confidence 37)
+  Result: Read offset +6 (2 of 2 tracks agreed, v1+v2, confidence 75)
+
+Read offset: +6  (use: cdreader rip D: --offset 6; --save stores it for --offset auto)
 ```
 
-- `-t <n>` で照合に使うトラックを、`--range <n>` で探索範囲を指定できます (既定はデータベースの登録が多い中間のトラック、±3000 サンプル)。
-- 複数のオフセットが一致した場合は別プレスの登録が混在しています。confidence の高いものを採用し、別のディスクでも確認してください。
-- v1 / v2 の両方で照合し、オフセットごとに v1 / v2 それぞれの一致数と一致したプレスの数を表示します。
+- **トラックの選び方**: データベースに登録のあるオーディオトラックのうち、ディスクの最初・最後のトラック
+  (大きなオフセットでディスクの外にはみ出す) を避け、長さ 10 秒〜8 分のものを登録件数 (confidence) の多い順に最大 3 トラック読みます。
+  条件に合うトラックが足りなければ最初・最後のトラックや短い / 長いトラックも使います。`-t 3` / `-t 2,5` で指定もできます。
+- **確定の条件**: 2 トラックが同じオフセットで一致した時点で確定します (多くの場合 2 トラックの読み取りで終わります)。
+  - トラックごとに一致するオフセットが違う場合 (候補が割れた) は確定しません。
+  - 一致したのが 1 トラックだけの場合、どのオフセットでも一致しない場合も確定しません。
+  - 読んだトラックがすべて同じ 2 つのオフセットで一致する場合 (互いにずれたプレスの登録が混在) も確定しません。
+  - データベースに登録のあるトラックが 1 つしかないディスク (シングルなど) では、その 1 トラックの一致件数が 10 件以上のときだけ確定し、その旨を表示します。
+  - ディスクが AccurateRip に登録されていない場合は「検出できない」と表示します。別の (よく売れた) CD で試してください。
+- `--save` を付けると、確定したオフセットを**ドライブ (ベンダー・モデル・リビジョン) ごと**に保存します。
+  `cdreader rip D: --offset auto` は保存済みの値を使い、なければその場で検出・保存してからリッピングします
+  (確定できなければリッピングせずに終了します。`--offset <n>` は従来どおり手動指定です)。
+- 保存先は `%APPDATA%\cdreader\drive_offsets.txt` です (環境変数 `APPDATA` がない場合は `cdreader.exe` と同じフォルダ)。
+  1 行 1 ドライブのテキスト (`オフセット<TAB>ベンダー|モデル|リビジョン<TAB>メモ`、UTF-8) で、手で編集・削除してもかまいません。
+  `cdreader drives` は保存済みの値も表示し、`cdreader offsets` で一覧できます。
+- `--range <n>` で探索範囲 (既定 ±3000 サンプル)、`-r <n>` でリトライ回数を指定できます。
+- v1 / v2 の両方で照合し、トラックごとに一致したオフセットと一致件数を表示します。
 - v1 は全オフセット分を 1 回のスライド計算で求めます。v2 はサンプル値と位置の積の上位 32 ビットを含むためスライド計算できませんが、
   2^32 ≡ 1 (mod 2^32 − 1) を使った剰余のスライド計算で一致の可能性がないオフセットを除外し、残った少数のオフセットだけ厳密に計算します
   (5 分のトラック・±3000 サンプル・3 プレスで約 1 秒)。
-- 検出中は読み取ったトラックをメモリに保持します (1 サンプル 4 バイト、5 分のトラックで約 50 MB)。
+- 検出中は読み取り中のトラックをメモリに保持します (1 サンプル 4 バイト、5 分のトラックで約 50 MB。8 分を超えるトラックはなるべく避けます)。
+- `rip.log` には補正値の出所が記録されます。その場で検出した場合は、読み取ったトラックごとの結果も記録されます:
+
+```
+Read offset correction: +6 samples (auto-detected: 2 of 2 tracks agreed, v1+v2)
+Read offset correction: +6 samples (saved for drive HL-DT-ST BD-RE BP71N (1.03); auto-detected: 2 of 2 tracks agreed, v1+v2)
+Read offset correction: 0 samples (manual)
+```
 
 ### タグ
 
@@ -586,7 +619,13 @@ SCSI/MMC コマンドを送ります)。
 4. 形式 (FLAC (既定) / Ogg FLAC / ALAC (M4A) / WAV / Opus / Vorbis / MKA (FLAC)。Opus は VBR 160 kbit/s、Vorbis は品質 5 の固定設定)、
    「AccurateRip で照合」(既定でオン) を設定し、保存するトラックにチェックを付けて「リッピング」を押します。
    必要に応じて「▶ 詳細設定」をタップして開き、次を設定します (開閉状態と設定は次回以降も使われます):
-   - 読み取りオフセット (Windows 版の `--offset` と同じ値)
+   - 読み取りオフセット (Windows 版の `--offset` と同じ値)。「オフセットを自動検出」を押すと、入っているディスクで
+     AccurateRip を使って検出し (Windows 版の `cdreader offset` と同じ処理。進行状況を表示し、「検出を中止」で中断できます)、
+     確定した値を欄に入れてドライブ (ベンダー・モデル・リビジョン) ごとに保存します。
+     保存済みのドライブを接続すると自動でその値を使い、欄の横に「(ドライブ <モデル名> の保存値)」と表示します
+     (欄を書き換えると手動の値になります)。
+     オフセットが保存されていないドライブでオフセット 0 のままリッピングを始めると、先に自動検出するかを確認します
+     (「検出する」/「このまま続ける」。接続ごとに 1 回)
    - 「2 回読みして比較 (低速)」(Windows 版の `--verify`)
    - 「C2 エラーポインタを使う (対応ドライブのみ)」(既定でオン。オフにすると Windows 版の `--no-c2` と同じ。「C2 エラーポインタ」の節を参照)
    - 「キャッシュ対策」: 自動 (既定) / FUA / 追い出し / なし (Windows 版の `--cache auto|fua|flush|none`。「ドライブキャッシュ対策」の節を参照)。
@@ -595,14 +634,15 @@ SCSI/MMC コマンドを送ります)。
    キャッシュ対策の結果 (判定結果と使った方法、再読込前に行った対策の回数) と
    AccurateRip の結果がトラックごとに表示されます
    (例: `Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2` — 一致したチェックサムの版、v2 / v1 それぞれの一致件数、
-   登録件数の合計、一致したプレス数 / そのトラックの登録があるプレス数)。1 トラックも一致しない場合は読み取りオフセットを確認してください。
+   登録件数の合計、一致したプレス数 / そのトラックの登録があるプレス数)。ディスクが AccurateRip に登録されているのに
+   1 トラックも一致しなかった場合は、読み取りオフセットが合っていない可能性が高いため、オフセットの自動検出を勧めるダイアログを表示します。
 
 保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`。Ogg FLAC は `.oga`、ALAC は `.m4a`、Opus は `.opus`、Vorbis は `.ogg`、MKA は `.mka`) と `rip.log` が作られます。
 ファイルにはタグ (曲名・アーティスト・アルバム・年・ジャンル・トラック番号・CDDB ID、ディスクに記録されていれば ISRC と MCN) が書き込まれます。
 MCN / ISRC はリッピング開始時にディスクごとに 1 回読み取り、`rip.log` にも記録します。
 プリギャップ・HTOA もリッピング開始時にディスクごとに 1 回検出し、`rip.log` に記録します (Android 版はまだ CUE シート・シングルファイルを書かないため記録のみ。HTOA は保存しません)。
 `rip.log` には Windows 版と同じく、ドライブ・C2 対応状況・設定・TOC・CDDB の結果・トラックごとの CRC32 / リトライ回数 / 読めなかったセクタ数・
-C2 エラーの集計と疑わしい位置・キャッシュ対策 (判定結果・試験の時間・トラックごとの回数)・AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
+C2 エラーの集計と疑わしい位置・読み取りオフセットとその出所 (手動・ドライブの保存値・自動検出と一致したトラック数)・キャッシュ対策 (判定結果・試験の時間・トラックごとの回数)・AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
 読み取り中は「キャンセル」で中断できます。リトライ回数は 5 回固定です。
 CDDB や AccurateRip に接続できなかった場合も、リッピングはそのまま行われます (ファイル名は `TrackNN`、結果は `rip.log` に記録)。
 AccurateRip のデータベースは HTTP でしか提供されていないため、`www.accuraterip.com` に限って平文通信を許可しています
@@ -719,7 +759,9 @@ Matroska (`cdreader_mka_tests`) は、EBML の可変長整数・各要素の符�
 (CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング、
 C2 付き読み取りの転送サイズ 24 × 2646 バイト) を検証します。
 `cdreader_rip_session_tests` は Android 版のリッピング処理 (`platform/android/rip_session.*`) を仮想 USB デバイスと偽の `HttpClient` で検証します
-(FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`、C2 の有効・無効・非対応・切り替えと `rip.log` の C2 の行、キャッシュ対策の設定・ディスクごとに 1 回の判定・`none` でコマンドを送らないこと・FUA から追い出しへの切り替えと `rip.log` の行)。
+(FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`、C2 の有効・無効・非対応・切り替えと `rip.log` の C2 の行、キャッシュ対策の設定・ディスクごとに 1 回の判定・`none` でコマンドを送らないこと・FUA から追い出しへの切り替えと `rip.log` の行、USB 経由のオフセット自動検出 (オフセット 0 で不一致 → 検出 → 検出値でのリッピングで全トラック一致)・照会失敗・未登録・キャンセルと `rip.log` のオフセットの出所の行)。
+
+読み取りオフセットの自動検出 (#37) は、仮想ドライブと偽の AccurateRip データ (各トラックを指定のオフセットで読んだチェックサム) で、正のオフセット (+6, +667)・負のオフセット (-1164, -472)・v1 / v2、トラックの選び方 (中間・登録件数・長さ・`-t`)、候補が割れる場合、互いにずれたプレス、1 トラックだけ一致、一致なし、登録トラックが 1 つのディスク (件数による確定 / 保留)、未登録 (HTTP 404)・ネットワーク障害 (読み取りをしないこと)、キャンセルと進行状況、ディスクの最初・最後のトラックを ±3000 サンプルで端まで読むこと、保存形式の往復 (壊れた行の無視) と `rip.log` の行を検証します。
 
 ### Android アプリ
 
@@ -755,7 +797,8 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   toc       TOC 解析、CDDB ID
   cddb      CDDB の問い合わせ・応答解析 (HttpClient 経由)
   file_naming  メタデータからのファイル名・フォルダ名・アルバム単位のファイル名 (使えない文字の置換)
-  accuraterip  AccurateRip ディスク ID・チェックサム v1/v2・データベース応答の解析と照合・オフセット検出
+  accuraterip  AccurateRip ディスク ID・チェックサム v1/v2・データベース応答の解析と照合・オフセットごとのチェックサム (スライド計算)
+  offset_detect  読み取りオフセットの自動検出 (トラックの選択・一致の判定)、rip.log の出所の行、ドライブごとの保存形式
   ripper    リトライ・セクタ分割・verify・C2 エラーの再読込を含むトラック読み取り、C2 / キャッシュ対策の rip.log 行
   drive_cache  ドライブキャッシュ対策 (FUA・追い出し・自動判定)
   clock     時計のインターフェース (キャッシュ判定の時間測定。テストでは擬似時間)
@@ -796,7 +839,7 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
 - [ ] Android 版の FLAC・CDDB・AccurateRip 対応 — [#18](https://github.com/noribow/cdreader/issues/18)
   (実装済み・実機での動作確認待ち)
 - [ ] Android 版の改善: 保存先へ直接書き込む (現在は一時ファイル経由でコピー)、リトライ回数の設定、UAS 専用ドライブ対応、
-  CUE シート・シングルファイル出力、読み取りオフセットの自動検出、CDDB サーバーの設定
+  CUE シート・シングルファイル出力、CDDB サーバーの設定
 - [x] AccurateRip 対応 (照合、オフセット値の自動検出) — [#5](https://github.com/noribow/cdreader/issues/5)
 - [ ] リードイン/リードアウトのオーバーリード
 - [x] CDDB 対応 (ディスク情報の取得) — [#6](https://github.com/noribow/cdreader/issues/6)
@@ -820,6 +863,9 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
 - [x] C2 エラーポインタを使った読み取りエラーの検出と再読込 (`--no-c2`、Android は詳細設定) — [#33](https://github.com/noribow/cdreader/issues/33)
   (実装済み・実機での動作確認待ち)
 - [x] 再読込 (`--verify`・リトライ・C2) でのドライブキャッシュ回避 (FUA・追い出し・自動判定、`--cache`、Android は詳細設定) — [#34](https://github.com/noribow/cdreader/issues/34)
+  (実装済み・実機での動作確認待ち)
+- [x] 読み取りオフセットの自動検出・自動設定 (複数トラックの一致で確定、ドライブごとに保存、`rip --offset auto`・`offset --save`、
+  Android は詳細設定の「オフセットを自動検出」とリッピング前の確認) — [#37](https://github.com/noribow/cdreader/issues/37)
   (実装済み・実機での動作確認待ち)
 - [ ] Windows GUI
 

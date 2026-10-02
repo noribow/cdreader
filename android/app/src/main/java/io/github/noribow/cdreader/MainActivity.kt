@@ -1,6 +1,7 @@
 package io.github.noribow.cdreader
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -13,6 +14,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.text.Editable
+import android.text.TextWatcher
 import android.text.method.ScrollingMovementMethod
 import android.view.View
 import android.view.WindowInsets
@@ -55,6 +58,9 @@ class MainActivity : Activity() {
         const val PREF_C2 = "useC2"
         const val PREF_CACHE = "cacheMode"
         const val PREF_ADVANCED = "advancedOpen"
+        // Detected read offsets per drive model (#37): key = DriveInfo.offsetKey.
+        const val DRIVE_OFFSETS = "driveOffsets"
+        const val DRIVE_OFFSET_NOTES = "driveOffsetNotes"
         const val MAX_RETRIES = 5
         const val READY_WAIT_SECONDS = 30
         const val USER_AGENT = "cdreader/0.1.0 (Android)"
@@ -76,6 +82,8 @@ class MainActivity : Activity() {
     private lateinit var listTracks: ListView
     private lateinit var spinnerMatch: Spinner
     private lateinit var editOffset: EditText
+    private lateinit var textOffsetSource: TextView
+    private lateinit var buttonDetectOffset: Button
     private lateinit var checkVerify: CheckBox
     private lateinit var checkC2: CheckBox
     private lateinit var spinnerCache: Spinner
@@ -107,6 +115,14 @@ class MainActivity : Activity() {
 
     // UI thread state.
     private var driveName = ""
+    private var driveInfo: DriveInfo? = null
+    // Where the value in editOffset came from (#37); a manual edit makes it MANUAL.
+    private var offsetSource = OffsetSource.MANUAL
+    private var offsetDetail = ""
+    private var settingOffset = false  // editOffset changed by the app, not the user
+    private var detecting = false
+    // Asked once per connected drive whether to detect the offset before ripping.
+    private var askedOffset = false
     private var toc: DiscToc? = null
     private var metadata: DiscMetadata? = null
     private var outputTree: Uri? = null
@@ -145,6 +161,8 @@ class MainActivity : Activity() {
         listTracks = findViewById(R.id.listTracks)
         spinnerMatch = findViewById(R.id.spinnerMatch)
         editOffset = findViewById(R.id.editOffset)
+        textOffsetSource = findViewById(R.id.textOffsetSource)
+        buttonDetectOffset = findViewById(R.id.buttonDetectOffset)
         checkVerify = findViewById(R.id.checkVerify)
         checkC2 = findViewById(R.id.checkC2)
         spinnerCache = findViewById(R.id.spinnerCache)
@@ -184,6 +202,18 @@ class MainActivity : Activity() {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQUEST_FOLDER)
         }
         buttonRip.setOnClickListener { if (ripping) cancelRip() else startRip() }
+        buttonDetectOffset.setOnClickListener { if (detecting) cancelRip() else startDetectOffset(thenRip = false) }
+        editOffset.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(text: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(text: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(text: Editable?) {
+                if (settingOffset) return
+                // Typed by the user: a manual value from now on.
+                offsetSource = OffsetSource.MANUAL
+                offsetDetail = ""
+                showOffsetSource("")
+            }
+        })
         groupFormat.setOnCheckedChangeListener { _, _ ->
             prefs.edit().putString(PREF_FORMAT, selectedFormat()).apply()
         }
@@ -300,10 +330,13 @@ class MainActivity : Activity() {
                     conn.fileDescriptor, ms.usbInterface.id, ms.bulkIn.address, ms.bulkOut.address
                 )
                 synchronized(sessionLock) { session = s }
-                val name = s.inquiry()
+                val info = s.driveInfo()
                 runOnUiThread {
-                    driveName = name
-                    textDrive.text = name
+                    driveName = info.displayName
+                    driveInfo = info
+                    askedOffset = false
+                    textDrive.text = info.displayName
+                    applySavedOffset()
                 }
                 loadDisc(s)
             } catch (e: Exception) {
@@ -396,12 +429,14 @@ class MainActivity : Activity() {
         connection = null
         massStorage = null
         device = null
+        driveInfo = null
         toc = null
         metadata = null
         listTracks.adapter = null
         spinnerMatch.visibility = View.GONE
         textDisc.text = ""
         buttonConnect.text = getString(R.string.connect)
+        if (!detecting) buttonDetectOffset.isEnabled = false
         updateRipButton()
         // Queued after a running rip, which stops quickly once cancelled or unplugged.
         worker.execute {
@@ -416,7 +451,8 @@ class MainActivity : Activity() {
 
     // --- Ripping -------------------------------------------------------------
 
-    private fun startRip() {
+    /** [askOffset]: ask first whether to detect the offset when none is set for the drive (#37). */
+    private fun startRip(askOffset: Boolean = true) {
         val disc = toc ?: return
         val tree = outputTree ?: return setStatus(getString(R.string.no_folder))
         val s = session ?: return
@@ -427,7 +463,32 @@ class MainActivity : Activity() {
             showAdvanced(true)  // the field is in 詳細設定
             return setStatus("読み取りオフセットは整数で指定してください")
         }
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(PREF_OFFSET, offset).apply()
+        val info = driveInfo
+        if (askOffset && !askedOffset && offset == 0 && info != null && savedOffset(info) == null) {
+            AlertDialog.Builder(this)
+                .setTitle("読み取りオフセットが未設定です")
+                .setMessage(
+                    "このドライブ (${info.product}) の読み取りオフセットは保存されていません。" +
+                        "オフセット 0 のままだと AccurateRip で一致しないことがあります。\n\n" +
+                        "リッピングの前に AccurateRip を使ってオフセットを自動検出しますか? " +
+                        "(数トラックを読み取ります。ディスクが AccurateRip に登録されている必要があります)"
+                )
+                .setPositiveButton("検出する") { _, _ ->
+                    askedOffset = true
+                    startDetectOffset(thenRip = true)
+                }
+                .setNegativeButton("このまま続ける") { _, _ ->
+                    askedOffset = true
+                    startRip(askOffset = false)
+                }
+                .show()
+            return
+        }
+        // Only a typed value is the app-wide default; saved / detected ones belong to the drive.
+        if (offsetSource == OffsetSource.MANUAL)
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(PREF_OFFSET, offset).apply()
+        val source = offsetSource
+        val sourceDetail = offsetDetail
         val verify = checkVerify.isChecked
         val useC2 = checkC2.isChecked
         val cacheMode = selectedCacheMode()
@@ -447,9 +508,10 @@ class MainActivity : Activity() {
             val temp = File(cacheDir, "rip.$format")
             var message: String
             var results: String? = null
+            var suggestDetection = false
             try {
                 if (cacheMode == CacheMode.AUTO) runOnUiThread { setStatus("ドライブのキャッシュを確認しています…") }
-                s.beginRip(format, offset, MAX_RETRIES, verify, useC2, cacheMode)
+                s.beginRip(format, offset, MAX_RETRIES, verify, useC2, cacheMode, source, sourceDetail)
                 val ripped = mutableListOf<Pair<Int, RipResult>>()
                 val dir = createDocument(treeDocument(tree), DocumentsContract.Document.MIME_TYPE_DIR, s.albumFolderName())
                 var problems = 0
@@ -474,6 +536,9 @@ class MainActivity : Activity() {
                 writeText(createDocument(dir, "application/octet-stream", "rip.log"), log)
                 results = describeC2(s.c2Status(), ripped) + "\n" + describeCache(s.cacheStatus(), ripped) + "\n" +
                     describeAccurateRip(summary)
+                // The disc is in AccurateRip but nothing matched: most likely the offset (#37).
+                suggestDetection = summary.status == AccurateRipStatus.FOUND && summary.accurateTracks == 0 &&
+                    summary.tracksInDatabase > 0
                 message = if (problems == 0) "完了しました (${selected.size} トラック)"
                 else "完了しましたが、$problems トラックに読めないセクタまたは疑わしい位置がありました (rip.log を参照)"
             } catch (e: CancellationException) {
@@ -493,8 +558,148 @@ class MainActivity : Activity() {
                     textResults.scrollTo(0, 0)
                     textResults.visibility = View.VISIBLE
                 }
+                if (suggestDetection && toc != null) suggestOffsetDetection()
             }
         }
+    }
+
+    // --- Read offset (#37) -----------------------------------------------------
+
+    private fun driveOffsetPrefs() = getSharedPreferences(DRIVE_OFFSETS, MODE_PRIVATE)
+    private fun driveOffsetNotePrefs() = getSharedPreferences(DRIVE_OFFSET_NOTES, MODE_PRIVATE)
+
+    /** The offset saved for this drive model, or null. */
+    private fun savedOffset(info: DriveInfo): Int? {
+        val prefs = driveOffsetPrefs()
+        return if (prefs.contains(info.offsetKey)) prefs.getInt(info.offsetKey, 0) else null
+    }
+
+    private fun saveOffset(info: DriveInfo, offset: Int, note: String) {
+        driveOffsetPrefs().edit().putInt(info.offsetKey, offset).apply()
+        driveOffsetNotePrefs().edit().putString(info.offsetKey, note).apply()
+    }
+
+    /** Sets the field without making it a manual value. */
+    private fun setOffsetField(offset: Int, source: OffsetSource, detail: String, label: String) {
+        settingOffset = true
+        editOffset.setText(offset.toString())
+        settingOffset = false
+        offsetSource = source
+        offsetDetail = detail
+        showOffsetSource(label)
+    }
+
+    private fun showOffsetSource(label: String) {
+        textOffsetSource.text = label
+        textOffsetSource.visibility = if (label.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    /** A newly connected drive: its saved offset, otherwise the last value typed. */
+    private fun applySavedOffset() {
+        val info = driveInfo ?: return
+        val saved = savedOffset(info)
+        if (saved != null) {
+            val note = driveOffsetNotePrefs().getString(info.offsetKey, "").orEmpty()
+            val detail = info.displayName + if (note.isEmpty()) "" else "; $note"
+            setOffsetField(saved, OffsetSource.SAVED, detail, "(ドライブ ${info.product} の保存値)")
+        } else if (offsetSource != OffsetSource.MANUAL) {
+            // The value of another drive: back to the app-wide manual value.
+            val manual = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(PREF_OFFSET, 0)
+            setOffsetField(manual, OffsetSource.MANUAL, "", "")
+        }
+    }
+
+    private fun suggestOffsetDetection() {
+        AlertDialog.Builder(this)
+            .setTitle("AccurateRip で一致したトラックがありません")
+            .setMessage(
+                "このディスクは AccurateRip に登録されていますが、どのトラックも一致しませんでした。" +
+                    "読み取りオフセットが合っていない可能性があります。\n\nオフセットを自動検出しますか?"
+            )
+            .setPositiveButton("検出する") { _, _ -> startDetectOffset(thenRip = false) }
+            .setNegativeButton("後で", null)
+            .show()
+    }
+
+    /** Detects the offset of the drive with the disc in it; [thenRip]: start the rip after a confirmed result. */
+    private fun startDetectOffset(thenRip: Boolean) {
+        if (toc == null || ripping || detecting) return
+        val s = session ?: return
+        val info = driveInfo ?: return
+        detecting = true
+        cancelRequested = false
+        setBusy(true)
+        showAdvanced(true)
+        progress.progress = 0
+        setStatus("AccurateRip でオフセットを検出しています…")
+        worker.execute {
+            var error: String? = null
+            val result = try {
+                s.detectOffset(http) { step, steps, track, done, total ->
+                    val part = if (total > 0) 1000L * done / total else 0L
+                    val permille = (((step - 1) * 1000L + part) / steps.coerceAtLeast(1)).toInt()
+                    runOnUiThread {
+                        progress.progress = permille
+                        setStatus("オフセット検出: トラック $track を読み取り中 ($step/$steps)  ${part / 10}%")
+                    }
+                }
+            } catch (e: Exception) {
+                error = e.message
+                null
+            }
+            runOnUiThread {
+                detecting = false
+                setBusy(false)
+                if (result != null) finishDetection(info, result, thenRip) else setStatus("エラー: $error")
+            }
+        }
+    }
+
+    private fun finishDetection(info: DriveInfo, d: OffsetDetection, thenRip: Boolean) {
+        if (driveInfo?.offsetKey != info.offsetKey) return  // the drive was unplugged meanwhile
+        if (d.status == OffsetDetectStatus.DETECTED) {
+            val agreed = "${d.agreeingTracks}/${d.testedTracks} トラック一致, ${d.version}"
+            setOffsetField(d.offset, OffsetSource.DETECTED, d.agreement, "(自動検出: $agreed)")
+            saveOffset(info, d.offset, "auto-detected: ${d.agreement}")
+            val single = if (d.singleTrack) " 登録トラックが 1 つだけのディスクのため、別の CD でも確認することをおすすめします。" else ""
+            setStatus("オフセット %+d を検出しました (%s)。ドライブ %s の値として保存しました。%s".format(
+                d.offset, agreed, info.product, single
+            ))
+            if (thenRip) startRip(askOffset = false)
+            return
+        }
+        val message = describeDetectionFailure(d)
+        setStatus(message)
+        if (thenRip && d.status != OffsetDetectStatus.CANCELLED) {
+            AlertDialog.Builder(this)
+                .setTitle("オフセットを検出できませんでした")
+                .setMessage("$message\n\n現在のオフセット (${editOffset.text}) のままリッピングしますか?")
+                .setPositiveButton("リッピングする") { _, _ -> startRip(askOffset = false) }
+                .setNegativeButton("やめる", null)
+                .show()
+        }
+    }
+
+    private fun describeDetectionFailure(d: OffsetDetection): String = when (d.status) {
+        OffsetDetectStatus.DETECTED -> d.summary
+        OffsetDetectStatus.NOT_IN_DATABASE ->
+            "このディスクは AccurateRip に登録されていないため、オフセットを検出できません。よく知られた別の CD で試してください"
+        OffsetDetectStatus.LOOKUP_FAILED -> "AccurateRip の照会に失敗しました (${d.error})"
+        OffsetDetectStatus.NO_USABLE_TRACKS ->
+            "AccurateRip にこのディスクのトラックの登録がないため、オフセットを検出できません"
+        OffsetDetectStatus.NO_MATCH ->
+            "±3000 サンプルの範囲で一致するオフセットが見つかりませんでした (${d.testedTracks} トラックを照合)。別の CD で試してください"
+        OffsetDetectStatus.NOT_ENOUGH ->
+            if (d.usableTracks <= 1)
+                "オフセット %+d で一致しましたが、AccurateRip の登録件数が少ない (%d 件) ため確定できません。別の CD で試してください"
+                    .format(d.offset, d.confidence)
+            else
+                "オフセット %+d で一致したのは %d / %d トラックだけのため確定できません。別の CD で試してください"
+                    .format(d.offset, d.agreeingTracks, d.testedTracks)
+        OffsetDetectStatus.CONFLICT ->
+            "トラックごとに一致するオフセットが異なるため確定できません (候補: %s)。別の CD で試してください"
+                .format(d.candidates.joinToString(", ") { "%+d".format(it) })
+        OffsetDetectStatus.CANCELLED -> "オフセットの検出を中止しました"
     }
 
     private fun formatButtons(): List<Pair<String, RadioButton>> =
@@ -580,7 +785,7 @@ class MainActivity : Activity() {
                     summary.accurateTracks, summary.tracks.size, summary.tracksInDatabase, summary.pressings
                 )
                 if (summary.accurateTracks == 0 && summary.tracksInDatabase > 0)
-                    lines += "一致しません。読み取りオフセットを確認してください"
+                    lines += "一致しません。読み取りオフセットを確認してください (詳細設定の「オフセットを自動検出」)"
                 for (t in summary.tracks) {
                     lines += when {
                         t.accurate -> "Track %02d: 一致 (%s) v2 %d / v1 %d / %d 件, プレス %d/%d".format(
@@ -691,6 +896,9 @@ class MainActivity : Activity() {
         buttonConnect.text = getString(if (connection == null) R.string.connect else R.string.reload)
         buttonFolder.isEnabled = !busy
         editOffset.isEnabled = !busy
+        // While detecting it is the cancel button; not during a rip or without a disc.
+        buttonDetectOffset.isEnabled = detecting || (!busy && toc != null && session != null)
+        buttonDetectOffset.text = getString(if (detecting) R.string.detect_offset_cancel else R.string.detect_offset)
         checkVerify.isEnabled = !busy
         checkC2.isEnabled = !busy
         spinnerCache.isEnabled = !busy
@@ -703,7 +911,7 @@ class MainActivity : Activity() {
     }
 
     private fun updateRipButton(busy: Boolean = false) {
-        buttonRip.isEnabled = ripping || (!busy && toc != null && outputTree != null)
+        buttonRip.isEnabled = ripping || (!busy && !detecting && toc != null && outputTree != null)
     }
 
     private fun showAdvanced(open: Boolean) {

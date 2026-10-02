@@ -92,7 +92,26 @@
                 android:importantForAutofill="no"
                 android:inputType="numberSigned"
                 android:text="0" />
+
+            <!-- Where the value came from (#37): 「(ドライブ … の保存値)」 / 「(自動検出: …)」. -->
+            <TextView
+                android:id="@+id/textOffsetSource"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:maxLines="2"
+                android:visibility="gone" />
         </LinearLayout>
+
+        <!-- Read offset auto-detection with AccurateRip (#37); 「検出を中止」 while it runs. -->
+        <Button
+            android:id="@+id/buttonDetectOffset"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:enabled="false"
+            android:text="@string/detect_offset" />
 
         <CheckBox
             android:id="@+id/checkVerify"
