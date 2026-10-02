@@ -58,17 +58,21 @@ class MainActivity : Activity() {
         const val PREF_C2 = "useC2"
         const val PREF_CACHE = "cacheMode"
         const val PREF_ADVANCED = "advancedOpen"
+        // CDDB server URL and contact e-mail address (#38); "" = default server / anonymous greeting.
+        const val PREF_CDDB_SERVER = "cddbServer"
+        const val PREF_CDDB_EMAIL = "cddbEmail"
         // Detected read offsets per drive model (#37): key = DriveInfo.offsetKey.
         const val DRIVE_OFFSETS = "driveOffsets"
         const val DRIVE_OFFSET_NOTES = "driveOffsetNotes"
         const val MAX_RETRIES = 5
         const val READY_WAIT_SECONDS = 30
         const val USER_AGENT = "cdreader/0.1.0 (Android)"
-        const val CDDB_SERVER = ""  // the default server (gnudb.org)
     }
 
     private lateinit var usbManager: UsbManager
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
+    // The CDDB connection test needs no drive: it does not wait for a disc being loaded.
+    private val cddbTestWorker: ExecutorService = Executors.newSingleThreadExecutor()
     private val http = HttpGet(USER_AGENT)
 
     private lateinit var buttonConnect: Button
@@ -100,6 +104,10 @@ class MainActivity : Activity() {
     private lateinit var radioMka: RadioButton
     private lateinit var radioAlac: RadioButton
     private lateinit var progress: ProgressBar
+    private lateinit var editCddbServer: EditText
+    private lateinit var editCddbEmail: EditText
+    private lateinit var buttonCddbTest: Button
+    private lateinit var textCddbTest: TextView
 
     // Owned by the worker thread once opened.
     private var device: UsbDevice? = null
@@ -110,6 +118,9 @@ class MainActivity : Activity() {
 
     // Read by the worker when a disc is loaded.
     @Volatile private var cddbEnabled = true
+    // The saved (valid) CDDB settings (#38); "" = default server / anonymous greeting.
+    @Volatile private var cddbServer = ""
+    @Volatile private var cddbEmail = ""
     // Set on the UI thread; stops a rip between tracks, even before it reached native code.
     @Volatile private var cancelRequested = false
 
@@ -127,6 +138,10 @@ class MainActivity : Activity() {
     private var metadata: DiscMetadata? = null
     private var outputTree: Uri? = null
     private var ripping = false
+    private var busy = false
+    private var testingCddb = false
+    // The "set a contact e-mail address" dialog was shown for the current settings.
+    private var emailHintShown = false
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -179,6 +194,10 @@ class MainActivity : Activity() {
         radioMka = findViewById(R.id.radioMka)
         radioAlac = findViewById(R.id.radioAlac)
         progress = findViewById(R.id.progress)
+        editCddbServer = findViewById(R.id.editCddbServer)
+        editCddbEmail = findViewById(R.id.editCddbEmail)
+        buttonCddbTest = findViewById(R.id.buttonCddbTest)
+        textCddbTest = findViewById(R.id.textCddbTest)
         textResults.movementMethod = ScrollingMovementMethod()
         applySystemBarInsets(findViewById(R.id.root))
 
@@ -196,6 +215,11 @@ class MainActivity : Activity() {
         checkC2.isChecked = prefs.getBoolean(PREF_C2, true)
         spinnerCache.setSelection(CacheMode.fromKey(prefs.getString(PREF_CACHE, null)).ordinal, false)
         showAdvanced(prefs.getBoolean(PREF_ADVANCED, false))
+        cddbServer = prefs.getString(PREF_CDDB_SERVER, "").orEmpty()
+        cddbEmail = prefs.getString(PREF_CDDB_EMAIL, "").orEmpty()
+        editCddbServer.hint = CddbSettings.DEFAULT_SERVER
+        editCddbServer.setText(cddbServer)
+        editCddbEmail.setText(cddbEmail)
 
         buttonConnect.setOnClickListener { if (connection == null) connect() else reloadDisc() }
         buttonFolder.setOnClickListener {
@@ -235,6 +259,9 @@ class MainActivity : Activity() {
             showAdvanced(open)
             prefs.edit().putBoolean(PREF_ADVANCED, open).apply()
         }
+        editCddbServer.addTextChangedListener(afterChange { saveCddbSettings() })
+        editCddbEmail.addTextChangedListener(afterChange { saveCddbSettings() })
+        buttonCddbTest.setOnClickListener { startCddbTest() }
         checkCddb.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(PREF_CDDB, checked).apply()
             cddbEnabled = checked
@@ -273,6 +300,7 @@ class MainActivity : Activity() {
         cancelRip()
         closeDevice()
         worker.shutdown()
+        cddbTestWorker.shutdown()
         super.onDestroy()
     }
 
@@ -394,7 +422,7 @@ class MainActivity : Activity() {
     private fun lookUp(s: CdSession, enabled: Boolean, matchIndex: Int) {
         if (enabled) runOnUiThread { setStatus("CDDB で検索しています…") }
         val meta = try {
-            s.lookupCddb(enabled, CDDB_SERVER, matchIndex, http)
+            s.lookupCddb(enabled, cddbServer, cddbEmail, matchIndex, http)
         } catch (e: Exception) {
             null
         }
@@ -702,6 +730,110 @@ class MainActivity : Activity() {
         OffsetDetectStatus.CANCELLED -> "オフセットの検出を中止しました"
     }
 
+    // --- CDDB settings (#38) ---------------------------------------------------
+
+    private fun afterChange(action: () -> Unit) = object : TextWatcher {
+        override fun beforeTextChanged(text: CharSequence?, start: Int, count: Int, after: Int) {}
+        override fun onTextChanged(text: CharSequence?, start: Int, before: Int, count: Int) {}
+        override fun afterTextChanged(text: Editable?) = action()
+    }
+
+    /** Japanese text for a problem of the typed settings, null if none. */
+    private fun cddbProblemText(problem: CddbSettingProblem): String? = when (problem) {
+        CddbSettingProblem.NONE -> null
+        CddbSettingProblem.SERVER_SCHEME -> "http:// または https:// で始まる URL を入力してください"
+        CddbSettingProblem.SERVER_HOST -> "URL のホスト名 (またはポート番号) が正しくありません"
+        CddbSettingProblem.SERVER_CHARACTERS -> "URL に空白・制御文字・全角文字・# は使えません"
+        CddbSettingProblem.EMAIL_SHAPE -> "user@example.com の形式で入力してください (半角英数字)"
+        CddbSettingProblem.HELLO_CHARACTERS -> "使えない文字が含まれています"
+    }
+
+    /** Saves the fields when valid (the last valid values stay in use otherwise) and marks invalid ones. */
+    private fun saveCddbSettings() {
+        val server = editCddbServer.text.toString().trim()
+        val email = editCddbEmail.text.toString().trim()
+        val check = CddbSettings.check(server, email)
+        val serverProblem = cddbProblemText(check.server)
+        val emailProblem = cddbProblemText(check.email)
+        editCddbServer.error = serverProblem
+        editCddbEmail.error = emailProblem
+        val edit = getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+        if (serverProblem == null && server != cddbServer) {
+            cddbServer = server
+            emailHintShown = false
+            edit.putString(PREF_CDDB_SERVER, server)
+        }
+        if (emailProblem == null && email != cddbEmail) {
+            cddbEmail = email
+            emailHintShown = false
+            edit.putString(PREF_CDDB_EMAIL, email)
+        }
+        edit.apply()
+    }
+
+    /** Connection test with the values in the fields, on [cddbTestWorker]. */
+    private fun startCddbTest() {
+        if (testingCddb || busy) return
+        val server = editCddbServer.text.toString().trim()
+        val email = editCddbEmail.text.toString().trim()
+        val check = CddbSettings.check(server, email)
+        val problem = cddbProblemText(check.server)?.let { "サーバー URL: $it" }
+            ?: cddbProblemText(check.email)?.let { "連絡先メールアドレス: $it" }
+        if (problem != null) {
+            textCddbTest.text = problem
+            return
+        }
+        testingCddb = true
+        buttonCddbTest.isEnabled = false
+        textCddbTest.text = getString(R.string.cddb_testing)
+        cddbTestWorker.execute {
+            val text = try {
+                describeCddbTest(CddbSettings.test(server, email, http))
+            } catch (e: Exception) {
+                "失敗: ${e.message}"
+            }
+            val ok = text.startsWith("接続できました")
+            runOnUiThread {
+                if (isDestroyed) return@runOnUiThread
+                testingCddb = false
+                buttonCddbTest.isEnabled = !busy
+                textCddbTest.text = text
+                // The settings work now: look the loaded disc up again if it was not found.
+                val meta = metadata
+                if (ok && !busy && cddbEnabled && toc != null && session != null && meta != null && !meta.found &&
+                    server == cddbServer && email == cddbEmail
+                ) lookUpAgain(0)
+            }
+        }
+    }
+
+    private fun describeCddbTest(r: CddbTestResult): String {
+        if (!r.ok) {
+            val hint = if (r.needsContactEmail) "\n" + getString(R.string.cddb_email_needed) else ""
+            return "失敗: ${r.message}$hint"
+        }
+        var text = "接続できました: ${r.message}"
+        if (r.detail.isNotEmpty()) text += " (${r.detail})"
+        if (r.missingEmail) text += "\n連絡先メールアドレスが未設定です。gnudb は検索を拒否することがあります。"
+        return text
+    }
+
+    /** After a lookup the server refused because of the greeting. */
+    private fun showContactEmailNeeded() {
+        if (emailHintShown || isFinishing) return
+        emailHintShown = true
+        AlertDialog.Builder(this)
+            .setTitle("CDDB の連絡先メールアドレス")
+            .setMessage(getString(R.string.cddb_email_needed) + "\n\n" + getString(R.string.cddb_email_note))
+            .setPositiveButton("設定する") { _, _ ->
+                showAdvanced(true)
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_ADVANCED, true).apply()
+                editCddbEmail.requestFocus()
+            }
+            .setNegativeButton("後で", null)
+            .show()
+    }
+
     private fun formatButtons(): List<Pair<String, RadioButton>> =
         listOf(
             "flac" to radioFlac, "oggflac" to radioOggFlac, "alac" to radioAlac, "wav" to radioWav, "opus" to radioOpus,
@@ -855,9 +987,11 @@ class MainActivity : Activity() {
                 meta.found && meta.matches.size > 1 -> "CDDB: ${meta.matches.size} 件の候補から選択できます  $audio"
                 meta.found -> "CDDB: 見つかりました  $audio"
                 meta.message == "disabled" -> audio
+                meta.needsContactEmail -> "CDDB: 連絡先メールアドレスが必要です (${meta.message})  $audio"
                 else -> "CDDB: 見つかりませんでした (${meta.message})  $audio"
             }
         )
+        if (!meta.found && meta.needsContactEmail) showContactEmailNeeded()
     }
 
     private fun showDiscInfo() {
@@ -892,6 +1026,7 @@ class MainActivity : Activity() {
     }
 
     private fun setBusy(busy: Boolean) {
+        this.busy = busy
         buttonConnect.isEnabled = !busy
         buttonConnect.text = getString(if (connection == null) R.string.connect else R.string.reload)
         buttonFolder.isEnabled = !busy
@@ -903,6 +1038,10 @@ class MainActivity : Activity() {
         checkC2.isEnabled = !busy
         spinnerCache.isEnabled = !busy
         checkCddb.isEnabled = !busy
+        // CDDB settings (#38): not while ripping, detecting or looking up.
+        editCddbServer.isEnabled = !busy
+        editCddbEmail.isEnabled = !busy
+        buttonCddbTest.isEnabled = !busy && !testingCddb
         checkAccurateRip.isEnabled = !busy
         for ((_, radio) in formatButtons()) radio.isEnabled = !busy
         spinnerMatch.isEnabled = !busy

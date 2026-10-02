@@ -717,6 +717,262 @@ TEST(cddb_lookup_disc_starting_after_track_one) {
     CHECK(r.album.forTrack(3, 4).title == "Three");
 }
 
+// The real answer of gnudb.org to the anonymous hello (#38).
+const char* const kGnudbHelloError = "500 Unknown application, developer email for cdreader 0.1.0";
+
+TEST(cddb_request_url_with_and_without_email) {
+    // Nothing configured: the anonymous hello of earlier versions.
+    cdr::CddbOptions anonymous = cdr::cddbOptionsFromConfig({}, "0.1.0");
+    CHECK(anonymous.server == cdr::kDefaultCddbServer);
+    CHECK(anonymous.client.anonymous());
+    CHECK(cdr::cddbRequestUrl(anonymous.server, "stat", anonymous.client) ==
+          std::string(cdr::kDefaultCddbServer) + "?cmd=stat&hello=cdreader+localhost+cdreader+0.1.0&proto=6");
+
+    cdr::CddbConfig config;
+    config.server = "http://cddb.example.org:8880/~cddb/cddb.cgi";
+    config.email = "jane.doe+cd@mail.example.org";
+    const cdr::CddbOptions options = cdr::cddbOptionsFromConfig(config, "0.2.0");
+    CHECK(!options.client.anonymous());
+    CHECK(options.client.user == "jane.doe+cd" && options.client.host == "mail.example.org");
+    CHECK(options.client.name == "cdreader" && options.client.version == "0.2.0");
+    CHECK(cdr::cddbRequestUrl(options.server, "cddb query 0c025803", options.client) ==
+          "http://cddb.example.org:8880/~cddb/cddb.cgi?cmd=cddb+query+0c025803"
+          "&hello=jane.doe%2Bcd+mail.example.org+cdreader+0.2.0&proto=6");
+
+    config.appName = "MyRipper";
+    config.appVersion = "9.9";
+    const cdr::CddbOptions renamed = cdr::cddbOptionsFromConfig(config, "0.2.0");
+    CHECK(renamed.client.name == "MyRipper" && renamed.client.version == "9.9");
+
+    // Invalid values (e.g. a hand-edited file) keep the defaults: nothing half-valid is sent.
+    cdr::CddbConfig bad;
+    bad.server = "ftp://x.example";
+    bad.email = "not an address";
+    bad.appName = "two words";
+    const cdr::CddbOptions fallback = cdr::cddbOptionsFromConfig(bad, "0.1.0");
+    CHECK(fallback.server == cdr::kDefaultCddbServer);
+    CHECK(fallback.client.anonymous() && fallback.client.name == "cdreader");
+
+    // Control characters in hello fields never reach the URL unescaped.
+    cdr::CddbClientInfo raw;
+    raw.user = "a\tb";
+    raw.host = "h\r\nx";
+    CHECK(cdr::cddbRequestUrl("http://x/cgi", "stat", raw) == "http://x/cgi?cmd=stat&hello=a_b+h__x+cdreader+0.1.0&proto=6");
+}
+
+TEST(cddb_settings_validation) {
+    using P = cdr::CddbConfigProblem;
+    CHECK(cdr::checkCddbServer("") == P::None);
+    CHECK(cdr::checkCddbServer("https://gnudb.gnudb.org/~cddb/cddb.cgi") == P::None);
+    CHECK(cdr::checkCddbServer("HTTP://Example.org:8880/cgi?x=1") == P::None);
+    CHECK(cdr::checkCddbServer("http://[::1]:80/cgi") == P::None);
+    CHECK(cdr::checkCddbServer("gnudb.gnudb.org/~cddb/cddb.cgi") == P::ServerScheme);
+    CHECK(cdr::checkCddbServer("ftp://example.org/") == P::ServerScheme);
+    CHECK(cdr::checkCddbServer("https://") == P::ServerHost);
+    CHECK(cdr::checkCddbServer("https:///cgi") == P::ServerHost);
+    CHECK(cdr::checkCddbServer("https://user:pw@example.org/") == P::ServerHost);
+    CHECK(cdr::checkCddbServer("https://example.org:99999/") == P::ServerHost);
+    CHECK(cdr::checkCddbServer("https://example.org:/") == P::ServerHost);
+    CHECK(cdr::checkCddbServer("https://exa_mple.org/") == P::ServerHost);
+    CHECK(cdr::checkCddbServer("https://example.org/a b") == P::ServerCharacters);
+    CHECK(cdr::checkCddbServer("https://example.org/\x01") == P::ServerCharacters);
+    CHECK(cdr::checkCddbServer("https://example.org/#x") == P::ServerCharacters);
+    CHECK(cdr::checkCddbServer("https://\xE4\xBE\x8B.jp/") == P::ServerCharacters);
+
+    CHECK(cdr::checkCddbEmail("") == P::None);
+    CHECK(cdr::checkCddbEmail("user@example.com") == P::None);
+    CHECK(cdr::checkCddbEmail("first.last+tag@sub.example-mail.co.jp") == P::None);
+    for (const char* bad : {"user", "@example.com", "user@", "user@localhost", "a@b@c.com", "us er@example.com",
+                            "user@exa mple.com", ".user@example.com", "us..er@example.com", "user@-x.com",
+                            "user@x..com", "user@x.com.", "us\"er@example.com", "user@ex_ample.com",
+                            "\xE5\xA4\xAA\xE9\x83\x8E@example.com", "user@example.com\n", "user\t@example.com"})
+        CHECK(cdr::checkCddbEmail(bad) == P::EmailShape);
+
+    CHECK(cdr::checkCddbHelloField("") == P::None);
+    CHECK(cdr::checkCddbHelloField("cdreader") == P::None);
+    CHECK(cdr::checkCddbHelloField("0.1.0-beta") == P::None);
+    CHECK(cdr::checkCddbHelloField("two words") == P::HelloCharacters);
+    CHECK(cdr::checkCddbHelloField("tab\there") == P::HelloCharacters);
+    CHECK(cdr::checkCddbHelloField(std::string(65, 'x')) == P::HelloCharacters);
+
+    std::string user = "keep", host = "keep";
+    CHECK(!cdr::splitCddbEmail("bad", user, host) && user == "keep" && host == "keep");
+    CHECK(cdr::splitCddbEmail("me@example.net", user, host) && user == "me" && host == "example.net");
+
+    cdr::CddbConfig config;
+    CHECK(cdr::cddbConfigError(config).empty());
+    config.email = "nobody";
+    CHECK(cdr::cddbConfigError(config) == "cddb-email: expected an e-mail address such as user@example.com");
+    config.server = "gnudb.org";
+    CHECK(cdr::cddbConfigError(config) == "cddb-server: the server must be an http:// or https:// URL");
+
+    CHECK(cdr::cddbServerWantsEmail(cdr::kDefaultCddbServer));
+    CHECK(cdr::cddbServerWantsEmail("http://GNUDB.org/~cddb/cddb.cgi"));
+    CHECK(!cdr::cddbServerWantsEmail("https://notgnudb.org/cgi"));
+    CHECK(!cdr::cddbServerWantsEmail("https://example.org/gnudb.org"));
+}
+
+TEST(settings_store_round_trip) {
+    cdr::SettingsStore store;
+    store.set("cddb-server", "https://cddb.example.org/cgi?x=1&y=a=b");
+    store.set("cddb-email", "  me@example.org \r\n");
+    store.set("zz.unknown_key", "line1\nline2");
+    CHECK(store.get("cddb-email") == "me@example.org");
+    CHECK(store.get("zz.unknown_key") == "line1 line2");
+    bool threw = false;
+    try {
+        store.set("Bad Key", "x");
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    const std::string text = store.serialize();
+    CHECK(text.rfind("# ", 0) == 0);
+    CHECK(text.find("\ncddb-server=https://cddb.example.org/cgi?x=1&y=a=b\n") != std::string::npos);
+    const cdr::SettingsStore back = cdr::SettingsStore::parse(text);
+    CHECK(back.entries() == store.entries());
+
+    // Damaged / foreign lines are skipped; CRLF and spaces are tolerated.
+    const cdr::SettingsStore parsed = cdr::SettingsStore::parse(
+        "# comment\r\n\r\n  cddb-email = you@example.com  \r\nno equals sign\r\nBAD KEY=1\r\n=value\r\nempty=\r\n"
+        "cddb-server=http://a.example/x=y");
+    CHECK(parsed.entries().size() == 2u);
+    CHECK(parsed.get("cddb-email") == "you@example.com");
+    CHECK(parsed.get("cddb-server") == "http://a.example/x=y");
+    CHECK(parsed.get("missing", "fallback") == "fallback");
+    CHECK(parsed.find("empty") == nullptr);
+
+    // CDDB settings in the store: empty values remove the keys, unknown keys stay.
+    cdr::SettingsStore s2 = cdr::SettingsStore::parse("other=1\ncddb-app-name=old\n");
+    cdr::CddbConfig config;
+    config.server = "https://cddb.example.org/cgi";
+    config.email = "me@example.org";
+    cdr::storeCddbConfig(s2, config);
+    CHECK(s2.find("cddb-app-name") == nullptr && s2.get("other") == "1");
+    const cdr::CddbConfig loaded = cdr::cddbConfigFromSettings(cdr::SettingsStore::parse(s2.serialize()));
+    CHECK(loaded.server == config.server && loaded.email == config.email && loaded.appName.empty() &&
+          loaded.appVersion.empty());
+    config.email.clear();
+    cdr::storeCddbConfig(s2, config);
+    CHECK(s2.find(cdr::kSettingCddbEmail) == nullptr);
+}
+
+TEST(cddb_error_hint_mapping) {
+    using H = cdr::CddbHint;
+    CHECK(cdr::cddbErrorHint(kGnudbHelloError) == H::ContactEmail);
+    CHECK(cdr::cddbErrorHint(std::string(kGnudbHelloError) + "\r\n") == H::ContactEmail);
+    CHECK(cdr::cddbErrorHint("431 Handshake not successful, closing connection.") == H::ContactEmail);
+    CHECK(cdr::cddbErrorHint("409 No handshake.") == H::ContactEmail);
+    CHECK(cdr::cddbErrorHint("530 Invalid hello: please send your e-mail address") == H::ContactEmail);
+    CHECK(cdr::cddbErrorHint("500 Command syntax error.") == H::None);
+    CHECK(cdr::cddbErrorHint("402 Server error.") == H::None);
+    CHECK(cdr::cddbErrorHint("202 No match found") == H::None);
+    // Not a CDDB response (transport errors, HTML pages).
+    CHECK(cdr::cddbErrorHint("cannot connect to hello.example.org") == H::None);
+    CHECK(cdr::cddbErrorHint("<html>email us</html>") == H::None);
+    CHECK(cdr::cddbErrorHint("") == H::None);
+    CHECK(cdr::cddbHintText(H::None).empty());
+    const std::string text = cdr::cddbHintText(H::ContactEmail);
+    CHECK(text.rfind("Hint: ", 0) == 0);
+    CHECK(text.find("set a contact e-mail address in the CDDB settings") != std::string::npos);
+    CHECK(text.find("cdreader config cddb-email") != std::string::npos);
+
+    // A lookup refused by gnudb: the error keeps the server's words, plus the hint.
+    FakeHttp http;
+    http.reply("cddb query", std::string(kGnudbHelloError) + "\r\n");
+    cdr::CddbLookupResult r = cdr::lookupCddb(http, makeCddbToc());
+    CHECK(!r.found && r.hint == H::ContactEmail);
+    CHECK(r.error == std::string("query failed: ") + kGnudbHelloError);
+    std::vector<std::string> log = cdr::cddbLookupLogLines(true, cdr::kDefaultCddbServer, r);
+    CHECK(log.size() == 2u);
+    CHECK(log[0] == "CDDB lookup (" + std::string(cdr::kDefaultCddbServer) + "): query failed: " + kGnudbHelloError);
+    CHECK(log.size() == 2u && log[1] == text);
+
+    // The same text in an HTTP error page.
+    FakeHttp page;
+    page.reply("cddb query", std::string(kGnudbHelloError) + "\n", 403);
+    r = cdr::lookupCddb(page, makeCddbToc());
+    CHECK(!r.found && r.hint == H::ContactEmail && r.error == std::string("HTTP status 403: ") + kGnudbHelloError);
+
+    // Other failures have no hint line.
+    FakeHttp notFound;
+    notFound.reply("cddb query", "202 No match found\r\n");
+    r = cdr::lookupCddb(notFound, makeCddbToc());
+    CHECK(r.hint == H::None);
+    CHECK(cdr::cddbLookupLogLines(true, "https://s.example/cgi", r) ==
+          std::vector<std::string>{"CDDB lookup (https://s.example/cgi): no matching disc in the database"});
+    CHECK(cdr::cddbLookupLogLines(false, "x", r) == std::vector<std::string>{"CDDB lookup: disabled"});
+}
+
+TEST(cddb_lookup_log_lines_for_a_match) {
+    FakeHttp http;
+    http.reply("cddb query", "200 rock 0c025803 A / B\r\n");
+    http.reply("cddb read", "210 rock 0c025803\r\nDTITLE=A / B\r\nDYEAR=1999\r\nDGENRE=Rock\r\nTTITLE0=x\r\n.\r\n");
+    const cdr::CddbLookupResult r = cdr::lookupCddb(http, makeCddbToc());
+    CHECK(cdr::cddbLookupLogLines(true, "https://s/cgi", r) ==
+          (std::vector<std::string>{"CDDB lookup (https://s/cgi): 1 exact match(es)", "  * 1. rock/0c025803  A / B",
+                                    "Artist: A", "Album: B", "Year: 1999", "Genre: Rock"}));
+}
+
+TEST(cddb_connection_test) {
+    cdr::CddbOptions options = cdr::cddbOptionsFromConfig({}, "0.1.0");
+    options.server = "https://cddb.example/cgi";
+
+    FakeHttp ok;
+    ok.reply("stat",
+             "210 OK, status information follows (until terminating `.')\r\nServer status:\r\n"
+             "    current proto: 6\r\nDatabase entries: 4120000\r\nDatabase entries by category:\r\n"
+             "    rock: 1\r\n.\r\n");
+    cdr::CddbTestResult r = cdr::testCddbConnection(ok, options);
+    CHECK(r.ok && r.code == 210 && r.hint == cdr::CddbHint::None && !r.missingEmail);
+    CHECK(r.message == "210 OK, status information follows (until terminating `.')");
+    CHECK(r.detail == "4120000 database entries");
+    CHECK(r.summary() == "OK: 210 OK, status information follows (until terminating `.') (4120000 database entries)");
+    CHECK(ok.urls.size() == 1u &&
+          ok.urls[0] == "https://cddb.example/cgi?cmd=stat&hello=cdreader+localhost+cdreader+0.1.0&proto=6");
+
+    // gnudb answers, but nothing tells it who we are.
+    options.server = cdr::kDefaultCddbServer;
+    r = cdr::testCddbConnection(ok, options);
+    CHECK(r.ok && r.missingEmail);
+    cdr::CddbConfig config;
+    config.email = "me@example.org";
+    cdr::CddbOptions withEmail = cdr::cddbOptionsFromConfig(config, "0.1.0");
+    r = cdr::testCddbConnection(ok, withEmail);
+    CHECK(r.ok && !r.missingEmail);
+    CHECK(ok.urls.back().find("&hello=me+example.org+cdreader+0.1.0&") != std::string::npos);
+
+    FakeHttp refused;
+    refused.reply("stat", std::string(kGnudbHelloError) + "\r\n");
+    r = cdr::testCddbConnection(refused, options);
+    CHECK(!r.ok && r.code == 500 && r.message == kGnudbHelloError && r.hint == cdr::CddbHint::ContactEmail);
+    CHECK(r.summary() == std::string("failed: ") + kGnudbHelloError);
+
+    FakeHttp syntax;
+    syntax.reply("stat", "500 Command syntax error.\r\n");
+    r = cdr::testCddbConnection(syntax, options);
+    CHECK(!r.ok && r.code == 500 && r.hint == cdr::CddbHint::None);
+
+    FakeHttp none;  // transport failure
+    r = cdr::testCddbConnection(none, options);
+    CHECK(!r.ok && r.code == 0 && r.message == "no route" && r.hint == cdr::CddbHint::None);
+
+    FakeHttp html;
+    html.reply("stat", "<html>Bad Gateway</html>", 502);
+    r = cdr::testCddbConnection(html, options);
+    CHECK(!r.ok && r.message == "HTTP status 502");
+    html.reply("stat", "<html>hi</html>");
+    r = cdr::testCddbConnection(html, options);
+    CHECK(!r.ok && r.message == "not a CDDB response: <html>hi</html>");
+
+    struct Throwing : cdr::HttpClient {
+        cdr::HttpResponse get(const std::string&) override { throw std::runtime_error("boom"); }
+    } throwing;
+    r = cdr::testCddbConnection(throwing, options);
+    CHECK(!r.ok && r.message == "boom");
+}
+
 TEST(file_name_sanitizing) {
     CHECK(cdr::sanitizeFileName("AC/DC: \"Live\" <1991>?*|\\") == "AC_DC_ _Live_ _1991_____");
     CHECK(cdr::sanitizeFileName("tab\there\x01") == "tab_here_");

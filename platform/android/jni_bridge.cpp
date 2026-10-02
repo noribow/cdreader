@@ -326,22 +326,26 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeReadT
 }
 
 // Looks the disc up on CDDB (or clears the metadata when !enabled); an empty
-// `server` means the default server. Never fails for network problems.
+// `server` means the default server, an empty `email` the anonymous hello
+// (#38: the contact address "user@host" the user entered; invalid values are
+// ignored). Never fails for network problems.
 // Returns [found ("1"/"0"), message (error, or "exact"/"inexact"), artist,
 // album, year, genre, folder name, AccurateRip disc id, chosen match index,
-// match count N, N x "category/discid  Artist / Album", then one label per
-// TOC track ("Title" or "Artist / Title", "" if unknown)].
+// match count N, hint ("1": the server refused the hello, set a contact
+// e-mail address; "0" otherwise), N x "category/discid  Artist / Album", then
+// one label per TOC track ("Title" or "Artist / Title", "" if unknown)].
 JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeLookupCddb(
-    JNIEnv* env, jclass, jlong handle, jboolean enabled, jstring server, jint matchIndex, jobject httpGet) {
+    JNIEnv* env, jclass, jlong handle, jboolean enabled, jstring server, jstring email, jint matchIndex,
+    jobject httpGet) {
     try {
         cdr::RipSession& rip = session(handle)->rip;
+        cdr::CddbConfig config;
+        if (!fromJava(env, server, config.server)) return nullptr;
+        if (!fromJava(env, email, config.email)) return nullptr;
         cdr::CddbSettings settings;
         settings.enabled = enabled == JNI_TRUE && httpGet != nullptr;
-        std::string url;
-        if (!fromJava(env, server, url)) return nullptr;
-        if (!url.empty()) settings.options.server = url;
+        settings.options = cdr::cddbOptionsFromConfig(config, CDREADER_VERSION);
         settings.options.matchIndex = matchIndex > 0 ? size_t(matchIndex) : 0;
-        settings.options.client.version = CDREADER_VERSION;
 
         JavaHttpClient http(env, httpGet);
         const cdr::CddbLookupResult& r = rip.lookupCddb(settings.enabled ? &http : nullptr, settings);
@@ -355,10 +359,45 @@ JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeLo
                                       rip.albumDirectoryName(),
                                       cdr::AccurateRipDiscId::fromToc(rip.toc()).toString(),
                                       std::to_string(r.chosen),
-                                      std::to_string(r.matches.size())};
+                                      std::to_string(r.matches.size()),
+                                      r.hint == cdr::CddbHint::ContactEmail ? "1" : "0"};
         for (const cdr::CddbMatch& m : r.matches) v.push_back(m.category + "/" + m.discId + "  " + m.title);
         for (const cdr::Track& t : rip.toc().tracks) v.push_back(rip.trackLabel(t.number));
         return toJavaArray(env, v);
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+        return nullptr;
+    }
+}
+
+// Checks the CDDB settings (#38) as typed: [server problem, e-mail problem],
+// each 0 valid (or empty), 1 not http(s)://, 2 bad host, 3 bad characters,
+// 4 not an e-mail address (cdr::CddbConfigProblem).
+JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeCheckCddbSettings(JNIEnv* env, jclass,
+                                                                                            jstring server,
+                                                                                            jstring email) {
+    std::string url, address;
+    if (!fromJava(env, server, url) || !fromJava(env, email, address)) return nullptr;
+    return toJavaArray(env, std::vector<jint>{jint(cdr::checkCddbServer(url)), jint(cdr::checkCddbEmail(address))});
+}
+
+// CDDB connection test (#38): one "stat" request with the hello of the
+// lookups, needs no drive. Runs on the calling (worker) thread, never call it
+// on the UI thread. Returns [ok ("1"/"0"), CDDB code ("0": none), message
+// (server status line or error), detail (e.g. "4120000 database entries"),
+// hint ("1": the server refused the hello, set a contact e-mail address),
+// missing e-mail ("1": works, but gnudb wants a contact address and none is set)].
+JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTestCddb(JNIEnv* env, jclass,
+                                                                                      jstring server, jstring email,
+                                                                                      jobject httpGet) {
+    try {
+        cdr::CddbConfig config;
+        if (!fromJava(env, server, config.server) || !fromJava(env, email, config.email)) return nullptr;
+        JavaHttpClient http(env, httpGet);
+        const cdr::CddbTestResult r = cdr::testCddbConnection(http, cdr::cddbOptionsFromConfig(config, CDREADER_VERSION));
+        return toJavaArray(env, std::vector<std::string>{r.ok ? "1" : "0", std::to_string(r.code), r.message, r.detail,
+                                                         r.hint == cdr::CddbHint::ContactEmail ? "1" : "0",
+                                                         r.missingEmail ? "1" : "0"});
     } catch (const std::exception& e) {
         throwIo(env, e.what());
         return nullptr;

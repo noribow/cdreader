@@ -21,6 +21,14 @@
         <item>追い出し</item>
         <item>なし</item>
     </string-array>
+    <string name="cddb_group">CDDB</string>
+    <string name="cddb_server">サーバー URL (空欄: 既定のサーバー)</string>
+    <string name="cddb_email">連絡先メールアドレス</string>
+    <string name="cddb_email_hint">user@example.com</string>
+    <string name="cddb_email_note">gnudb は開発者/利用者の連絡先メールを要求します。入力したアドレスはサーバーに送信されます。空欄の場合は匿名 (cdreader@localhost) で接続します。</string>
+    <string name="cddb_test">接続テスト</string>
+    <string name="cddb_testing">テスト中…</string>
+    <string name="cddb_email_needed">CDDB サーバー (gnudb) が連絡先メールアドレスを要求しています。詳細設定の「CDDB」で連絡先メールアドレスを設定してください。</string>
     <string name="format">形式</string>
     <string name="format_flac">FLAC</string>
     <string name="format_oggflac">Ogg FLAC</string>

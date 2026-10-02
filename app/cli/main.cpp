@@ -29,6 +29,7 @@
 #include "cdreader/metadata.h"
 #include "cdreader/offset_detect.h"
 #include "cdreader/ripper.h"
+#include "cdreader/settings_store.h"
 #include "cdreader/subchannel.h"
 #include "cdreader/toc.h"
 #include "spti_transport.h"
@@ -50,40 +51,70 @@ std::string formatList() {
     return list;
 }
 
-// --- Read offsets saved per drive (#37) ---------------------------------------
-// %APPDATA%\cdreader\drive_offsets.txt (the roaming profile of the user);
-// next to cdreader.exe when APPDATA is not set. Format: cdr::DriveOffsetStore.
-fs::path offsetStorePath() {
+// --- Files of saved settings --------------------------------------------------
+// %APPDATA%\cdreader (the roaming profile of the user); the folder of
+// cdreader.exe when APPDATA is not set.
+fs::path settingsDirectory() {
     std::wstring appData(32768, L'\0');
     const DWORD n = GetEnvironmentVariableW(L"APPDATA", appData.data(), DWORD(appData.size()));
     if (n > 0 && n < appData.size()) {
         appData.resize(n);
-        return fs::path(appData) / L"cdreader" / L"drive_offsets.txt";
+        return fs::path(appData) / L"cdreader";
     }
     std::wstring exe(32768, L'\0');
     const DWORD len = GetModuleFileNameW(nullptr, exe.data(), DWORD(exe.size()));
     exe.resize(len < exe.size() ? len : 0);
-    return fs::path(exe).parent_path() / L"drive_offsets.txt";
+    return fs::path(exe).parent_path();
 }
 
-cdr::DriveOffsetStore loadOffsetStore() {
-    std::ifstream in(offsetStorePath(), std::ios::binary);
+std::string readTextFile(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
     if (!in) return {};
-    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    return cdr::DriveOffsetStore::parse(text);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
+
+void writeTextFile(const fs::path& path, const std::string& text) {
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << text;
+    if (!out.flush()) throw std::runtime_error("cannot write " + path.u8string());
+}
+
+// --- Read offsets saved per drive (#37): drive_offsets.txt (cdr::DriveOffsetStore)
+fs::path offsetStorePath() { return settingsDirectory() / L"drive_offsets.txt"; }
+
+cdr::DriveOffsetStore loadOffsetStore() { return cdr::DriveOffsetStore::parse(readTextFile(offsetStorePath())); }
 
 void saveDriveOffset(const cdr::DriveInfo& info, const cdr::SavedDriveOffset& value) {
     cdr::DriveOffsetStore store = loadOffsetStore();
     store.set(cdr::driveOffsetKey(info), value);
     const fs::path path = offsetStorePath();
-    std::error_code ec;
-    fs::create_directories(path.parent_path(), ec);
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    out << store.serialize();
-    if (!out.flush()) throw std::runtime_error("cannot write " + path.u8string());
+    writeTextFile(path, store.serialize());
     std::printf("Saved read offset %+d for %s in %s\n", value.offset, info.displayName().c_str(),
                 path.u8string().c_str());
+}
+
+// --- Settings (#38): settings.txt (key=value, cdr::SettingsStore) -------------------
+fs::path settingsPath() { return settingsDirectory() / L"settings.txt"; }
+
+cdr::SettingsStore loadSettings() { return cdr::SettingsStore::parse(readTextFile(settingsPath())); }
+
+// The keys of 'cdreader config', with their defaults.
+struct ConfigKey {
+    const char* key;
+    const char* description;
+    std::string defaultValue;
+};
+
+std::vector<ConfigKey> configKeys() {
+    return {
+        {cdr::kSettingCddbServer, "CDDB server (http:// or https:// CGI URL)", cdr::kDefaultCddbServer},
+        {cdr::kSettingCddbEmail, "contact e-mail address user@host sent in the CDDB hello",
+         "none: anonymous hello cdreader@localhost"},
+        {cdr::kSettingCddbAppName, "application name in the CDDB hello", "cdreader"},
+        {cdr::kSettingCddbAppVersion, "application version in the CDDB hello", kVersion},
+    };
 }
 
 void printUsage() {
@@ -98,6 +129,10 @@ void printUsage() {
         "  cdreader rip <drive> [options]        Rip audio tracks (see --format)\n"
         "  cdreader offset <drive> [options]     Detect the drive read offset (AccurateRip)\n"
         "  cdreader offsets                      List the read offsets saved per drive\n"
+        "  cdreader config                       List the saved settings\n"
+        "  cdreader config <key> [<value>]       Show or save a setting (see Settings)\n"
+        "  cdreader config <key> --unset         Back to the default\n"
+        "  cdreader cddb-test [CDDB options]     Test the CDDB server and the greeting\n"
         "\n"
         "Rip options:\n"
         "  -o, --output <dir>    Output directory (default: \"Artist - Album\" from CDDB,\n"
@@ -156,15 +191,28 @@ void printUsage() {
         "      --save            Save a confirmed offset for this drive (used by\n"
         "                        rip --offset auto). Saved offsets: %s\n"
         "\n"
-        "CDDB options (rip and toc):\n"
+        "CDDB options (rip, toc and cddb-test; they override the saved settings):\n"
         "      --no-cddb         Do not look up the disc online\n"
-        "      --cddb-server <url>  CDDB HTTP server (default: %s)\n"
+        "      --cddb-server <url>  CDDB HTTP server (default: cddb-server setting,\n"
+        "                        otherwise %s)\n"
         "      --cddb-match <n>  Use the n-th match when there are several (default: 1)\n"
-        "      --cddb-hello <user@host>  User and host sent in the CDDB greeting\n"
-        "                        (default: cdreader@localhost)\n"
+        "      --cddb-hello <user@host>  Contact e-mail address sent in the CDDB greeting\n"
+        "                        (default: cddb-email setting, otherwise the anonymous\n"
+        "                        cdreader@localhost)\n"
+        "\n"
+        "Settings (cdreader config <key> <value>; saved in %s):\n"
+        "  cddb-server <url>     CDDB server, http:// or https://\n"
+        "  cddb-email <user@host>  Contact e-mail address for the CDDB greeting. gnudb.org\n"
+        "                        refuses anonymous requests (\"500 Unknown application,\n"
+        "                        developer email ...\"); the address is sent to the server\n"
+        "                        with every lookup. Nothing is sent unless you set it.\n"
+        "  cddb-app-name <name>, cddb-app-version <version>\n"
+        "                        Application name / version in the greeting\n"
+        "                        (default: cdreader %s)\n"
         "\n"
         "<drive> is a drive letter such as D or D:\n",
-        kVersion, formatList().c_str(), offsetStorePath().u8string().c_str(), cdr::kDefaultCddbServer);
+        kVersion, formatList().c_str(), offsetStorePath().u8string().c_str(), cdr::kDefaultCddbServer,
+        settingsPath().u8string().c_str(), kVersion);
 }
 
 std::vector<std::string> utf8Arguments() {
@@ -241,6 +289,18 @@ struct CddbSettings {
     cdr::CddbOptions options;
 };
 
+// The saved CDDB settings (#38); invalid saved values are reported and ignored.
+CddbSettings savedCddbSettings() {
+    const cdr::CddbConfig config = cdr::cddbConfigFromSettings(loadSettings());
+    const std::string error = cdr::cddbConfigError(config);
+    if (!error.empty())
+        std::fprintf(stderr, "warning: ignoring the invalid setting %s (%s)\n", error.c_str(),
+                     settingsPath().u8string().c_str());
+    CddbSettings cddb;
+    cddb.options = cdr::cddbOptionsFromConfig(config, kVersion);
+    return cddb;
+}
+
 // Consumes a CDDB option at args[i]; returns false if args[i] is not one.
 bool parseCddbOption(const std::vector<std::string>& args, size_t& i, CddbSettings& cddb) {
     const std::string& a = args[i];
@@ -251,17 +311,16 @@ bool parseCddbOption(const std::vector<std::string>& args, size_t& i, CddbSettin
     if (a == "--no-cddb") {
         cddb.enabled = false;
     } else if (a == "--cddb-server") {
-        cddb.options.server = value();
-        if (cddb.options.server.rfind("http://", 0) != 0 && cddb.options.server.rfind("https://", 0) != 0)
-            throw UsageError("CDDB server must be an http:// or https:// URL");
+        const std::string& url = value();
+        const cdr::CddbConfigProblem problem = cdr::checkCddbServer(url);
+        if (url.empty() || problem != cdr::CddbConfigProblem::None)
+            throw UsageError("--cddb-server: " + (url.empty() ? std::string("needs a URL")
+                                                               : cdr::describeCddbConfigProblem(problem)));
+        cddb.options.server = url;
     } else if (a == "--cddb-hello") {
-        // Some servers want to see a contact address in the greeting.
-        const std::string& hello = value();
-        const size_t at = hello.find('@');
-        if (at == 0 || at == std::string::npos || at + 1 == hello.size())
-            throw UsageError("--cddb-hello expects user@host");
-        cddb.options.client.user = hello.substr(0, at);
-        cddb.options.client.host = hello.substr(at + 1);
+        // gnudb wants a contact address in the greeting (#38).
+        if (!cdr::splitCddbEmail(value(), cddb.options.client.user, cddb.options.client.host))
+            throw UsageError("--cddb-hello expects an e-mail address user@host, e.g. user@example.com");
     } else if (a == "--cddb-match") {
         const int n = parseInt(value(), "CDDB match number");
         if (n < 1) throw UsageError("CDDB match numbers start at 1");
@@ -283,15 +342,15 @@ cdr::CddbLookupResult lookupDisc(const cdr::Toc& toc, const CddbSettings& cddb) 
     std::fflush(stdout);
     try {
         cdr::win::WinHttpClient http(std::string("cdreader/") + kVersion);
-        cdr::CddbOptions options = cddb.options;
-        options.client.version = kVersion;
-        result = cdr::lookupCddb(http, toc, options);
+        result = cdr::lookupCddb(http, toc, cddb.options);
     } catch (const std::exception& e) {
         result = {};
         result.error = e.what();
     }
     if (!result.found) {
-        std::printf("CDDB: %s\n\n", result.error.c_str());
+        std::printf("CDDB: %s\n", result.error.c_str());
+        if (result.hint != cdr::CddbHint::None) std::printf("%s\n", cdr::cddbHintText(result.hint).c_str());
+        std::printf("\n");
         return result;
     }
     if (result.matches.size() > 1 || !result.exact) {
@@ -415,7 +474,7 @@ int cmdDrives() {
 int cmdToc(const std::vector<std::string>& args) {
     if (args.size() < 2) throw UsageError("toc needs a drive argument");
     const char letter = parseDriveLetter(args[1]);
-    CddbSettings cddb;
+    CddbSettings cddb = savedCddbSettings();
     bool discCodes = true;
     bool gapDetection = true;
     for (size_t i = 2; i < args.size(); ++i) {
@@ -550,7 +609,7 @@ int cmdRip(const std::vector<std::string>& args) {
     std::string format = "wav";
     std::set<int> wanted;
     cdr::RipOptions options;
-    CddbSettings cddb;
+    CddbSettings cddb = savedCddbSettings();
     bool accurateRip = true;
     bool singleFile = false;
     bool cueFile = true;
@@ -764,22 +823,8 @@ int cmdRip(const std::vector<std::string>& args) {
         for (const std::string& l : gaps.logLines()) log << l << "\n";
         log << "\n";
     }
-    if (!cddb.enabled) {
-        log << "CDDB lookup: disabled\n\n";
-    } else if (!found.found) {
-        log << "CDDB lookup (" << cddb.options.server << "): " << found.error << "\n\n";
-    } else {
-        log << "CDDB lookup (" << cddb.options.server << "): " << found.matches.size()
-            << (found.exact ? " exact" : " inexact") << " match(es)\n";
-        for (size_t i = 0; i < found.matches.size(); ++i) {
-            const cdr::CddbMatch& m = found.matches[i];
-            log << (i == found.chosen ? "  * " : "    ") << i + 1 << ". " << m.category << "/" << m.discId << "  "
-                << m.title << "\n";
-        }
-        log << "Artist: " << album.artist << "\nAlbum: " << album.title << "\nYear: " << album.year
-            << "\nGenre: " << album.genre << "\n\n";
-    }
-
+    for (const std::string& l : cdr::cddbLookupLogLines(cddb.enabled, cddb.options.server, found)) log << l << "\n";
+    log << "\n";
 
     cdr::Ripper ripper(*d.drive, toc, options);
     int problems = 0;
@@ -958,6 +1003,91 @@ int cmdOffset(const std::vector<std::string>& args) {
     return 0;
 }
 
+// cdreader config [<key> [<value> | --unset]] (#38).
+int cmdConfig(const std::vector<std::string>& args) {
+    const std::vector<ConfigKey> keys = configKeys();
+    cdr::SettingsStore store = loadSettings();
+    if (args.size() == 1) {
+        std::printf("Settings (%s):\n", settingsPath().u8string().c_str());
+        for (const ConfigKey& k : keys) {
+            const std::string* v = store.find(k.key);
+            std::printf("  %-17s %s\n", k.key, v ? v->c_str() : ("(default: " + k.defaultValue + ")").c_str());
+        }
+        for (const auto& [key, value] : store.entries()) {
+            bool known = false;
+            for (const ConfigKey& k : keys) known = known || key == k.key;
+            if (!known) std::printf("  %-17s %s  (unknown key, kept)\n", key.c_str(), value.c_str());
+        }
+        const std::string error = cdr::cddbConfigError(cdr::cddbConfigFromSettings(store));
+        if (!error.empty()) std::printf("warning: invalid setting %s (ignored)\n", error.c_str());
+        return 0;
+    }
+    const std::string& key = args[1];
+    const ConfigKey* entry = nullptr;
+    for (const ConfigKey& k : keys)
+        if (key == k.key) entry = &k;
+    if (entry == nullptr) {
+        std::string names;
+        for (const ConfigKey& k : keys) names += (names.empty() ? "" : ", ") + std::string(k.key);
+        throw UsageError("unknown setting '" + key + "' (settings: " + names + ")");
+    }
+    if (args.size() == 2) {
+        const std::string* v = store.find(key);
+        std::printf("%s\n", v ? v->c_str() : ("(default: " + entry->defaultValue + ")").c_str());
+        return 0;
+    }
+    if (args.size() > 3) throw UsageError("config takes one value (quote values with spaces)");
+    const std::string value = args[2] == "--unset" ? std::string() : args[2];
+    cdr::CddbConfig config = cdr::cddbConfigFromSettings(store);
+    if (key == cdr::kSettingCddbServer) config.server = value;
+    else if (key == cdr::kSettingCddbEmail) config.email = value;
+    else if (key == cdr::kSettingCddbAppName) config.appName = value;
+    else if (key == cdr::kSettingCddbAppVersion) config.appVersion = value;
+    const cdr::CddbConfigProblem problem = key == cdr::kSettingCddbServer  ? cdr::checkCddbServer(value)
+                                           : key == cdr::kSettingCddbEmail ? cdr::checkCddbEmail(value)
+                                                                           : cdr::checkCddbHelloField(value);
+    if (problem != cdr::CddbConfigProblem::None)
+        throw UsageError(key + ": " + cdr::describeCddbConfigProblem(problem));
+    cdr::storeCddbConfig(store, config);
+    writeTextFile(settingsPath(), store.serialize());
+    if (value.empty()) std::printf("%s reset to the default (%s)\n", key.c_str(), entry->defaultValue.c_str());
+    else std::printf("%s = %s\n", key.c_str(), value.c_str());
+    if (key == cdr::kSettingCddbEmail && !value.empty())
+        std::printf("This address is sent to the CDDB server with every lookup (try it: cdreader cddb-test).\n");
+    std::printf("Saved in %s\n", settingsPath().u8string().c_str());
+    return 0;
+}
+
+// cdreader cddb-test [CDDB options] (#38): one "stat" request with the hello of the lookups.
+int cmdCddbTest(const std::vector<std::string>& args) {
+    CddbSettings cddb = savedCddbSettings();
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string a = args[i];
+        if ((a != "--cddb-server" && a != "--cddb-hello") || !parseCddbOption(args, i, cddb))
+            throw UsageError("unknown option '" + a + "' (cddb-test takes --cddb-server and --cddb-hello)");
+    }
+    const cdr::CddbClientInfo& c = cddb.options.client;
+    std::printf("Server: %s\n", cddb.options.server.c_str());
+    std::printf("Hello:  %s %s %s %s%s\n", c.user.c_str(), c.host.c_str(), c.name.c_str(), c.version.c_str(),
+                c.anonymous() ? "  (anonymous: no contact e-mail address set)" : "");
+    std::printf("Sending '%s' ...\n", cdr::kCddbTestCommand);
+    std::fflush(stdout);
+    cdr::CddbTestResult r;
+    try {
+        cdr::win::WinHttpClient http(std::string("cdreader/") + kVersion);
+        r = cdr::testCddbConnection(http, cddb.options);
+    } catch (const std::exception& e) {
+        r.message = e.what();
+    }
+    std::printf("CDDB test %s\n", r.summary().c_str());
+    if (r.hint != cdr::CddbHint::None) std::printf("%s\n", cdr::cddbHintText(r.hint).c_str());
+    if (r.missingEmail)
+        std::printf("Note: gnudb.org wants a contact e-mail address in the greeting and may refuse lookups\n"
+                    "without one: cdreader config %s <user@host>\n",
+                    cdr::kSettingCddbEmail);
+    return r.ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main() {
@@ -977,6 +1107,8 @@ int main() {
         if (args[0] == "rip") return cmdRip(args);
         if (args[0] == "offset") return cmdOffset(args);
         if (args[0] == "offsets") return cmdOffsets();
+        if (args[0] == "config") return cmdConfig(args);
+        if (args[0] == "cddb-test") return cmdCddbTest(args);
         throw UsageError("unknown command '" + args[0] + "'");
     } catch (const UsageError& e) {
         std::fprintf(stderr, "error: %s\n\n", e.what());

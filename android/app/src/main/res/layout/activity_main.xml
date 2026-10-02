@@ -65,87 +65,165 @@
         android:text="@string/advanced_collapsed"
         android:textAppearance="@android:style/TextAppearance.Material.Subhead" />
 
-    <LinearLayout
+    <!-- Scrolls when the settings do not fit (small screens, keyboard open);
+         shares the height with the track list while open. -->
+    <ScrollView
         android:id="@+id/groupAdvanced"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:paddingStart="16dp"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="false"
         android:visibility="gone">
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
+            android:orientation="vertical"
+            android:paddingStart="16dp">
 
-            <TextView
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/read_offset" />
+
+                <EditText
+                    android:id="@+id/editOffset"
+                    android:layout_width="96dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:importantForAutofill="no"
+                    android:inputType="numberSigned"
+                    android:text="0" />
+
+                <!-- Where the value came from (#37): 「(ドライブ … の保存値)」 / 「(自動検出: …)」. -->
+                <TextView
+                    android:id="@+id/textOffsetSource"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:ellipsize="end"
+                    android:maxLines="2"
+                    android:visibility="gone" />
+            </LinearLayout>
+
+            <!-- Read offset auto-detection with AccurateRip (#37); 「検出を中止」 while it runs. -->
+            <Button
+                android:id="@+id/buttonDetectOffset"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="@string/read_offset" />
+                android:enabled="false"
+                android:text="@string/detect_offset" />
+
+            <CheckBox
+                android:id="@+id/checkVerify"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/verify" />
+
+            <CheckBox
+                android:id="@+id/checkC2"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:text="@string/use_c2" />
+
+            <!-- Drive cache defeat before re-reads (#34): 自動 / FUA / 追い出し / なし. -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/cache_mode" />
+
+                <Spinner
+                    android:id="@+id/spinnerCache"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:entries="@array/cache_modes" />
+            </LinearLayout>
+
+            <!-- CDDB server and contact e-mail address (#38). -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/cddb_group"
+                android:textAppearance="@android:style/TextAppearance.Material.Body2" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:labelFor="@+id/editCddbServer"
+                android:text="@string/cddb_server" />
 
             <EditText
-                android:id="@+id/editOffset"
-                android:layout_width="96dp"
+                android:id="@+id/editCddbServer"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
                 android:importantForAutofill="no"
-                android:inputType="numberSigned"
-                android:text="0" />
-
-            <!-- Where the value came from (#37): 「(ドライブ … の保存値)」 / 「(自動検出: …)」. -->
-            <TextView
-                android:id="@+id/textOffsetSource"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:layout_weight="1"
-                android:ellipsize="end"
-                android:maxLines="2"
-                android:visibility="gone" />
-        </LinearLayout>
-
-        <!-- Read offset auto-detection with AccurateRip (#37); 「検出を中止」 while it runs. -->
-        <Button
-            android:id="@+id/buttonDetectOffset"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:enabled="false"
-            android:text="@string/detect_offset" />
-
-        <CheckBox
-            android:id="@+id/checkVerify"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="@string/verify" />
-
-        <CheckBox
-            android:id="@+id/checkC2"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:checked="true"
-            android:text="@string/use_c2" />
-
-        <!-- Drive cache defeat before re-reads (#34): 自動 / FUA / 追い出し / なし. -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
+                android:inputType="textUri"
+                android:maxLines="1"
+                android:textSize="14sp" />
 
             <TextView
-                android:layout_width="wrap_content"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="@string/cache_mode" />
+                android:layout_marginTop="4dp"
+                android:labelFor="@+id/editCddbEmail"
+                android:text="@string/cddb_email" />
 
-            <Spinner
-                android:id="@+id/spinnerCache"
-                android:layout_width="wrap_content"
+            <EditText
+                android:id="@+id/editCddbEmail"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                android:entries="@array/cache_modes" />
+                android:autofillHints="emailAddress"
+                android:hint="@string/cddb_email_hint"
+                android:inputType="textEmailAddress"
+                android:maxLines="1"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/cddb_email_note"
+                android:textAppearance="@android:style/TextAppearance.Material.Caption" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/buttonCddbTest"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/cddb_test" />
+
+                <!-- Result of the connection test. -->
+                <TextView
+                    android:id="@+id/textCddbTest"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:textIsSelectable="true" />
+            </LinearLayout>
         </LinearLayout>
-    </LinearLayout>
+    </ScrollView>
 
     <LinearLayout
         android:layout_width="match_parent"
