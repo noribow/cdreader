@@ -131,6 +131,12 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="@string/format_vorbis" />
+
+                <RadioButton
+                    android:id="@+id/radioMka"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/format_mka" />
             </RadioGroup>
         </HorizontalScrollView>
     </LinearLayout>

@@ -65,9 +65,13 @@ void printUsage() {
         "                        oggflac = FLAC in an Ogg container (.oga, lossless)\n"
         "                        opus = Ogg Opus (.opus), vorbis = Ogg Vorbis (.ogg)\n"
         "                        (when built with libopus / libvorbis)\n"
+        "                        mka = Matroska (.mka) with FLAC; mka-pcm, mka-opus,\n"
+        "                        mka-vorbis = Matroska with that codec\n"
         "  -b, --bitrate <kbps>  Lossy formats: target bitrate in kbit/s (VBR)\n"
-        "                        opus: 6-510 (default 160), vorbis: 45-500 (average)\n"
-        "  -q, --quality <q>     vorbis: VBR quality -1..10 (default 5, about 160 kbit/s)\n"
+        "                        opus, mka-opus: 6-510 (default 160),\n"
+        "                        vorbis, mka-vorbis: 45-500 (average)\n"
+        "  -q, --quality <q>     vorbis, mka-vorbis: VBR quality -1..10 (default 5,\n"
+        "                        about 160 kbit/s)\n"
         "  -t, --tracks <list>   Tracks to rip, e.g. 1,3-5 (default: all audio tracks)\n"
         "  -r, --retries <n>     Retries per failing read (default: 5)\n"
         "      --offset <n>      Drive read offset correction in samples, e.g. 6 or -472\n"
@@ -77,7 +81,7 @@ void printUsage() {
         "      --single-file     Rip the tracks into one file (an image of the disc);\n"
         "                        the CUE sheet then marks the track positions. FLAC\n"
         "                        and Ogg FLAC images also carry the CUE sheet inside\n"
-        "                        the file\n"
+        "                        the file, Matroska images a chapter per track\n"
         "      --no-cue-file     Do not write the external .cue file\n"
         "      --no-isrc         Do not read the MCN (catalog number) and the ISRCs\n"
         "                        from the Q sub-channel (some drives are slow at it)\n"
@@ -576,8 +580,10 @@ int cmdRip(const std::vector<std::string>& args) {
         writer->open(dir / fs::u8path(imageName), album.forTrack(0, toc.lastTrack));
         log << "Single file: " << imageName << "\n";
         if (writer->canEmbedCueSheet()) {
-            std::printf("Embedded CUE sheet: CUESHEET block and tag in %s\n\n", imageName.c_str());
-            log << "Embedded CUE sheet: CUESHEET block and tag\n";
+            // FLAC: CUESHEET block + tag; Matroska: chapters (#23).
+            const char* what = extension == "mka" ? "Matroska chapters (one per track)" : "CUESHEET block and tag";
+            std::printf("Embedded CUE sheet: %s in %s\n\n", what, imageName.c_str());
+            log << "Embedded CUE sheet: " << what << "\n";
         }
     }
     for (const cdr::Track& t : selected) {

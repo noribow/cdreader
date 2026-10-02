@@ -39,8 +39,10 @@ add_library(cdreader_core STATIC
   core/src/file_naming.cpp
   core/src/flac_encoder.cpp
   core/src/flac_writer.cpp
+  core/src/matroska.cpp
   core/src/md5.cpp
   core/src/metadata.cpp
+  core/src/mka_writer.cpp
   core/src/ogg.cpp
   core/src/ogg_flac_writer.cpp
   core/src/resampler.cpp
@@ -139,6 +141,12 @@ if(CDREADER_BUILD_TESTS)
   target_link_libraries(cdreader_rip_session_tests PRIVATE cdreader_rip_session cdreader_usb)
   add_test(NAME cdreader_rip_session_tests COMMAND cdreader_rip_session_tests)
 
+  # Matroska writer (#23): EBML layout and the codecs inside, decoded in process.
+  add_executable(cdreader_mka_tests tests/flac_decoder.cpp tests/mka_tests.cpp)
+  target_include_directories(cdreader_mka_tests PRIVATE tests)
+  target_link_libraries(cdreader_mka_tests PRIVATE cdreader_core)
+  add_test(NAME cdreader_mka_tests COMMAND cdreader_mka_tests)
+
   # Round trip through the reference FLAC tool (skipped when `flac` is not installed).
   add_executable(cdreader_flac_roundtrip tests/flac_roundtrip.cpp)
   target_include_directories(cdreader_flac_roundtrip PRIVATE tests)
@@ -201,4 +209,20 @@ if(CDREADER_BUILD_TESTS)
   endforeach()
   add_test(NAME ogg_flac_check COMMAND cdreader_ogg_flac_check ${_oggflac_tools})
   set_tests_properties(ogg_flac_check PROPERTIES SKIP_RETURN_CODE 77)
+
+  # Matroska output checked with mkvinfo (mkvtoolnix), ffprobe and ffmpeg.
+  # Skipped when none is installed.
+  add_executable(cdreader_mka_check tests/mka_check.cpp)
+  target_include_directories(cdreader_mka_check PRIVATE tests)
+  target_link_libraries(cdreader_mka_check PRIVATE cdreader_core)
+  set(_mka_tools)
+  foreach(_tool mkvinfo ffprobe ffmpeg)
+    string(TOUPPER "${_tool}" _var)
+    find_program(${_var}_EXECUTABLE ${_tool})
+    if(${_var}_EXECUTABLE)
+      list(APPEND _mka_tools --${_tool} "${${_var}_EXECUTABLE}")
+    endif()
+  endforeach()
+  add_test(NAME mka_check COMMAND cdreader_mka_check ${_mka_tools})
+  set_tests_properties(mka_check PROPERTIES SKIP_RETURN_CODE 77)
 endif()
