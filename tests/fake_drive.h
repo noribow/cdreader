@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <deque>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -124,6 +125,15 @@ public:
     // many reads, with the CRC of the right frame (caught by the CRC, not
     // when the drive reports none).
     std::map<uint32_t, int> wrongQ;
+    // Drive quirks around the Q sub-channel (#41):
+    // The Q frame returned with sector n is the one of sector n + qDelay
+    // (READ CD with sub-channel data; its absolute time says n + qDelay).
+    int qDelay = 0;
+    // Positions whose Q frame is mode 2 / 3 (MCN / ISRC), in addition to otherAdrEvery.
+    std::set<uint32_t> otherAdrSectors;
+    // Sectors (as requested) for which formatted Q (selection 010b) comes back
+    // as 16 zero bytes, while raw P-W and READ SUB-CHANNEL work.
+    std::set<uint32_t> formattedQBlank;
     int subQReads = 0;  // READ CD commands with sub-channel data (not counted in readCommands)
     std::vector<uint8_t> lastReadCdCdb;
 

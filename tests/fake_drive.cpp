@@ -101,9 +101,9 @@ void FakeDrive::qFrame(uint32_t lba, uint8_t q[12]) const {
         if (it != laterIndexes.end())
             for (uint32_t at : it->second) index += lba >= at ? 1 : 0;
     }
-    if (otherAdrEvery > 0 && lba % otherAdrEvery == otherAdrEvery / 2) {
+    if ((otherAdrEvery > 0 && lba % otherAdrEvery == otherAdrEvery / 2) || otherAdrSectors.count(lba) != 0) {
         // Mode 2 (MCN digits) / mode 3 (ISRC): no position, only AFRAME in byte 9.
-        const bool isrc = (lba / otherAdrEvery) % 2 == 1;
+        const bool isrc = (otherAdrEvery > 0 ? lba / otherAdrEvery : lba) % 2 == 1;
         q[0] = uint8_t(control << 4 | (isrc ? 3 : 2));
         for (int b = 1; b < 9; ++b) q[b] = uint8_t(0x49 + b);
         q[9] = bcd((lba + cdr::kPregapSectors) % cdr::kSectorsPerSecond);
@@ -119,9 +119,24 @@ void FakeDrive::qFrame(uint32_t lba, uint8_t q[12]) const {
 }
 
 // Sub-channel data of one sector for a READ CD selection (1 raw P-W, 2 formatted Q).
-void FakeDrive::subQ(uint32_t lba, uint8_t selection, uint8_t* out) {
+void FakeDrive::subQ(uint32_t requested, uint8_t selection, uint8_t* out) {
+    if (selection == 2 && formattedQBlank.count(requested) != 0) {
+        std::memset(out, 0, 16);
+        return;
+    }
+    const int64_t position = int64_t(requested) + qDelay;
+    const uint32_t lba = uint32_t(std::max<int64_t>(0, position));
     uint8_t q[12];
     qFrame(lba, q);
+    if (position < 0) {
+        // Before LBA 0: the pregap of track 1 (INDEX 00), counting down.
+        q[0] = uint8_t((q[0] & 0xF0) | 1);
+        q[1] = 0x01;
+        q[2] = 0x00;
+        putMsf(q + 3, uint32_t(-position));
+        putMsf(q + 7, uint32_t(position + cdr::kPregapSectors));
+        setCrc(q);
+    }
     const bool corrupt = fault(badQ, lba);
     if (fault(wrongQ, lba) && (q[0] & 0x0F) == 1) {
         // The other side of the boundary: INDEX 00 of the next track, or the

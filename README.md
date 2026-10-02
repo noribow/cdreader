@@ -594,6 +594,22 @@ TOC 上は前のトラックの末尾に含まれます。また、1 曲目の `
   位置はフレーム自身の絶対アドレスを使い、要求したセクタから 10 セクタを超えて離れたフレームは捨てます。
   見つけた境界は前後のセクタを読み直して確認し、矛盾した場合 (CRC を返さないドライブが誤ったフレームを返した場合) は
   「同じ位置で 2 回一致したフレームだけを使う」モードで探索し直します。それでも決まらないトラックは「不明」としてプリギャップなし扱いにします。
+- 位置が見つからないときの再試行 (#41): 境界の近くで探索範囲が数セクタに狭まると、通常の 3 セクタの読み取りは何度やっても同じセクタになり、
+  そこが ADR 2 / 3 のフレームだったり、ドライブが隣のセクタの Q を返したりすると「不明」になっていました。現在は、通常の読み取りで
+  見つからない位置について、次の順に試してからあきらめます (いずれも読み取り回数の上限に数えます)。
+  1. 目的の位置を中心に 16 セクタを読む (広い読み取り)、続けてその前後 16 セクタずつ (範囲に関係する場合のみ)
+  2. 自動選択のときだけ、その位置に限って別の読み取り方法: フォーマット済み Q → 生の P-W → `READ SUB-CHANNEL` (現在位置)。
+     対応していない方法は一度拒否されたら以後使いません
+  3. どの方法でも位置の入ったフレームがない (例: 境界の先頭セクタ自体が ISRC のフレーム) 場合、未確定のセクタが 3 以下なら、
+     新しいインデックスとして確認できた最初のセクタを境界とし、`INDEX 00 may start 1 sector earlier: no position in the Q frame at LBA …`
+     と記録します (誤差は最大でその数のセクタ)。
+- Q の遅延 (Q delay): セクタ n と一緒に n ± k の Q を返すドライブがあります。位置は常に Q フレーム自身の絶対アドレスを使うため結果はずれませんが、
+  狭い範囲を読むときに目的のフレームが入らなくなります。`READ CD` で読んだ位置付きフレーム (CRC エラーのものは除く) の「フレームの位置 − 読んだセクタ」が
+  8 個以上そろい 90 % 以上一致した場合はそれを遅延とみなし、読む位置をその分ずらします (`rip.log` に `Q delay: +1 sector …`)。
+- 一度失敗した次のトラックのプリギャップの中で前のトラックの `INDEX 02` 以降を探し直すことはしません
+  (`INDEX 02+: not searched (the pregap of track N is unknown)`。以前は同じ探索を繰り返して同じ理由で失敗していました)。
+- 診断: 読んだ Q フレームを 1 回ずつ「使った」か理由別 (ADR 2/3・CRC・bad BCD・要求セクタから 10 を超えて離れた・探索範囲外・その他) に数え、
+  「フレームの位置 − 読んだセクタ」の分布とあわせて `rip.log` に 1 行で記録します。「不明」になったトラックには、その位置での内訳を付けます。
 - コマンドに対応していない・正しいフレームを返さないドライブでは検出をあきらめ、従来どおり `INDEX 01` だけの CUE シートになります (リッピングは続行)。
 - HTOA は TOC だけで分かります (トラック 1 の開始 LBA > 0)。検出時は LBA 0 とトラック 1 の直前が「トラック 1・INDEX 00」であることを Q で確認します。
 - 結果は `rip.log` と `cdreader toc` に表示します (所要時間・読み取り回数を含む):
@@ -604,8 +620,14 @@ HTOA (hidden track before track 1): 00:32.00, LBA 0-2399, confirmed by the Q sub
 Track  1  pregap 00:32.00  INDEX 00 at LBA 0 (HTOA)
 Track  2  pregap 00:02.00  INDEX 00 at LBA 18350
 Track  3  pregap 00:00.00  INDEX 02 at LBA 40125
-Track  4  pregap unknown (no usable Q frame near LBA 51230)
+Track  4  pregap unknown (no usable Q frame near LBA 51230 [52 Q frames: 6 ADR 2/3, 46 out of window, position delta +1..+2; also tried raw P-W, READ SUB-CHANNEL])
+Track  5  pregap 00:01.15  INDEX 00 at LBA 60327  (INDEX 00 may start 1 sector earlier: no position in the Q frame at LBA 60326)
+Q frames: 402 read, 301 used; rejected: 9 ADR 2/3, 92 out of window; position delta min +1 / max +2 / median +1
+Q retries: 3 positions found with a wider read, 1 with READ CD with raw P-W sub-channel
 ```
+
+`Q frames` の行は読んだフレーム数・使ったフレーム数・捨てた理由の内訳・位置のずれ (最小 / 最大 / 中央値) です。
+遅延が一定なら `Q delay: +1 sector (the Q frame read with sector n is that of n + 1; reads moved to make up for it)` の行が加わります。
 
 CUE シート・FLAC への反映:
 
@@ -815,7 +837,10 @@ MCN / ISRC は仮想ドライブの `READ SUB-CHANNEL` 応答で、CDB のバイ
 非対応ドライブ (ILLEGAL REQUEST) を検証します。
 プリギャップ・HTOA は、仮想ドライブがセクタごとのサブチャンネル Q (フォーマット済み Q・生の P-W・`READ SUB-CHANNEL` 現在位置) を返し、
 Q の解析 (BCD・CRC-16・デインターリーブ)、さまざまな長さのギャップ (0・1・150・157・ほぼ 1 トラック分)、HTOA、`INDEX 02` 以降、
-MCN / ISRC フレームや CRC エラー・CRC なしの誤ったフレームの混入、非対応ドライブ、読み取り回数の上限、CUE シート (シングルファイル・トラックごと)、
+MCN / ISRC フレームや CRC エラー・CRC なしの誤ったフレームの混入、非対応ドライブ、読み取り回数の上限、
+#41 のディスクの配置 (境界の先頭セクタが ISRC のフレーム、+2 セクタの Q 遅延。旧ロジックで「不明」になることを再現)、
+-3〜+3 セクタの Q 遅延の検出と補正、境界付近の ADR 2/3 の連続、境界付近だけフォーマット済み Q が空になるドライブでの生の P-W /
+`READ SUB-CHANNEL` への切り替え、診断行の書式、再試行でも読み取り回数の上限を守ること、CUE シート (シングルファイル・トラックごと)、
 `CUESHEET` ブロックのバイト列、HTOA を含むイメージが各トラックの連結と一致すること (オフセット補正あり) を検証します。
 HTOA・プリギャップを含むイメージは Ogg FLAC (`CUESHEET` ブロックが FLAC と同一、`flac -d --cue=1.0-1.1` / `2.0-2.1` / `3.2` で切り出し)、
 MKA (チャプターの時刻・「Hidden Track」チャプター、`ffprobe` での読み取り)、ALAC (イメージの PCM がそのまま入ること) でも確認します。
