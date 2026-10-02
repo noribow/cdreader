@@ -40,6 +40,14 @@ std::string cueFileType(const std::string& extension);
 // the text contains non-ASCII characters; see cue_sheet.cpp.
 std::string formatCueSheet(const AlbumMetadata& album, const std::vector<CueTrack>& tracks);
 
+// A CUE sheet carried inside a single-file (disc image) output, for formats
+// that support it (FLAC: CUESHEET metadata block + CUESHEET tag, #16).
+struct EmbeddedCueSheet {
+    std::vector<CueTrack> tracks;  // INDEX 01 positions relative to the start of the file
+    uint32_t totalSectors = 0;     // length of the image: position of the lead-out
+    std::string text;              // the CUE sheet as text, as written to the .cue file
+};
+
 // "mm:ss:ff" as used by INDEX lines (minutes may exceed 99).
 std::string formatCueTime(uint32_t sectors);
 

@@ -554,7 +554,7 @@ std::vector<uint8_t> FrameEncoder::encode(const int32_t* left, const int32_t* ri
 
 // --- Metadata -----------------------------------------------------------------
 
-std::vector<uint8_t> vorbisComment(const TrackMetadata& m, const std::string& vendor) {
+std::vector<uint8_t> vorbisComment(const TrackMetadata& m, const std::string& vendor, const std::string& cueSheet) {
     std::vector<std::string> fields;
     auto add = [&](const char* name, const std::string& value) {
         if (!value.empty()) fields.push_back(std::string(name) + "=" + value);
@@ -568,6 +568,7 @@ std::vector<uint8_t> vorbisComment(const TrackMetadata& m, const std::string& ve
     add("DATE", m.year);
     add("GENRE", m.genre);
     add("CDDB", m.discId);
+    add("CUESHEET", cueSheet);
 
     std::vector<uint8_t> v;
     put32le(v, uint32_t(vendor.size()));
@@ -577,6 +578,57 @@ std::vector<uint8_t> vorbisComment(const TrackMetadata& m, const std::string& ve
         put32le(v, uint32_t(f.size()));
         v.insert(v.end(), f.begin(), f.end());
     }
+    return v;
+}
+
+namespace {
+
+// CUESHEET layout (FLAC format, METADATA_BLOCK_CUESHEET).
+constexpr size_t kCueHeaderBytes = 128 + 8 + 1 + 258 + 1;  // MCN, lead-in, flags, reserved, track count
+constexpr size_t kCueTrackBytes = 8 + 1 + 12 + 1 + 13 + 1;  // offset, number, ISRC, flags, reserved, index count
+constexpr size_t kCueIndexBytes = 8 + 1 + 3;                // offset, number, reserved
+constexpr uint64_t kCdLeadInSamples = 2 * 44100;            // the 2-second pregap before LBA 0
+constexpr uint8_t kLeadOutTrack = 170;
+
+void putBigEndian(std::vector<uint8_t>& v, uint64_t x, int bytes) {
+    for (int i = bytes - 1; i >= 0; --i) v.push_back(uint8_t(x >> (8 * i)));
+}
+
+}  // namespace
+
+size_t cueSheetLeadOutOffsetPosition(size_t tracks) {
+    return kCueHeaderBytes + tracks * (kCueTrackBytes + kCueIndexBytes);
+}
+
+std::vector<uint8_t> cueSheet(const EmbeddedCueSheet& cue, uint64_t leadOutSamples) {
+    if (cue.tracks.size() > 99) throw std::invalid_argument("a CD has at most 99 tracks");
+    const bool isCd = leadOutSamples % kSamplesPerSector == 0;
+    for (const CueTrack& t : cue.tracks) {
+        if (t.number < 1 || t.number > 99) throw std::invalid_argument("CD track numbers are 1..99");
+        if (uint64_t(t.startSectors) * kSamplesPerSector >= leadOutSamples && leadOutSamples > 0)
+            throw std::invalid_argument("CUE track starts after the end of the image");
+    }
+
+    std::vector<uint8_t> v(128, 0);  // media catalog number: unknown
+    putBigEndian(v, isCd ? kCdLeadInSamples : 0, 8);
+    v.push_back(isCd ? 0x80 : 0x00);
+    v.resize(v.size() + 258, 0);
+    v.push_back(uint8_t(cue.tracks.size() + 1));
+    for (const CueTrack& t : cue.tracks) {
+        putBigEndian(v, uint64_t(t.startSectors) * kSamplesPerSector, 8);
+        v.push_back(uint8_t(t.number));
+        v.resize(v.size() + 12, 0);                          // ISRC: unknown
+        v.push_back(uint8_t(t.preEmphasis ? 0x40 : 0x00));   // audio track, pre-emphasis flag
+        v.resize(v.size() + 13, 0);
+        v.push_back(1);                                      // one index point: INDEX 01 at the track start
+        putBigEndian(v, 0, 8);
+        v.push_back(1);
+        v.resize(v.size() + 3, 0);
+    }
+    putBigEndian(v, leadOutSamples, 8);
+    v.push_back(kLeadOutTrack);
+    v.resize(v.size() + 12 + 1 + 13, 0);
+    v.push_back(0);  // the lead-out has no index points
     return v;
 }
 
