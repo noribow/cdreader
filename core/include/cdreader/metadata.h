@@ -17,6 +17,8 @@ struct TrackMetadata {
     std::string genre;
     std::string year;
     std::string discId;       // CDDB disc id as 8 hex digits
+    std::string isrc;         // ISRC from the Q sub-channel (12 characters, #22)
+    std::string mcn;          // media catalog number (13 digits, UPC / EAN), disc level
 };
 
 struct AlbumMetadata {
@@ -27,6 +29,9 @@ struct AlbumMetadata {
     std::string discId;
     std::vector<std::string> trackTitles;   // index 0 = track 1
     std::vector<std::string> trackArtists;  // optional, same indexing
+    // Read from the disc's Q sub-channel (#22), not from CDDB.
+    std::string mcn;                        // media catalog number
+    std::vector<std::string> trackIsrcs;    // index 0 = track 1; empty = unknown
 
     // Metadata for track `number` (1-based) of a disc with `total` tracks.
     TrackMetadata forTrack(int number, int total) const;

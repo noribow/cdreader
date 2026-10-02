@@ -81,6 +81,8 @@ cdr::TrackMetadata metadata() {
     m.year = "1999";
     m.genre = "Rock";
     m.discId = "0A0B0C03";
+    m.isrc = "JPXX09912345";
+    m.mcn = "4988001234567";
     return m;
 }
 
@@ -202,7 +204,8 @@ void checkTrack(Checker& c, const std::string& format, size_t samples) {
         const std::map<std::string, std::string> want = {
             {"title", m.title},    {"artist", m.artist},          {"album", m.album},
             {"track", "3"},        {"total_parts", "12"},         {"date_released", "1999"},
-            {"genre", "rock"},     {"cddb", "0a0b0c03"}};
+            {"genre", "rock"},     {"cddb", "0a0b0c03"},          {"isrc", "jpxx09912345"},
+            {"barcode", "4988001234567"}};
         bool ok = !text.empty();
         for (const auto& [key, value] : want) {
             const bool found = text.find("tag:" + key + "=" + lower(value) + "\n") != std::string::npos;
@@ -225,6 +228,7 @@ void checkImage(Checker& c, const std::string& format) {
         t.startSectors = starts[i];
         t.title = "Song " + std::to_string(i + 1);
         t.performer = "Performer " + std::to_string(i + 1);
+        t.isrc = "JPXX0990000" + std::to_string(i + 1);
         cue.tracks.push_back(t);
     }
     cue.totalSectors = 4000;
@@ -246,7 +250,7 @@ void checkImage(Checker& c, const std::string& format) {
         std::istringstream lines(text);
         std::string line;
         std::vector<long long> chapterStarts, chapterEnds;
-        std::vector<std::string> titles, tracks;
+        std::vector<std::string> titles, tracks, isrcs;
         bool nsTimeBase = true;
         while (std::getline(lines, line)) {
             if (line.rfind("time_base=", 0) == 0) nsTimeBase = nsTimeBase && line == "time_base=1/1000000000";
@@ -254,14 +258,15 @@ void checkImage(Checker& c, const std::string& format) {
             else if (line.rfind("end=", 0) == 0) chapterEnds.push_back(std::atoll(line.c_str() + 4));
             else if (lower(line).rfind("tag:title=", 0) == 0) titles.push_back(line.substr(10));
             else if (lower(line).rfind("tag:track=", 0) == 0) tracks.push_back(line.substr(10));
+            else if (lower(line).rfind("tag:isrc=", 0) == 0) isrcs.push_back(line.substr(9));
         }
         bool ok = nsTimeBase && chapterStarts.size() == 3 && chapterEnds.size() == 3 && titles.size() == 3 &&
-                  tracks.size() == 3;
+                  tracks.size() == 3 && isrcs.size() == 3;
         for (size_t i = 0; ok && i < 3; ++i) {
             const uint32_t end = i + 1 < 3 ? starts[i + 1] : cue.totalSectors;
             ok = chapterStarts[i] == std::llround(double(starts[i]) * 1e9 / 75) &&
                  chapterEnds[i] == std::llround(double(end) * 1e9 / 75) && titles[i] == "Song " + std::to_string(i + 1) &&
-                 tracks[i] == std::to_string(i + 1);
+                 tracks[i] == std::to_string(i + 1) && isrcs[i] == "JPXX0990000" + std::to_string(i + 1);
         }
         c.expect(ok, "ffprobe chapters at the CUE positions: " + label);
         if (!ok) std::printf("%s\n", text.c_str());
@@ -269,7 +274,8 @@ void checkImage(Checker& c, const std::string& format) {
         const std::string tags = lower(c.probe(file, "-show_entries format_tags -of default=noprint_wrappers=1"));
         const bool albumOk = tags.find("tag:title=album\n") != std::string::npos &&
                              tags.find("tag:artist=album artist\n") != std::string::npos &&
-                             tags.find("tag:total_parts=12\n") != std::string::npos;
+                             tags.find("tag:total_parts=12\n") != std::string::npos &&
+                             tags.find("tag:barcode=4988001234567\n") != std::string::npos;
         c.expect(albumOk, "ffprobe album tags: " + label);
         if (!albumOk) std::printf("%s\n", tags.c_str());
     }

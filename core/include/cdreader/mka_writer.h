@@ -28,11 +28,12 @@ namespace cdr {
 // Opus / Vorbis are only available when built in (codecAvailable()).
 // Tags (Matroska Tags, RFC 9559 section 5.1.8):
 //   level 50 (ALBUM): TITLE and ALBUM = album, ARTIST = album artist,
-//                     TOTAL_PARTS, DATE_RELEASED, GENRE, CDDB (disc id)
-//   level 30 (TRACK): TITLE, ARTIST, PART_NUMBER (per-track files)
+//                     TOTAL_PARTS, DATE_RELEASED, GENRE, CDDB (disc id),
+//                     BARCODE (the disc's MCN, when read)
+//   level 30 (TRACK): TITLE, ARTIST, PART_NUMBER, ISRC (per-track files)
 // Disc images (setEmbeddedCueSheet()) get a chapter per CUE track instead of
 // the level 30 tag, with a level 30 tag per chapter (TITLE, ARTIST,
-// PART_NUMBER).
+// PART_NUMBER, ISRC).
 class MkaWriter : public AudioWriter {
 public:
     enum class Codec { Flac, Pcm, Opus, Vorbis };

@@ -564,6 +564,18 @@ TEST(mka_tags_per_track) {
     const std::vector<ebml::Element> tags = ebml::all(p.d, p.topLevel(id::kTags), id::kTag);
     CHECK_EQ(tags.size(), size_t(2));
 
+    // ISRC (track level) and the disc's MCN as BARCODE (album level), when read (#22).
+    cdr::TrackMetadata withCodes = trackMetadata();
+    withCodes.isrc = "JPXX09912345";
+    withCodes.mcn = "4988001234567";
+    const Parsed coded = encodeFile("mka", s.pcm, withCodes);
+    const TagList codedAlbum = tagsOf(coded, 50);
+    CHECK(!codedAlbum.empty() && codedAlbum.back() == std::make_pair(std::string("BARCODE"), std::string("4988001234567")));
+    CHECK(tagsOf(coded, 30) == TagList({{"TITLE", "\xE6\x9B\xB2\xE5\x90\x8D"},
+                                        {"ARTIST", "Track Artist"},
+                                        {"PART_NUMBER", "3"},
+                                        {"ISRC", "JPXX09912345"}}));
+
     // Without metadata there are no Tags at all.
     const Parsed bare = encodeFile("mka", s.pcm, cdr::TrackMetadata{});
     CHECK(!bare.hasTop(id::kTags));
@@ -581,7 +593,9 @@ TEST(mka_image_chapters_at_cue_positions) {
         t.performer = "Performer " + std::to_string(i + 1);
         cue.tracks.push_back(t);
     }
+    cue.tracks[0].isrc = "JPXX09900001";
     cue.totalSectors = 620;
+    cue.mcn = "4988001234567";  // the album metadata has none: taken from the CUE sheet
     cue.text = "REM test\r\n";
     const testsig::Signal s = testsig::music(size_t(cue.totalSectors) * cdr::kSamplesPerSector);
     cdr::TrackMetadata album = trackMetadata();
@@ -616,7 +630,9 @@ TEST(mka_image_chapters_at_cue_positions) {
     const TagList albumTags = tagsOf(p, 50);
     CHECK(!albumTags.empty() && albumTags[0] == std::make_pair(std::string("TITLE"), std::string("Album")));
     CHECK(tagsOf(p, 30).empty());
-    CHECK(tagsOf(p, 30, uids[0]) == TagList({{"TITLE", "Song 1"}, {"ARTIST", "Performer 1"}, {"PART_NUMBER", "1"}}));
+    CHECK(albumTags.back() == std::make_pair(std::string("BARCODE"), std::string("4988001234567")));
+    CHECK(tagsOf(p, 30, uids[0]) ==
+          TagList({{"TITLE", "Song 1"}, {"ARTIST", "Performer 1"}, {"PART_NUMBER", "1"}, {"ISRC", "JPXX09900001"}}));
     CHECK(tagsOf(p, 30, uids[1]) == TagList({{"ARTIST", "Performer 2"}, {"PART_NUMBER", "2"}}));
 
     // The audio is still the whole image.

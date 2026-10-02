@@ -10,6 +10,7 @@
     <string name="verify">2 回読みして比較 (低速)</string>
     <string name="format">形式</string>
     <string name="format_flac">FLAC</string>
+    <string name="format_oggflac">Ogg FLAC</string>
     <string name="format_wav">WAV</string>
     <string name="format_opus">Opus</string>
     <string name="format_vorbis">Vorbis</string>

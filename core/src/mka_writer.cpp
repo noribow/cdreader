@@ -63,8 +63,12 @@ public:
     std::string description() const override { return "FLAC (built-in encoder) in Matroska, lossless"; }
 
     mkv::AudioTrack start() override {
-        stream_.reset();
+        muxer_ = nullptr;
         position_ = 0;
+        stream_.start([this](const std::vector<uint8_t>& frame, unsigned samples) {
+            muxer_->addFrame(frame.data(), frame.size(), toNs(position_, kCdRate));
+            position_ += samples;
+        });
         mkv::AudioTrack t;
         t.codecId = "A_FLAC";
         t.bitDepth = 16;
@@ -73,23 +77,19 @@ public:
     }
 
     void write(const uint8_t* pcm, size_t bytes, mkv::Muxer& muxer) override {
-        stream_.write(pcm, bytes, sink(muxer));
+        muxer_ = &muxer;
+        stream_.write(pcm, bytes);
     }
 
     double finish(mkv::Muxer& muxer) override {
-        stream_.finish(sink(muxer));
+        muxer_ = &muxer;
+        if (!stream_.wholeSamples()) throw std::runtime_error("FLAC input ends in the middle of a sample");
+        stream_.finish();
         muxer.updateCodecPrivate(codecPrivate());
         return double(stream_.totalSamples()) * 1e9 / kCdRate;
     }
 
 private:
-    flac::StreamEncoder::FrameSink sink(mkv::Muxer& muxer) {
-        return [this, &muxer](const std::vector<uint8_t>& frame, unsigned samples) {
-            muxer.addFrame(frame.data(), frame.size(), toNs(position_, kCdRate));
-            position_ += samples;
-        };
-    }
-
     // "fLaC" and the STREAMINFO block, flagged as the last metadata block.
     std::vector<uint8_t> codecPrivate() const {
         std::vector<uint8_t> v = {'f', 'L', 'a', 'C', 0x80, 0, 0, 34};
@@ -99,7 +99,8 @@ private:
     }
 
     flac::StreamEncoder stream_;
-    uint64_t position_ = 0;  // samples given to the muxer so far
+    mkv::Muxer* muxer_ = nullptr;  // receives the frames (set by write() / finish())
+    uint64_t position_ = 0;        // samples given to the muxer so far
 };
 
 class MkaPcm : public MkaWriter::Encoder {
@@ -366,6 +367,7 @@ std::vector<mkv::Tag> MkaWriter::tagsFor(const TrackMetadata& m, const std::vect
     add(album, "DATE_RELEASED", m.year);
     add(album, "GENRE", m.genre);
     add(album, "CDDB", m.discId);
+    add(album, "BARCODE", !m.mcn.empty() ? m.mcn : cue ? cue->mcn : std::string());  // MCN (UPC / EAN), #22
     if (!album.simpleTags.empty()) tags.push_back(album);
 
     if (cue) {
@@ -377,6 +379,7 @@ std::vector<mkv::Tag> MkaWriter::tagsFor(const TrackMetadata& m, const std::vect
             add(tag, "TITLE", t.title);
             add(tag, "ARTIST", t.performer);
             add(tag, "PART_NUMBER", std::to_string(t.number));
+            add(tag, "ISRC", t.isrc);
             tags.push_back(tag);
         }
     } else {
@@ -386,6 +389,7 @@ std::vector<mkv::Tag> MkaWriter::tagsFor(const TrackMetadata& m, const std::vect
         add(track, "TITLE", m.title);
         add(track, "ARTIST", m.artist);
         if (m.trackNumber > 0) add(track, "PART_NUMBER", std::to_string(m.trackNumber));
+        add(track, "ISRC", m.isrc);
         if (!track.simpleTags.empty()) tags.push_back(track);
     }
     return tags;

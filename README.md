@@ -1,6 +1,6 @@
 # cdreader
 
-音楽 CD (CD-DA) をリッピングして WAV / FLAC / Opus / Ogg Vorbis / Matroska (MKA) ファイルに保存するツールです。
+音楽 CD (CD-DA) をリッピングして WAV / FLAC / Ogg FLAC / Opus / Ogg Vorbis / Matroska (MKA) ファイルに保存するツールです。
 対象環境は **Windows** (コマンドライン) と **Android** (USB 接続の外付け CD ドライブ) です。
 
 > **このプロジェクトは [Claude Code](https://claude.com/claude-code) (Anthropic の AI コーディングエージェント) を利用して開発しています。**
@@ -8,14 +8,16 @@
 
 ## 特徴
 
-- SCSI/MMC コマンド (`READ TOC`, `READ CD`) でドライブから直接オーディオセクタを読み取り
+- SCSI/MMC コマンド (`READ TOC`, `READ CD`, `READ SUB-CHANNEL`) でドライブから直接オーディオセクタを読み取り
 - 44.1 kHz / 16 bit / ステレオの WAV、または可逆圧縮の FLAC で保存 (トラックごとに `NN - 曲名.wav` / `NN - 曲名.flac`、曲名が不明なら `TrackNN.wav`)
 - FLAC エンコーダは外部ライブラリを使わない自前実装 (Android でもそのままビルド可能)。MD5 署名・タグ・シークテーブル付き
+- 同じ FLAC を Ogg コンテナに入れた **Ogg FLAC** (`.oga`) でも保存可能 (可逆圧縮、FLAC-to-Ogg マッピング 1.0)
 - 非可逆圧縮の **Opus** (Ogg Opus、`.opus`) と **Vorbis** (Ogg Vorbis、`.ogg`) でも保存可能 (libopus / libvorbis を使用。ビットレート・品質を指定可能)
 - **Matroska** (`.mka`) コンテナでも保存可能 (中身は FLAC / PCM / Opus / Vorbis から選択。タグ付き、シングルファイルではトラックごとのチャプター付き)
 - `--single-file` で全トラックを 1 ファイルのイメージとして保存
 - WAV へのタグ書き込み (RIFF `LIST`/`INFO` と ID3v2.4 の `id3 ` チャンク、UTF-8)
 - CUE シートの出力 (シングルファイル / トラックごとのどちらでも)
+- ディスクの MCN (カタログ番号、JAN / UPC) とトラックごとの ISRC をサブチャンネル Q から読み取り、CUE シート・FLAC の `CUESHEET`・タグ・`rip.log` に記録
 - 読み取りエラー時のリトライ、失敗したブロックはセクタ単位で再読込し、読めないセクタだけを無音で補完
 - `--verify` で 2 回読みして一致を確認 (セキュアモード)
 - ドライブの読み取りオフセット補正 (`--offset`、EAC / AccurateRip と同じ値)
@@ -30,13 +32,14 @@
 
 ```
 cdreader drives                     光学ドライブの一覧
-cdreader toc D:                     TOC (トラック一覧) と CDDB のディスク情報を表示
+cdreader toc D:                     TOC (トラック一覧)、MCN / ISRC と CDDB のディスク情報を表示
 cdreader rip D:                     全オーディオトラックを "アーティスト - アルバム"\ に保存
 cdreader rip D: -t 1,3-5 -o out     トラック 1,3,4,5 を out\ に保存
 cdreader rip D: --verify -r 10      2 回読み比較、リトライ 10 回
 cdreader rip D: --offset 6          読み取りオフセット +6 サンプルで補正
 cdreader rip D: --single-file       全トラックを 1 つの WAV と CUE シートに保存
 cdreader rip D: -f flac             FLAC で保存
+cdreader rip D: -f oggflac          Ogg FLAC (.oga) で保存
 cdreader rip D: -f opus             Opus で保存 (VBR 160 kbit/s)
 cdreader rip D: -f opus -b 128      Opus 128 kbit/s で保存
 cdreader rip D: -f vorbis -q 6      Ogg Vorbis 品質 6 で保存
@@ -46,22 +49,24 @@ cdreader rip D: -f mka --single-file  1 つの MKA (トラックごとのチャ�
 cdreader rip D: --cddb-match 2      CDDB の候補が複数あるとき 2 番目を使う
 cdreader rip D: --no-cddb           CDDB に問い合わせない (cd_<CDDB ID>\TrackNN.wav)
 cdreader rip D: --no-accuraterip    AccurateRip の照合 (ネットワークアクセス) をしない
+cdreader rip D: --no-isrc           MCN / ISRC を読み取らない (読み取りの遅いドライブ向け)
 cdreader offset D:                  読み取りオフセットを AccurateRip で検出
 ```
 
 | オプション | 説明 |
 | --- | --- |
 | `-o, --output <dir>` | 出力先ディレクトリ (既定: `アーティスト - アルバム`。CDDB で見つからなければ `cd_<CDDB ID>`) |
-| `-f, --format <name>` | 出力フォーマット: `wav` / `flac` / `opus` / `vorbis` / `mka` / `mka-pcm` / `mka-opus` / `mka-vorbis` (既定: `wav`。`opus` / `vorbis` / `mka-opus` / `mka-vorbis` はビルド時に有効にした場合のみ。MKA は「Matroska 出力」の節を参照) |
+| `-f, --format <name>` | 出力フォーマット: `wav` / `flac` / `oggflac` / `opus` / `vorbis` / `mka` / `mka-pcm` / `mka-opus` / `mka-vorbis` (既定: `wav`。`opus` / `vorbis` / `mka-opus` / `mka-vorbis` はビルド時に有効にした場合のみ。MKA は「Matroska (MKA) 出力」の節を参照) |
 | `-b, --bitrate <kbps>` | 非可逆フォーマットの目標ビットレート (kbit/s、VBR)。`opus` / `mka-opus`: 6〜510 (既定 160)、`vorbis` / `mka-vorbis`: 45〜500 (平均ビットレート、`--quality` の代わり) |
 | `-q, --quality <q>` | `vorbis` / `mka-vorbis` の VBR 品質 (oggenc と同じ -1〜10、小数可。既定 5 ≒ 160 kbit/s)。Opus には指定できません |
 | `-t, --tracks <list>` | リッピングするトラック (例: `1,3-5`)。既定は全オーディオトラック |
 | `-r, --retries <n>` | 読み取り失敗時のリトライ回数 (既定: 5) |
 | `--verify` | 全ブロックを 2 回読みして比較 (低速) |
 | `--offset <n>` | 読み取りオフセット補正 (サンプル単位、負の値も可。既定: 0) |
-| `--single-file` | 選択したトラックを 1 つのファイルにつなげて保存 (ディスクイメージ + CUE シート。FLAC ではファイル内にも CUE シートを埋め込み、MKA ではトラックごとのチャプターを記録) |
+| `--single-file` | 選択したトラックを 1 つのファイルにつなげて保存 (ディスクイメージ + CUE シート。FLAC / Ogg FLAC ではファイル内にも CUE シートを埋め込み、MKA ではトラックごとのチャプターを記録) |
 | `--no-cue-file` | 外部の `.cue` ファイルを書かない |
 | `--no-accuraterip` | リッピング後に AccurateRip データベースを照会しない (チェックサムは `rip.log` に記録されます) |
+| `--no-isrc` | MCN (カタログ番号) と ISRC を読み取らない (`toc` でも使えます)。読み取りに時間のかかるドライブ向け |
 
 CDDB のオプション (`rip` と `toc` の両方で使えます):
 
@@ -115,7 +120,8 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
   ブロックサイズ 4096 サンプル、サブフレームは CONSTANT / VERBATIM / FIXED (0〜4 次) / LPC (最大 8 次) から最小のものを選択、
   ステレオ相関 (L/R・L/S・S/R・M/S) も最小のものを選択、Rice 符号のパーティション分割とパラメータ探索 (エスケープ符号を含む)、wasted bits に対応。
 - メタデータ: `STREAMINFO` (PCM の MD5 署名を含む)、`VORBIS_COMMENT`、`SEEKTABLE` (10 秒ごと)、`PADDING` (タグの後からの書き換え用)。
-- タグ (`VORBIS_COMMENT`): `TITLE`, `ARTIST`, `ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`, `TRACKTOTAL`, `DATE`, `GENRE`, `CDDB` (ディスク ID)。
+- タグ (`VORBIS_COMMENT`): `TITLE`, `ARTIST`, `ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`, `TRACKTOTAL`, `DATE`, `GENRE`, `CDDB` (ディスク ID)、
+  `ISRC`、`BARCODE` (MCN。読み取れた場合。MCN と ISRC の節を参照)。
   曲名・アーティストなどは CDDB ([#6](https://github.com/noribow/cdreader/issues/6)) で取得できた場合に入ります。
 - `flac -t ファイル名` で CRC と MD5 を検証できます。
 
@@ -129,14 +135,33 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
   リードアウトは実際に書いた音声の長さに合わせて、ファイルを閉じるときに確定します。
 - **`CUESHEET` タグ** (Vorbis コメント): 外部 `.cue` と同じテキスト (BOM なし) で、曲名・アーティストなども含みます。foobar2000 などが読みます。
 - `--no-cue-file` を付けると外部の `.cue` を書きません (埋め込みのみ)。
-- MCN (カタログ番号) と ISRC は現状読み取っていないため空です。プリギャップ (`INDEX 00`) も含みません。
+- MCN (カタログ番号) と各トラックの ISRC も `CUESHEET` ブロックに入ります (MCN は 128 バイトの欄に 13 桁の ASCII、ISRC は 12 バイト)。
+  `metaflac --import-cuesheet-from` で取り込んだ場合とバイト単位で同じブロックになることをテストで確認しています。
+  プリギャップ (`INDEX 00`) は含みません。
 - トラックごとのリッピング (`--single-file` なし) では埋め込みません (1 ファイル 1 トラックのため)。
+
+### Ogg FLAC 出力
+
+`--format oggflac` を指定すると、FLAC と同じ可逆圧縮のフレームを Ogg コンテナに入れた Ogg FLAC (`.oga`) で保存します
+([FLAC-to-Ogg マッピング 1.0](https://xiph.org/flac/ogg_mapping.html))。Ogg に対応したプレーヤー・ツール向けで、
+デコード結果は FLAC 出力と同じく元の PCM とビット単位で一致します (フレームは `--format flac` のものとバイト単位で同一)。
+
+- エンコーダは FLAC 出力と共通 (`flac::StreamEncoder`)、Ogg のページは Ogg Opus / Vorbis と共通の `OggStreamWriter` で書きます。
+- 最初のパケット: `0x7F` `FLAC`、マッピングのバージョン 1.0、ヘッダーパケット数、`fLaC`、`STREAMINFO` (MD5 署名を含む)。BOS ページにこのパケットだけを置きます。
+- 続くヘッダーパケット: メタデータブロックを 1 つずつ (`VORBIS_COMMENT`、`--single-file` では `CUESHEET`)。音声は新しいページから始まります。
+- 音声: 1 パケット = 1 FLAC フレーム (4096 サンプル)。グラニュール位置はそのページで完結したフレームまでのサンプル数、最後のページに EOS フラグ。
+- `SEEKTABLE` は書きません (Ogg ではグラニュール位置でシークするため)。`PADDING` も書きません (Ogg のタグ編集はファイルを書き直すため)。
+- `STREAMINFO` の総サンプル数・MD5・フレームサイズと `CUESHEET` のリードアウトは最後に確定するので、ファイルを閉じるときに
+  ヘッダーのページ (大きさは変わりません) を作り直して先頭に上書きします (CRC も再計算)。
+- タグと CUE シートの埋め込み (`CUESHEET` ブロック + `CUESHEET` タグ) は FLAC 出力と同じです。
+  `flac -t ファイル名.oga` で CRC と MD5 を検証できます。`metaflac` は Ogg FLAC を読めないため、埋め込み CUE シートは
+  `flac -d --cue=2.1-3.1 ファイル名.oga` (トラック 2 だけをデコード) や foobar2000 などで使えます。
 
 ### 非可逆圧縮 (Opus / Vorbis)
 
 `--format opus` / `--format vorbis` で、非可逆圧縮のファイルを作ります。
 携帯プレーヤーやスマートフォン向けの「聴く用」のファイルを想定しています (保存用には FLAC を推奨)。
-`--bitrate` / `--quality` を `wav` / `flac` に指定するとエラーになります。使ったコーデックと設定は `rip.log` の `Encoder:` 行に記録されます。
+`--bitrate` / `--quality` を `wav` / `flac` / `oggflac` に指定するとエラーになります。使ったコーデックと設定は `rip.log` の `Encoder:` 行に記録されます。
 
 | 形式 | ファイル | エンコーダ | 既定 | 指定 |
 | --- | --- | --- | --- | --- |
@@ -155,10 +180,10 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - **Vorbis**: 44.1 kHz のまま libvorbisenc でエンコードします。`--quality` は oggenc と同じ目盛り (内部では 1/10)、
   `--bitrate` は `oggenc -b` と同じく、ビットレート管理を使わずに平均がそのビットレートになる VBR です。
   グラニュール位置と最後のパケット (EOS) は libvorbis が決め、デコード結果は元のサンプル数ちょうどになります。
-- Ogg のページは FLAC と同じくコア内の `OggStreamWriter` で書きます (ヘッダーパケットはそれぞれ専用のページ、音声は新しいページから)。
-- タグは FLAC と同じ Vorbis コメント (`TITLE`, `ARTIST`, `ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`, `TRACKTOTAL`, `DATE`, `GENRE`, `CDDB`) を
+- Ogg のページは Ogg FLAC と同じくコア内の `OggStreamWriter` で書きます (ヘッダーパケットはそれぞれ専用のページ、音声は新しいページから)。
+- タグは FLAC と同じ Vorbis コメント (`TITLE`, `ARTIST`, `ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`, `TRACKTOTAL`, `DATE`, `GENRE`, `CDDB`, `ISRC`, `BARCODE`) を
   `OpusTags` / Vorbis のコメントヘッダーに書きます。
-- `--single-file` も使えます (CUE シートの `FILE` の種類は `WAVE`)。CUE シートのファイル内への埋め込みは FLAC のみです
+- `--single-file` も使えます (CUE シートの `FILE` の種類は `WAVE`)。CUE シートのファイル内への埋め込みは FLAC / Ogg FLAC のみです
   (Matroska ではチャプターとして記録します)。
 - 同じエンコーダで Matroska (`mka-opus` / `mka-vorbis`) にも保存できます (次節)。
 
@@ -183,11 +208,12 @@ WAV / FLAC / Opus と同じ 1 つの `--format` で選べるようにしてい�
 - **終端の切り詰め**: Ogg のグラニュール位置の代わりに、最後のブロックに `DiscardPadding` (最後のパケットのうち捨てる長さ) を書きます。
   Opus は `CodecDelay` (先頭の pre-skip) と合わせて、デコード結果が 48 kHz に変換した長さちょうどになり、Vorbis は元のサンプル数ちょうどになります (ffmpeg で確認)。
 - **タグ** (Matroska の `Tags`): アルバム単位 (`TargetTypeValue` 50) に `TITLE` (アルバム名)・`ARTIST` (アルバムアーティスト)・`TOTAL_PARTS` (トラック数)・
-  `DATE_RELEASED`・`GENRE`・`CDDB` (ディスク ID)、トラック単位 (30) に `TITLE`・`ARTIST`・`PART_NUMBER` (トラック番号) を書きます。
+  `DATE_RELEASED`・`GENRE`・`CDDB` (ディスク ID)・`BARCODE` (MCN)、トラック単位 (30) に `TITLE`・`ARTIST`・`PART_NUMBER` (トラック番号)・`ISRC` を書きます
+  (MCN / ISRC はディスクから読み取れた場合のみ。[#22](https://github.com/noribow/cdreader/issues/22))。
   階層を区別しないソフト (FFmpeg など) のために、アルバム単位には `ALBUM` (アルバム名) も書き、トラック単位のタグを後ろに置いています
   (FFmpeg / ffprobe では `title` が曲名、`album` がアルバム名、`track` がトラック番号として読めます)。
 - **`--single-file`**: 外部の `.cue` に加えて、CUE シートの各トラックの位置 (`INDEX 01`) をチャプター (`ChapterAtom`、名前は曲名) として記録します。
-  チャプターの時刻は 1/75 秒単位の CUE の位置をナノ秒に丸めたもので、曲名・アーティスト・トラック番号はチャプターごとのタグ (`TagChapterUID`) にも書きます。
+  チャプターの時刻は 1/75 秒単位の CUE の位置をナノ秒に丸めたもので、曲名・アーティスト・トラック番号・ISRC はチャプターごとのタグ (`TagChapterUID`) にも書きます。
 - Opus / Vorbis をビルドに含めていない場合、`mka-opus` / `mka-vorbis` は使えません (「このビルドでは使えない」旨のエラーになります)。
 
 #### MP3 / AAC に対応しない理由
@@ -263,13 +289,32 @@ Read offset: +6  (matched v1+v2, confidence 25; use: cdreader rip D: --offset 6)
 FLAC のタグは `VORBIS_COMMENT` に、Opus / Vorbis のタグは同じ形式の Vorbis コメントに、Matroska のタグは `Tags` 要素に書きます (FLAC 出力・非可逆圧縮・Matroska 出力の節を参照)。
 
 - RIFF `LIST`/`INFO` チャンク: `INAM` タイトル、`IART` アーティスト、`IPRD` アルバム、`ITRK` トラック番号、`ICRD` 年、`IGNR` ジャンル、`ICMT` CDDB ディスク ID。
-- `id3 ` チャンク (ID3v2.4、UTF-8): `TIT2` `TPE1` `TALB` `TPE2` `TRCK` (`番号/総数`) `TDRC` `TCON` `TXXX:DISCID`。
+- `id3 ` チャンク (ID3v2.4、UTF-8): `TIT2` `TPE1` `TALB` `TPE2` `TRCK` (`番号/総数`) `TDRC` `TCON` `TSRC` (ISRC) `TXXX:DISCID` `TXXX:BARCODE` (MCN)。
   INFO を読まずに ID3 だけを読むプレイヤーが多いため両方書きます。
+  ISRC と MCN は ID3 にだけ書きます (INFO の `ISRC` は「ソース (素材の提供元)」という別の意味の項目で、カタログ番号の項目もないため)。
 - タグはオーディオデータ (`data` チャンク) の **後ろ** に置きます。ヘッダーは従来どおり 44 バイトの標準形のままなので、
   「サンプルは 44 バイト目から」と決め打ちする単純なツールでも読めます。RIFF ではチャンクの順序は自由で、
   ffmpeg / MediaInfo / ExifTool などは後ろのチャンクも読みます。
 - INFO には文字コードの規定がありません。UTF-8 で書いており ffmpeg・MediaInfo は正しく表示しますが、
   ANSI コードページとして読むソフト (ExifTool の既定設定など) では日本語が化けます。ID3 側は UTF-8 が明示されています。
+
+### MCN と ISRC
+
+CD のサブチャンネル Q には、ディスクの **MCN** (Media Catalog Number。JAN / EAN-13・UPC のバーコード番号、13 桁) と
+トラックごとの **ISRC** (International Standard Recording Code。`JPVI09912345` のような 12 文字の録音コード) が記録されていることがあります。
+`rip` / `toc` は MMC の `READ SUB-CHANNEL` (42h、SubQ = 1、形式 02h / 03h) でこれらを読み取ります。
+
+- `cdreader toc D:` は TOC の後に `MCN: ...` と `Track NN  ISRC: ...` を表示します。`rip` は選択したトラックの ISRC を読み、`rip.log` に同じ形で記録します。
+- 記録先: CUE シートの `CATALOG` / `ISRC`、FLAC の `CUESHEET` ブロック (シングルファイル時)、タグ
+  (Vorbis コメントの `ISRC` / `BARCODE`、ID3 の `TSRC` / `TXXX:BARCODE`)。シングルファイルのイメージでは MCN のみタグに入ります (ISRC はトラックごとのため CUE シート側)。
+- MCN のタグ名は `BARCODE` にしています。MCN の中身は商品のバーコード番号で、MusicBrainz Picard や foobar2000 も同じ名前を使います
+  (`CATALOGNUMBER` は MusicBrainz ではレーベルの品番 (`SRCL-1234` など) を指すため使いません)。
+- ドライブの応答の有効ビット (MCVal / TCVal) が 0 なら「記録なし」です。MCN が全桁 0 の場合 (有効ビットを立てたまま 0 を返すドライブがあります) も記録なしとして扱います。
+- 文字の検証: MCN は数字 13 桁、ISRC は国コード 2 文字 (英大文字)・登録者コード 3 文字 (英大文字または数字)・年 2 桁・番号 5 桁。
+  形式に合わない値や不正な応答 (短い応答、形式コードやトラック番号の不一致) は使わず、`rip.log` に `invalid response (...)` と記録します。
+- コマンドに対応していないドライブ (ILLEGAL REQUEST) では最初の 1 回で読み取りをやめます。読み取りに失敗してもリッピングは中断しません。
+- ドライブによっては ISRC の読み取りに時間がかかるため、`--no-isrc` で読み取りを省略できます (`rip.log` には `MCN / ISRC: not read (disabled)`)。
+- 多くの市販 CD には MCN / ISRC が記録されていません (記録されていない場合は `not present`)。
 
 ### CUE シート
 
@@ -282,6 +327,7 @@ FLAC のタグは `VORBIS_COMMENT` に、Opus / Vorbis のタグは同じ形式�
   (イメージの内容 = トラックごとにリッピングした結果を連結したもの。テストで確認しています)。
 - トラックごとのリッピングでは、トラックごとに `FILE` 行を持つ CUE シートになります。
 - `TITLE` / `PERFORMER`、`REM GENRE` / `REM DATE` / `REM DISCID`、TOC のコントロールビットから `FLAGS DCP` (デジタルコピー許可) / `FLAGS PRE` (プリエンファシス) を書きます。
+- ディスクの MCN を `CATALOG` (ディスク全体の項目)、トラックの ISRC を `ISRC` (`TRACK` の後・`INDEX` の前。`FLAGS` の後で、`metaflac` の出力と同じ順) として書きます。
   `FILE` の種類は MP3 / AIFF 以外はすべて `WAVE` (EAC・foobar2000 と同じく、FLAC などでも `WAVE`)。
 - CUE には文字列のエスケープがないため、`"` は `'` に、改行などの制御文字は空白に置き換えます。改行コードは CRLF です。
 - 文字コードは UTF-8 です。ASCII だけの場合は BOM なし、日本語などを含む場合は BOM 付きにします。
@@ -296,7 +342,7 @@ FLAC のタグは `VORBIS_COMMENT` に、Opus / Vorbis のタグは同じ形式�
 
 ## 使い方 (Android)
 
-Android 端末に USB の外付け CD/DVD ドライブを接続し、アプリから直接オーディオトラックを読み取って FLAC・WAV・Opus・Vorbis・MKA (Matroska、中身は FLAC) で保存します。
+Android 端末に USB の外付け CD/DVD ドライブを接続し、アプリから直接オーディオトラックを読み取って FLAC・Ogg FLAC・WAV・Opus・Vorbis・MKA (Matroska、中身は FLAC) で保存します。
 Windows 版と同じコアを使うため、CDDB による曲名の取得 (タグ・ファイル名)、AccurateRip による照合、`rip.log` も同じ内容です。
 root 化は不要です (Android の USB ホスト API で得たファイルディスクリプタ経由で、USB Mass Storage Bulk-Only Transport の
 SCSI/MMC コマンドを送ります)。
@@ -320,14 +366,15 @@ SCSI/MMC コマンドを送ります)。
    アーティスト・アルバム名・曲名を表示します。候補が複数あるときは一覧の上の選択欄で切り替えられます。
    ディスクを入れ替えたら「TOC を再読込」を押します。
 3. 「保存先フォルダ」で保存先を選びます (Storage Access Framework。選んだフォルダは次回以降も使われます)。
-4. 形式 (FLAC (既定) / WAV / Opus / Vorbis / MKA (FLAC)。Opus は VBR 160 kbit/s、Vorbis は品質 5 の固定設定)、必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値)、「2 回読みして比較」、
+4. 形式 (FLAC (既定) / Ogg FLAC / WAV / Opus / Vorbis / MKA (FLAC)。Opus は VBR 160 kbit/s、Vorbis は品質 5 の固定設定)、必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値)、「2 回読みして比較」、
    「AccurateRip で照合」(既定でオン) を設定し、保存するトラックにチェックを付けて「リッピング」を押します。
 5. リッピング後、AccurateRip の結果がトラックごとに表示されます
    (例: `Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2` — 一致したチェックサムの版、v2 / v1 それぞれの一致件数、
    登録件数の合計、一致したプレス数 / そのトラックの登録があるプレス数)。1 トラックも一致しない場合は読み取りオフセットを確認してください。
 
-保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`。Opus は `.opus`、Vorbis は `.ogg`、MKA は `.mka`) と `rip.log` が作られます。
-ファイルにはタグ (曲名・アーティスト・アルバム・年・ジャンル・トラック番号・CDDB ID) が書き込まれます。
+保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`。Ogg FLAC は `.oga`、Opus は `.opus`、Vorbis は `.ogg`、MKA は `.mka`) と `rip.log` が作られます。
+ファイルにはタグ (曲名・アーティスト・アルバム・年・ジャンル・トラック番号・CDDB ID、ディスクに記録されていれば ISRC と MCN) が書き込まれます。
+MCN / ISRC はリッピング開始時にディスクごとに 1 回読み取り、`rip.log` にも記録します。
 `rip.log` には Windows 版と同じく、ドライブ・設定・TOC・CDDB の結果・トラックごとの CRC32 / リトライ回数 / 読めなかったセクタ数・
 AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
 読み取り中は「キャンセル」で中断できます。リトライ回数は 5 回固定です。
@@ -387,7 +434,15 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build
 ffprobe / MediaInfo / ExifTool / ogginfo などの外部ツールで確認できます。
 FLAC は MD5 / CRC / ビット書き込み / Rice 符号の単体テストと、テスト用の簡易デコーダ (`tests/flac_decoder.*`) による往復テストに加え、
 公式 `flac` コマンドがインストールされていれば (`apt-get install flac` など)、さまざまな合成信号を `flac -t` で検証・`flac -d` でデコードして
-元の PCM と一致することを確認するテスト (`flac_roundtrip`) と、埋め込み CUE シートを `metaflac` で読み出し・再取り込みして確認するテスト (`flac_cuesheet`) も実行されます (無い場合はスキップ)。
+元の PCM と一致することを確認するテスト (`flac_roundtrip`) と、埋め込み CUE シート (MCN・ISRC を含む) を `metaflac` で読み出し・再取り込みして確認するテスト (`flac_cuesheet`) も実行されます (無い場合はスキップ。
+`ffprobe` があれば FLAC / WAV の `ISRC` / `BARCODE` タグが読めることも確認します)。
+MCN / ISRC は仮想ドライブの `READ SUB-CHANNEL` 応答で、CDB のバイト列、有効ビット 0、不正な文字・短い応答・形式コードやトラック番号の不一致、
+非対応ドライブ (ILLEGAL REQUEST) を検証します。
+Ogg FLAC は、最初のパケットのバイト列、パケット・ページ構成 (ヘッダーのページ、BOS / EOS、通し番号)、グラニュール位置、`STREAMINFO` の値を検証し、
+パケットから組み立て直した FLAC を簡易デコーダでデコードして元の PCM と一致すること、フレームが FLAC 出力とバイト単位で同一であることを確かめます。
+さらに `ogg_flac_check` が、インストールされているツールで `flac -t` / `flac -d` (ビット単位で一致)、埋め込み CUE シートの `CUESHEET` ブロックを使った
+`flac -d --cue=` によるトラックの切り出し、`ogginfo` (警告なし)、`ffmpeg` によるデコード (ビット単位で一致)、`ffprobe` によるタグの読み取りを確認します
+(どのツールも無い場合はスキップ。`metaflac` は Ogg FLAC を読めないため使いません)。
 CDDB は偽の `HttpClient` を使い (ネットワークには接続しません)、問い合わせコマンドの生成・応答コード・xmcd エントリの解析・ファイル名の変換を検証します。
 AccurateRip はネットワークに接続せず (偽の `HttpClient` を使用)、実在のディスクの ID・データベース応答と、独立した参照実装で求めたチェックサムで検証します。
 Opus / Vorbis は、ヘッダー (`OpusHead` / `OpusTags`、Vorbis の 3 つのヘッダー) のバイト列とページ構成、
@@ -407,7 +462,7 @@ Matroska (`cdreader_mka_tests`) は、EBML の可変長整数・各要素の符�
 `cdreader_usb_tests` は仮想 USB デバイス (`tests/fake_usb_device.*`) を使って Android 版の USB Bulk-Only Transport
 (CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング) を検証します。
 `cdreader_rip_session_tests` は Android 版のリッピング処理 (`platform/android/rip_session.*`) を仮想 USB デバイスと偽の `HttpClient` で検証します
-(FLAC / WAV 出力とデコード結果の一致、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`)。
+(FLAC / Ogg FLAC / WAV 出力とデコード結果の一致、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`)。
 
 ### Android アプリ
 
@@ -437,7 +492,8 @@ cmake -S . -B build -DCDREADER_BUILD_JNI=ON && cmake --build build
 ```
 core/       プラットフォーム非依存のコア (Windows / Android で共有)
   scsi      ScsiTransport インターフェース、センスデータ解析
-  cd_drive  MMC コマンド (INQUIRY, TEST UNIT READY, READ TOC, READ CD)
+  cd_drive  MMC コマンド (INQUIRY, TEST UNIT READY, READ TOC, READ CD, READ SUB-CHANNEL)
+  subchannel  サブチャンネル Q の MCN / ISRC 応答の解析・検証、ディスク全体の読み取り (DiscCodes)
   toc       TOC 解析、CDDB ID
   cddb      CDDB の問い合わせ・応答解析 (HttpClient 経由)
   file_naming  メタデータからのファイル名・フォルダ名・アルバム単位のファイル名 (使えない文字の置換)
@@ -453,12 +509,13 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   http      オンライン照会用 HTTP インターフェース (実装はプラットフォーム側)
   wav_writer, crc32
   flac_writer, flac_encoder, md5  FLAC エンコーダ (外部ライブラリなし)
+  ogg_flac_writer  Ogg FLAC (flac_encoder + ogg)
   resampler サンプリングレート変換 (44.1 → 48 kHz、Opus 用)
   opus_writer, vorbis_writer  Ogg Opus / Ogg Vorbis (libopus / libvorbis、CMake オプションで有効時のみ)
 platform/windows/   SPTI による ScsiTransport 実装、ドライブ列挙、WinHTTP クライアント
 platform/android/   USB Mass Storage Bulk-Only Transport による ScsiTransport 実装 (プロトコル部分は
                     プラットフォーム非依存)、usbdevfs によるエンドポイント I/O、リッピング処理
-                    (rip_session: CDDB・FLAC/WAV/Opus/Vorbis/MKA・AccurateRip・rip.log。JNI 非依存でテスト可能)、JNI ブリッジ
+                    (rip_session: CDDB・FLAC/Ogg FLAC/WAV/Opus/Vorbis/MKA・AccurateRip・rip.log。JNI 非依存でテスト可能)、JNI ブリッジ
 app/cli/            Windows 用コマンドラインツール
 cmake/Codecs.cmake  Opus / Vorbis ライブラリの取得とビルド
 android/            Android アプリ (Kotlin、Gradle)
@@ -490,9 +547,10 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
 - [ ] コンテナフォーマット対応・タグ付け — [#8](https://github.com/noribow/cdreader/issues/8)
   - [x] WAV のタグ (INFO / ID3)、シングルファイル + CUE シート、Ogg ページ書き出し (コア)
   - [x] FLAC への CUE シート埋め込み (CUESHEET ブロック + タグ) — [#16](https://github.com/noribow/cdreader/issues/16)
-  - [ ] MCN / ISRC の読み取り (CUE シート・FLAC の CUESHEET への記録)
+  - [x] MCN / ISRC の読み取り (CUE シート・FLAC の CUESHEET・タグへの記録) — [#22](https://github.com/noribow/cdreader/issues/22)
+    (実装済み・実機での動作確認待ち)
   - [x] Ogg Opus、Ogg Vorbis — [#13](https://github.com/noribow/cdreader/issues/13)
-  - [ ] Ogg FLAC
+  - [x] Ogg FLAC — [#21](https://github.com/noribow/cdreader/issues/21)
   - [ ] M4A (AAC / ALAC)
   - [x] MKA (Matroska。FLAC / PCM / Opus / Vorbis、タグ、シングルファイルのチャプター) — [#23](https://github.com/noribow/cdreader/issues/23)
   - [ ] プリギャップ (`INDEX 00`) と HTOA の検出 (サブチャンネル Q の読み取り)

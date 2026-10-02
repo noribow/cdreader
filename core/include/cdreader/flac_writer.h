@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -40,7 +39,6 @@ public:
     uint64_t totalSamples() const { return stream_.totalSamples(); }
 
 private:
-    void writeFrame(const std::vector<uint8_t>& frame, unsigned samples);
     void writeBytes(const uint8_t* data, size_t size);
 
     flac::StreamEncoder stream_;

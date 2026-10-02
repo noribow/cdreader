@@ -44,9 +44,11 @@ add_library(cdreader_core STATIC
   core/src/metadata.cpp
   core/src/mka_writer.cpp
   core/src/ogg.cpp
+  core/src/ogg_flac_writer.cpp
   core/src/resampler.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp
+  core/src/subchannel.cpp
   core/src/tags.cpp
   core/src/toc.cpp
   core/src/wav_writer.cpp
@@ -162,8 +164,15 @@ if(CDREADER_BUILD_TESTS)
   add_executable(cdreader_flac_cuesheet_check tests/flac_cuesheet_check.cpp)
   target_link_libraries(cdreader_flac_cuesheet_check PRIVATE cdreader_core)
   find_program(METAFLAC_EXECUTABLE metaflac)
+  find_program(FFPROBE_EXECUTABLE ffprobe)
   if(FLAC_EXECUTABLE AND METAFLAC_EXECUTABLE)
-    add_test(NAME flac_cuesheet COMMAND cdreader_flac_cuesheet_check "${FLAC_EXECUTABLE}" "${METAFLAC_EXECUTABLE}")
+    # ffprobe is optional (tag check of single tracks, #22).
+    set(_ffprobe_arg)
+    if(FFPROBE_EXECUTABLE)
+      set(_ffprobe_arg "${FFPROBE_EXECUTABLE}")
+    endif()
+    add_test(NAME flac_cuesheet COMMAND cdreader_flac_cuesheet_check "${FLAC_EXECUTABLE}" "${METAFLAC_EXECUTABLE}"
+             ${_ffprobe_arg})
   else()
     add_test(NAME flac_cuesheet COMMAND cdreader_flac_cuesheet_check)
   endif()
@@ -184,6 +193,22 @@ if(CDREADER_BUILD_TESTS)
   endforeach()
   add_test(NAME lossy_decode COMMAND cdreader_lossy_decode_check ${_lossy_tools})
   set_tests_properties(lossy_decode PROPERTIES SKIP_RETURN_CODE 77)
+
+  # Ogg FLAC output checked with flac (decoding, CUESHEET through --cue),
+  # ogginfo, ffmpeg and ffprobe; the missing tools are skipped (all: 77).
+  add_executable(cdreader_ogg_flac_check tests/ogg_flac_check.cpp)
+  target_include_directories(cdreader_ogg_flac_check PRIVATE tests)
+  target_link_libraries(cdreader_ogg_flac_check PRIVATE cdreader_core)
+  find_program(FFMPEG_EXECUTABLE ffmpeg)
+  set(_oggflac_tools)
+  foreach(_tool flac ogginfo ffmpeg ffprobe)
+    string(TOUPPER "${_tool}" _var)
+    if(${_var}_EXECUTABLE)
+      list(APPEND _oggflac_tools --${_tool} "${${_var}_EXECUTABLE}")
+    endif()
+  endforeach()
+  add_test(NAME ogg_flac_check COMMAND cdreader_ogg_flac_check ${_oggflac_tools})
+  set_tests_properties(ogg_flac_check PROPERTIES SKIP_RETURN_CODE 77)
 
   # Matroska output checked with mkvinfo (mkvtoolnix), ffprobe and ffmpeg.
   # Skipped when none is installed.

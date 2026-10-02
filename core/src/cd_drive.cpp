@@ -1,5 +1,6 @@
 #include "cdreader/cd_drive.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -63,6 +64,41 @@ ScsiResult CdDrive::readAudio(uint32_t lba, uint32_t count, uint8_t* out) {
         r.error = "short read (" + std::to_string(r.transferred) + " of " + std::to_string(bytes) + " bytes)";
     }
     return r;
+}
+
+ScsiResult CdDrive::readSubChannel(SubChannelFormat format, int track, uint8_t* out, size_t length, bool msf) {
+    if (length > 0xFFFF) length = 0xFFFF;
+    const uint8_t cdb[10] = {
+        0x42,
+        uint8_t(msf ? 0x02 : 0x00),
+        0x40,  // SubQ: return Q sub-channel data
+        uint8_t(format),
+        0, 0,
+        uint8_t(format == SubChannelFormat::Isrc ? track : 0),
+        uint8_t(length >> 8), uint8_t(length & 0xFF),
+        0,
+    };
+    return transport_.execute(cdb, sizeof cdb, out, length, DataDirection::In, kCommandTimeout);
+}
+
+SubChannelCode CdDrive::readMcn() {
+    uint8_t data[kSubChannelResponseBytes] = {};
+    const ScsiResult r = readSubChannel(SubChannelFormat::MediaCatalogNumber, 0, data, sizeof data);
+    if (!r.ok()) return subChannelError(r);
+    return parseMcnResponse(data, std::min(r.transferred, sizeof data));
+}
+
+SubChannelCode CdDrive::readIsrc(int track) {
+    if (track < 1 || track > 99) {
+        SubChannelCode c;
+        c.status = SubChannelCode::Status::Invalid;
+        c.detail = "track number " + std::to_string(track);
+        return c;
+    }
+    uint8_t data[kSubChannelResponseBytes] = {};
+    const ScsiResult r = readSubChannel(SubChannelFormat::Isrc, track, data, sizeof data);
+    if (!r.ok()) return subChannelError(r);
+    return parseIsrcResponse(data, std::min(r.transferred, sizeof data), track);
 }
 
 }  // namespace cdr

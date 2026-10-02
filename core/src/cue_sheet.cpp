@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <stdexcept>
 
+#include "cdreader/subchannel.h"
+
 namespace cdr {
 
 namespace {
@@ -42,6 +44,7 @@ CueTrack makeCueTrack(const Track& t, const std::string& file, uint32_t start, c
     c.copyPermitted = t.copyPermitted;
     c.title = m.title;
     c.performer = m.artist;
+    c.isrc = m.isrc;
     return c;
 }
 
@@ -99,6 +102,7 @@ std::string formatCueSheet(const AlbumMetadata& album, const std::vector<CueTrac
     if (!album.genre.empty()) line("REM GENRE " + remValue(album.genre));
     if (!album.year.empty()) line("REM DATE " + remValue(album.year));
     if (!album.discId.empty()) line("REM DISCID " + remValue(album.discId));
+    if (isValidMcn(album.mcn)) line("CATALOG " + album.mcn);
     if (!album.artist.empty()) line("PERFORMER " + quoted(album.artist));
     if (!album.title.empty()) line("TITLE " + quoted(album.title));
 
@@ -118,6 +122,7 @@ std::string formatCueSheet(const AlbumMetadata& album, const std::vector<CueTrac
         if (!t.performer.empty()) line("    PERFORMER " + quoted(t.performer));
         if (t.preEmphasis || t.copyPermitted)
             line(std::string("    FLAGS") + (t.copyPermitted ? " DCP" : "") + (t.preEmphasis ? " PRE" : ""));
+        if (isValidIsrc(t.isrc)) line("    ISRC " + t.isrc);
         line("    INDEX 01 " + formatCueTime(t.startSectors));
     }
 

@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cstddef>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -76,44 +76,6 @@ private:
     std::vector<double> window_, windowed_;
 };
 
-// A whole FLAC stream without its container: CD-DA PCM bytes in, frames of
-// kBlockSize samples out (the last one shorter), plus the STREAMINFO values.
-// Shared by FlacWriter (native FLAC) and MkaWriter (FLAC in Matroska).
-class StreamEncoder {
-public:
-    // Receives each frame and the number of samples per channel in it.
-    using FrameSink = std::function<void(const std::vector<uint8_t>& frame, unsigned samples)>;
-
-    explicit StreamEncoder(EncoderOptions options = {});
-
-    void reset();  // starts a new stream
-    // Accepts any number of bytes, also parts of a sample.
-    void write(const uint8_t* pcm, size_t bytes, const FrameSink& sink);
-    // Encodes the last (short) frame. Throws std::runtime_error when the
-    // input ended in the middle of a sample or the stream is too long.
-    void finish(const FrameSink& sink);
-
-    uint64_t totalSamples() const { return totalSamples_; }
-    uint32_t frames() const { return frames_; }
-    bool hasPartialSample() const { return pending_.size() % 4 != 0; }
-
-    // Body of the STREAMINFO block (34 bytes, without the block header).
-    // Complete after finish(); before, a placeholder of the right size.
-    std::vector<uint8_t> streamInfo() const;
-
-private:
-    void encodeBlock(const uint8_t* pcm, unsigned samples, const FrameSink& sink);
-
-    FrameEncoder encoder_;
-    std::vector<uint8_t> pending_;  // PCM bytes not yet encoded (less than one block)
-    std::vector<int32_t> left_, right_;
-    Md5 md5_;
-    std::array<uint8_t, 16> digest_{};
-    uint64_t totalSamples_ = 0;
-    uint32_t frames_ = 0;
-    uint32_t minFrameBytes_ = 0, maxFrameBytes_ = 0;
-};
-
 // Body of a VORBIS_COMMENT metadata block (without the 4-byte block header),
 // see cdr::vorbisComment() in tags.h.
 inline std::vector<uint8_t> vorbisComment(const TrackMetadata& metadata, const std::string& vendor,
@@ -129,5 +91,61 @@ std::vector<uint8_t> cueSheet(const EmbeddedCueSheet& cue, uint64_t leadOutSampl
 
 // Position of the lead-out track's 64-bit offset inside a cueSheet() body.
 size_t cueSheetLeadOutOffsetPosition(size_t tracks);
+
+// Value of the CUESHEET tag: the CUE sheet text without the .cue file's
+// UTF-8 BOM (the tag holds plain UTF-8).
+std::string cueSheetTagText(const std::string& cueText);
+
+constexpr uint32_t kSampleRate = 44100;
+constexpr uint32_t kStreamInfoBytes = 34;
+
+// Metadata block types (RFC 9639 section 8.1).
+enum BlockType : uint8_t { kStreamInfo = 0, kPadding = 1, kSeekTable = 3, kVorbisComment = 4, kCueSheet = 5 };
+
+// Appends a metadata block header: last-block flag, type, 24-bit body length.
+void putBlockHeader(std::vector<uint8_t>& out, BlockType type, bool last, uint32_t length);
+
+// Appends `x` as a `bytes`-byte big-endian number.
+void putBigEndian(std::vector<uint8_t>& out, uint64_t x, int bytes);
+
+// Splits a stream of CD-DA PCM (16-bit stereo little-endian, any chunking)
+// into blocks of kBlockSize samples, encodes them with FrameEncoder and keeps
+// what STREAMINFO needs: sample count, frame size bounds and the MD5 of the
+// PCM. Shared by the native FLAC and the Ogg FLAC writer.
+class StreamEncoder {
+public:
+    // Receives each encoded frame (numbered from 0) with its sample count.
+    using FrameSink = std::function<void(const std::vector<uint8_t>& frame, unsigned samples)>;
+
+    explicit StreamEncoder(EncoderOptions options = {}) : encoder_(options) {}
+
+    void start(FrameSink sink);  // begins a new stream
+    void write(const uint8_t* pcm, size_t bytes);
+    // Whether the input so far ends on a sample boundary (finish() requires it).
+    bool wholeSamples() const { return pending_.size() % kBytesPerSample == 0; }
+    // Encodes the remaining samples as a last, shorter frame and computes the MD5.
+    void finish();
+
+    uint64_t totalSamples() const { return totalSamples_; }
+    uint32_t frames() const { return frames_; }
+    // Body of the STREAMINFO block (kStreamInfoBytes bytes), valid after
+    // finish(). Throws std::runtime_error for a stream too long for FLAC.
+    std::vector<uint8_t> streamInfo() const;
+
+    static constexpr unsigned kBytesPerSample = 4;  // one 16-bit stereo sample
+
+private:
+    void encodeBlock(const uint8_t* pcm, unsigned samples);
+
+    FrameEncoder encoder_;
+    FrameSink sink_;
+    std::vector<uint8_t> pending_;  // PCM bytes not yet encoded (less than one block)
+    std::vector<int32_t> left_, right_;
+    Md5 md5_;
+    std::array<uint8_t, 16> digest_{};
+    uint64_t totalSamples_ = 0;
+    uint32_t frames_ = 0;
+    uint32_t minFrameBytes_ = 0, maxFrameBytes_ = 0;
+};
 
 }  // namespace cdr::flac

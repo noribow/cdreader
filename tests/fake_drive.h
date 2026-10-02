@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <map>
+#include <string>
 #include <vector>
 
 #include "cdreader/scsi.h"
@@ -27,6 +29,16 @@ public:
     std::map<uint32_t, bool> unstableSectors;
     bool discPresent = true;
     int readCommands = 0;
+
+    // READ SUB-CHANNEL (42h), formats 02h / 03h. A code that is set is
+    // returned with MCVal / TCVal = 1 as is (up to 13 / 12 bytes, so that
+    // malformed codes can be tested); an unset one with the valid bit 0.
+    std::string mcn;
+    std::map<int, std::string> isrcs;  // by track number
+    bool subChannelSupported = true;   // false: ILLEGAL REQUEST (invalid opcode)
+    size_t subChannelTransferLimit = SIZE_MAX;  // fewer bytes transferred (short response)
+    int subChannelCommands = 0;
+    std::vector<uint8_t> lastSubChannelCdb;
 
     cdr::ScsiResult execute(const uint8_t* cdb, size_t cdbLength, void* data, size_t dataLength,
                             cdr::DataDirection direction, unsigned timeoutSeconds) override;
