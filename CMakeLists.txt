@@ -22,8 +22,10 @@ endif()
 add_library(cdreader_core STATIC
   core/src/accuraterip.cpp
   core/src/audio_writer.cpp
+  core/src/cddb.cpp
   core/src/cd_drive.cpp
   core/src/crc32.cpp
+  core/src/file_naming.cpp
   core/src/metadata.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp

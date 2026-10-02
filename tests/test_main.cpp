@@ -7,6 +7,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,9 +15,11 @@
 #include "cdreader/accuraterip.h"
 #include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
-#include "cdreader/metadata.h"
+#include "cdreader/cddb.h"
 #include "cdreader/crc32.h"
+#include "cdreader/file_naming.h"
 #include "cdreader/http.h"
+#include "cdreader/metadata.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
 #include "cdreader/toc.h"
@@ -109,6 +112,43 @@ struct Collected {
         return [this](const uint8_t* p, size_t n) { bytes.insert(bytes.end(), p, p + n); };
     }
 };
+
+// Answers CDDB requests from canned bodies keyed by the command ("cddb query",
+// "cddb read"); records every URL requested.
+struct FakeHttp : cdr::HttpClient {
+    std::map<std::string, cdr::HttpResponse> byCommand;
+    std::vector<std::string> urls;
+
+    void reply(const std::string& command, const std::string& body, int status = 200) {
+        cdr::HttpResponse r;
+        r.ok = true;
+        r.status = status;
+        r.body = body;
+        byCommand[command] = r;
+    }
+
+    cdr::HttpResponse get(const std::string& url) override {
+        urls.push_back(url);
+        const size_t cmd = url.find("cmd=");
+        const size_t end = url.find('&', cmd);
+        const std::string encoded = url.substr(cmd + 4, end - cmd - 4);
+        for (const auto& [prefix, response] : byCommand)
+            if (encoded.rfind(cdr::urlEncode(prefix), 0) == 0) return response;
+        cdr::HttpResponse r;
+        r.error = "no route";
+        return r;
+    }
+};
+
+// 3 tracks at 0 s / 200 s / 400 s, lead-out at 600 s (LBA).
+cdr::Toc makeCddbToc() {
+    cdr::Toc toc;
+    toc.firstTrack = 1;
+    toc.lastTrack = 3;
+    toc.tracks = {{1, 0}, {2, 15000}, {3, 30000}};
+    toc.leadOutLba = 45000;
+    return toc;
+}
 
 }  // namespace
 
@@ -413,6 +453,269 @@ TEST(wav_writer_produces_valid_header) {
     CHECK(std::equal(pcm.begin(), pcm.end(), file.begin() + 44));
 }
 
+TEST(cddb_query_command_follows_freedb_spec) {
+    const cdr::Toc toc = makeCddbToc();
+    // Disc id: digit sums of 2, 202, 402 s = 12; length 602 - 2 = 600 s = 0x258; 3 tracks.
+    // Offsets include the 150 frame pregap; nsecs is the lead-out (45150 / 75 = 602 s).
+    CHECK(cdr::cddbQueryCommand(toc) == "cddb query 0c025803 3 150 15150 30150 602");
+
+    // CD-Extra: the data track is part of the query like any other track.
+    cdr::Toc extra;
+    extra.tracks = {{1, 0}, {2, 20000}, {3, 50000, 0, false}};
+    extra.leadOutLba = 60000;
+    // seconds 2, 268, 668 -> 2 + 16 + 20 = 38 = 0x26; length 802 - 2 = 800 = 0x320
+    CHECK(cdr::cddbQueryCommand(extra) == "cddb query 26032003 3 150 20150 50150 802");
+}
+
+TEST(cddb_request_url_is_encoded) {
+    CHECK(cdr::urlEncode("a b&c=d/\xC3\xA9~") == "a+b%26c%3Dd%2F%C3%A9~");
+    cdr::CddbClientInfo client;
+    client.user = "my user";
+    client.version = "1.2.3";
+    const std::string url = cdr::cddbRequestUrl("https://example.org/~cddb/cddb.cgi", "cddb read rock 0c025803", client);
+    CHECK(url ==
+          "https://example.org/~cddb/cddb.cgi?cmd=cddb+read+rock+0c025803&hello=my_user+localhost+cdreader+1.2.3"
+          "&proto=6");
+    CHECK(cdr::cddbRequestUrl("http://x/cgi?a=1", "cddb query", client).rfind("http://x/cgi?a=1&cmd=cddb+query&", 0) ==
+          0);
+}
+
+TEST(cddb_query_response_codes) {
+    using S = cdr::CddbQueryResult::Status;
+    cdr::CddbQueryResult r = cdr::parseCddbQueryResponse("200 rock 0c025803 Some Artist / Some Album\r\n");
+    CHECK(r.status == S::Exact);
+    CHECK_EQ(r.code, 200);
+    CHECK_EQ(r.matches.size(), 1u);
+    CHECK(r.matches[0].category == "rock" && r.matches[0].discId == "0c025803" &&
+          r.matches[0].title == "Some Artist / Some Album");
+
+    r = cdr::parseCddbQueryResponse(
+        "210 Found exact matches, list follows (until terminating `.')\r\n"
+        "rock 0c025803 A / B\r\nmisc 0c025803 C / D\r\n.\r\n");
+    CHECK(r.status == S::Exact);
+    CHECK_EQ(r.matches.size(), 2u);
+    CHECK(r.matches[1].category == "misc" && r.matches[1].title == "C / D");
+
+    r = cdr::parseCddbQueryResponse(
+        "211 Found inexact matches, list follows (until terminating `.')\n"
+        "jazz 0c025804 E / F\n.\n");
+    CHECK(r.status == S::Inexact);
+    CHECK_EQ(r.code, 211);
+    CHECK_EQ(r.matches.size(), 1u);
+
+    r = cdr::parseCddbQueryResponse("202 No match found\r\n");
+    CHECK(r.status == S::NotFound);
+    CHECK(r.matches.empty());
+
+    r = cdr::parseCddbQueryResponse("403 Database entry is corrupt.\r\n");
+    CHECK(r.status == S::Error);
+    CHECK_EQ(r.code, 403);
+    CHECK(r.message == "403 Database entry is corrupt.");
+
+    CHECK(cdr::parseCddbQueryResponse("").status == S::Error);
+    CHECK(cdr::parseCddbQueryResponse("<html><body>Bad Gateway</body></html>").status == S::Error);
+    CHECK(cdr::parseCddbQueryResponse("211 list follows\n.\n").status == S::Error);
+}
+
+TEST(cddb_xmcd_entry_parsing) {
+    const std::string entry =
+        "# xmcd\n"
+        "#\n"
+        "# Track frame offsets:\n"
+        "#        150\n"
+        "# DTITLE=commented out\n"
+        "DISCID=0c025803\n"
+        "DTITLE=The Artist / The Album\n"
+        "DYEAR=1999\n"
+        "DGENRE=Rock\n"
+        "TTITLE0=First\n"
+        "TTITLE1=A very long title that the server spl\n"
+        "TTITLE1=it over two lines\n"
+        "TTITLE2=Tab\\there, new\\nline, back\\\\slash, other \\x\n"
+        "EXTD=\n"
+        "PLAYORDER=\n";
+    const cdr::AlbumMetadata a = cdr::parseXmcd(entry);
+    CHECK(a.artist == "The Artist");
+    CHECK(a.title == "The Album");
+    CHECK(a.year == "1999");
+    CHECK(a.genre == "Rock");
+    CHECK_EQ(a.trackTitles.size(), 3u);
+    CHECK(a.trackTitles[0] == "First");
+    CHECK(a.trackTitles[1] == "A very long title that the server split over two lines");
+    CHECK(a.trackTitles[2] == "Tab here, new line, back\\slash, other \\x");
+    CHECK(a.trackArtists.empty());
+
+    // No " / ": artist and title are the same (xmcd spec). DTITLE may be split too.
+    const cdr::AlbumMetadata b = cdr::parseXmcd("DTITLE=Self Tit\nDTITLE=led\nTTITLE1=Second only\n");
+    CHECK(b.artist == "Self Titled" && b.title == "Self Titled");
+    CHECK_EQ(b.trackTitles.size(), 2u);
+    CHECK(b.trackTitles[0].empty() && b.trackTitles[1] == "Second only");
+}
+
+TEST(cddb_compilation_track_artists) {
+    const cdr::AlbumMetadata various = cdr::parseXmcd(
+        "DTITLE=Various Artists / Hits\n"
+        "TTITLE0=Singer A / Song A\n"
+        "TTITLE1=Song without artist\n"
+        "TTITLE2=Singer C / Song C / Remix\n");
+    CHECK(various.artist == "Various Artists");
+    CHECK_EQ(various.trackArtists.size(), 3u);
+    CHECK(various.trackArtists[0] == "Singer A" && various.trackTitles[0] == "Song A");
+    CHECK(various.trackArtists[1].empty() && various.trackTitles[1] == "Song without artist");
+    CHECK(various.trackArtists[2] == "Singer C" && various.trackTitles[2] == "Song C / Remix");
+    CHECK(various.forTrack(1, 3).artist == "Singer A");
+    CHECK(various.forTrack(2, 3).artist == "Various Artists");
+
+    // Not marked as various, but every track has an artist.
+    const cdr::AlbumMetadata split = cdr::parseXmcd("DTITLE=DJ / Mix\nTTITLE0=X / One\nTTITLE1=Y / Two\n");
+    CHECK(split.trackArtists.size() == 2 && split.trackArtists[1] == "Y" && split.trackTitles[1] == "Two");
+
+    // A single title containing " / " on a normal album is left alone.
+    const cdr::AlbumMetadata normal = cdr::parseXmcd("DTITLE=Band / LP\nTTITLE0=Intro\nTTITLE1=This / That\n");
+    CHECK(normal.trackArtists.empty());
+    CHECK(normal.trackTitles[1] == "This / That");
+}
+
+TEST(cddb_text_encoding) {
+    // Valid UTF-8 (Japanese) is kept.
+    const std::string jp = "\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88";  // テスト
+    CHECK(cdr::toValidUtf8(jp) == jp);
+    const cdr::AlbumMetadata a = cdr::parseXmcd("DTITLE=" + jp + " / " + jp + "\nTTITLE0=" + jp + "\n");
+    CHECK(a.artist == jp && a.trackTitles[0] == jp);
+
+    // Latin-1 from old entries: "Café" with E9.
+    CHECK(cdr::toValidUtf8("Caf\xE9") == "Caf\xC3\xA9");
+    const cdr::AlbumMetadata b = cdr::parseXmcd("DTITLE=Bj\xF6rk / Debut\n");
+    CHECK(b.artist == "Bj\xC3\xB6rk");
+    // Truncated sequence, overlong form and surrogate are all invalid.
+    CHECK(cdr::toValidUtf8("\xE3\x83") == "\xC3\xA3\xC2\x83");
+    CHECK(cdr::toValidUtf8("\xC0\xAF") == "\xC3\x80\xC2\xAF");
+    CHECK(cdr::toValidUtf8("\xED\xA0\x80") != "\xED\xA0\x80");
+    CHECK(cdr::toValidUtf8("\xF0\x9F\x8E\xB5") == "\xF0\x9F\x8E\xB5");  // 4 byte sequence is fine
+}
+
+TEST(cddb_read_response) {
+    cdr::AlbumMetadata album;
+    std::string error;
+    CHECK(cdr::parseCddbReadResponse("210 rock 0c025803 CD database entry follows (until terminating `.')\r\n"
+                                     "DTITLE=A / B\r\nTTITLE0=T\r\n.\r\nTTITLE0=after the end\r\n",
+                                     album, error));
+    CHECK(album.artist == "A" && album.title == "B");
+    CHECK(album.trackTitles.size() == 1 && album.trackTitles[0] == "T");
+
+    CHECK(!cdr::parseCddbReadResponse("401 rock 0c025803 No such CD entry in database.\r\n", album, error));
+    CHECK(error == "401 rock 0c025803 No such CD entry in database.");
+    CHECK(!cdr::parseCddbReadResponse("", album, error));
+}
+
+TEST(cddb_lookup_end_to_end) {
+    FakeHttp http;
+    http.reply("cddb query",
+               "211 Found inexact matches, list follows (until terminating `.')\r\n"
+               "rock 0c025803 First / Match\r\nmisc 0c025803 Second / Match\r\n.\r\n");
+    http.reply("cddb read rock", "210 rock 0c025803\r\nDTITLE=First / Match\r\nTTITLE0=One\r\n.\r\n");
+    http.reply("cddb read misc",
+               "210 misc 0c025803\r\nDTITLE=Second / Match\r\nDYEAR=2001\r\nTTITLE0=Uno\r\nTTITLE1=Dos\r\n.\r\n");
+
+    cdr::CddbOptions options;
+    options.server = "https://cddb.example/cgi";
+    cdr::CddbLookupResult r = cdr::lookupCddb(http, makeCddbToc(), options);
+    CHECK(r.found);
+    CHECK(!r.exact);
+    CHECK_EQ(r.matches.size(), 2u);
+    CHECK_EQ(r.chosen, 0u);
+    CHECK(r.album.artist == "First" && r.album.trackTitles[0] == "One");
+    CHECK(r.album.discId == "0C025803");
+    CHECK_EQ(http.urls.size(), 2u);
+    CHECK(http.urls[0] ==
+          "https://cddb.example/cgi?cmd=cddb+query+0c025803+3+150+15150+30150+602"
+          "&hello=cdreader+localhost+cdreader+0.1.0&proto=6");
+
+    options.matchIndex = 1;
+    r = cdr::lookupCddb(http, makeCddbToc(), options);
+    CHECK(r.found && r.chosen == 1 && r.album.title == "Match" && r.album.year == "2001");
+    CHECK(r.album.forTrack(2, 3).title == "Dos");
+
+    options.matchIndex = 5;  // out of range: falls back to the first match
+    r = cdr::lookupCddb(http, makeCddbToc(), options);
+    CHECK(r.found && r.chosen == 0);
+}
+
+TEST(cddb_lookup_failures_do_not_throw) {
+    const cdr::Toc toc = makeCddbToc();
+    FakeHttp none;  // every request fails at the transport level
+    cdr::CddbLookupResult r = cdr::lookupCddb(none, toc);
+    CHECK(!r.found && r.error == "no route");
+
+    FakeHttp notFound;
+    notFound.reply("cddb query", "202 No match found\r\n");
+    r = cdr::lookupCddb(notFound, toc);
+    CHECK(!r.found && !r.error.empty() && notFound.urls.size() == 1);
+
+    FakeHttp httpError;
+    httpError.reply("cddb query", "oops", 503);
+    r = cdr::lookupCddb(httpError, toc);
+    CHECK(!r.found && r.error == "HTTP status 503");
+
+    FakeHttp readFails;
+    readFails.reply("cddb query", "200 rock 0c025803 A / B\r\n");
+    readFails.reply("cddb read", "402 Server error.\r\n");
+    r = cdr::lookupCddb(readFails, toc);
+    CHECK(!r.found && r.error == "read failed: 402 Server error." && r.matches.size() == 1);
+
+    struct Throwing : cdr::HttpClient {
+        cdr::HttpResponse get(const std::string&) override { throw std::runtime_error("boom"); }
+    } throwing;
+    r = cdr::lookupCddb(throwing, toc);
+    CHECK(!r.found && r.error == "boom");
+}
+
+TEST(cddb_lookup_disc_starting_after_track_one) {
+    cdr::Toc toc = makeCddbToc();
+    for (size_t i = 0; i < toc.tracks.size(); ++i) toc.tracks[i].number = int(i) + 2;
+    FakeHttp http;
+    http.reply("cddb query", "200 rock 0c025803 A / B\r\n");
+    http.reply("cddb read", "210 rock 0c025803\r\nDTITLE=A / B\r\nTTITLE0=Two\r\nTTITLE1=Three\r\n.\r\n");
+    const cdr::CddbLookupResult r = cdr::lookupCddb(http, toc);
+    CHECK(r.found);
+    CHECK(r.album.forTrack(2, 4).title == "Two");
+    CHECK(r.album.forTrack(3, 4).title == "Three");
+}
+
+TEST(file_name_sanitizing) {
+    CHECK(cdr::sanitizeFileName("AC/DC: \"Live\" <1991>?*|\\") == "AC_DC_ _Live_ _1991_____");
+    CHECK(cdr::sanitizeFileName("tab\there\x01") == "tab_here_");
+    CHECK(cdr::sanitizeFileName("  leading and trailing. . ") == "leading and trailing");
+    CHECK(cdr::sanitizeFileName("...").empty());
+    CHECK(cdr::sanitizeFileName("con") == "_con");
+    CHECK(cdr::sanitizeFileName("CON.txt") == "_CON.txt");
+    CHECK(cdr::sanitizeFileName("Com3") == "_Com3");
+    CHECK(cdr::sanitizeFileName("COM0") == "COM0");
+    CHECK(cdr::sanitizeFileName("Console") == "Console");
+    const std::string jp = "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E";  // 日本語 (3 x 3 bytes)
+    CHECK(cdr::sanitizeFileName(jp + "?") == jp + "_");
+    // Cut at a character boundary, never inside a multi-byte sequence.
+    CHECK(cdr::sanitizeFileName(jp, 7) == "\xE6\x97\xA5\xE6\x9C\xAC");
+    CHECK(cdr::sanitizeFileName(jp, 9) == jp);
+}
+
+TEST(file_names_from_metadata) {
+    cdr::AlbumMetadata album;
+    album.discId = "0C025803";
+    album.trackTitles = {"Intro", "What?", ""};
+    CHECK(cdr::trackFileBaseName(album.forTrack(1, 3)) == "01 - Intro");
+    CHECK(cdr::trackFileBaseName(album.forTrack(2, 3)) == "02 - What_");
+    CHECK(cdr::trackFileBaseName(album.forTrack(3, 3)) == "Track03");
+    CHECK(cdr::trackFileBaseName(album.forTrack(12, 12)) == "Track12");
+    CHECK(cdr::albumDirectoryName(album) == "cd_0C025803");
+    album.title = "Album.";
+    CHECK(cdr::albumDirectoryName(album) == "Album");
+    album.artist = "Artist/Name";
+    CHECK(cdr::albumDirectoryName(album) == "Artist_Name - Album");
+    album.artist = album.title;
+    CHECK(cdr::albumDirectoryName(album) == "Album");
+}
+
 // --- AccurateRip --------------------------------------------------------------
 // Reference values were cross-checked with an independent reimplementation of
 // ARver / whipper (which reproduces ARver's own published test vectors).
@@ -473,7 +776,8 @@ const std::vector<uint8_t> kDbar013 = {
     0x1b, 0x02, 0x9a, 0xa1, 0xd1, 0x51, 0x11, 0xb2, 0x02, 0x1d, 0x02, 0x73, 0xfa, 0xb3, 0x8a, 0x56, 0xb6,
     0x81, 0xf3, 0x02, 0xde, 0xe0, 0x49, 0x86, 0xe3, 0xca, 0x83, 0xd5};
 
-class FakeHttp : public cdr::HttpClient {
+// Returns the same response to every request (AccurateRip lookups).
+class CannedHttp : public cdr::HttpClient {
 public:
     cdr::HttpResponse response;
     std::vector<std::string> requests;
@@ -760,7 +1064,7 @@ TEST(accuraterip_matching) {
 
 TEST(accuraterip_lookup) {
     cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(tocFromLengths({279037}, 0, 0));
-    FakeHttp http;
+    CannedHttp http;
     http.response = httpReply(200, bytesToString(kDbar001));
     cdr::AccurateRipLookup l = cdr::lookupAccurateRip(http, id);
     CHECK(l.status == cdr::AccurateRipLookup::Status::Found);

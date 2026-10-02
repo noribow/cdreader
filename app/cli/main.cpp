@@ -18,6 +18,8 @@
 #include "cdreader/accuraterip.h"
 #include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
+#include "cdreader/cddb.h"
+#include "cdreader/file_naming.h"
 #include "cdreader/metadata.h"
 #include "cdreader/ripper.h"
 #include "cdreader/toc.h"
@@ -40,12 +42,13 @@ void printUsage() {
         "\n"
         "Usage:\n"
         "  cdreader drives                       List optical drives\n"
-        "  cdreader toc <drive>                  Show the table of contents\n"
+        "  cdreader toc <drive> [cddb options]   Show the table of contents and disc info\n"
         "  cdreader rip <drive> [options]        Rip audio tracks to WAV\n"
         "  cdreader offset <drive> [options]     Detect the drive read offset (AccurateRip)\n"
         "\n"
         "Rip options:\n"
-        "  -o, --output <dir>    Output directory (default: cd_<CDDB id>)\n"
+        "  -o, --output <dir>    Output directory (default: \"Artist - Album\" from CDDB,\n"
+        "                        otherwise cd_<CDDB id>)\n"
         "  -t, --tracks <list>   Tracks to rip, e.g. 1,3-5 (default: all audio tracks)\n"
         "  -r, --retries <n>     Retries per failing read (default: 5)\n"
         "      --offset <n>      Drive read offset correction in samples, e.g. 6 or -472\n"
@@ -58,8 +61,15 @@ void printUsage() {
         "      --range <n>       Offsets to try, -n..+n samples (default: 3000)\n"
         "  -r, --retries <n>     Retries per failing read (default: 5)\n"
         "\n"
+        "CDDB options (rip and toc):\n"
+        "      --no-cddb         Do not look up the disc online\n"
+        "      --cddb-server <url>  CDDB HTTP server (default: %s)\n"
+        "      --cddb-match <n>  Use the n-th match when there are several (default: 1)\n"
+        "      --cddb-hello <user@host>  User and host sent in the CDDB greeting\n"
+        "                        (default: cdreader@localhost)\n"
+        "\n"
         "<drive> is a drive letter such as D or D:\n",
-        kVersion);
+        kVersion, cdr::kDefaultCddbServer);
 }
 
 std::vector<std::string> utf8Arguments() {
@@ -121,6 +131,92 @@ std::string hex32(uint32_t v) {
     return buf;
 }
 
+struct CddbSettings {
+    bool enabled = true;
+    cdr::CddbOptions options;
+};
+
+// Consumes a CDDB option at args[i]; returns false if args[i] is not one.
+bool parseCddbOption(const std::vector<std::string>& args, size_t& i, CddbSettings& cddb) {
+    const std::string& a = args[i];
+    auto value = [&]() -> const std::string& {
+        if (i + 1 >= args.size()) throw UsageError(a + " needs a value");
+        return args[++i];
+    };
+    if (a == "--no-cddb") {
+        cddb.enabled = false;
+    } else if (a == "--cddb-server") {
+        cddb.options.server = value();
+        if (cddb.options.server.rfind("http://", 0) != 0 && cddb.options.server.rfind("https://", 0) != 0)
+            throw UsageError("CDDB server must be an http:// or https:// URL");
+    } else if (a == "--cddb-hello") {
+        // Some servers want to see a contact address in the greeting.
+        const std::string& hello = value();
+        const size_t at = hello.find('@');
+        if (at == 0 || at == std::string::npos || at + 1 == hello.size())
+            throw UsageError("--cddb-hello expects user@host");
+        cddb.options.client.user = hello.substr(0, at);
+        cddb.options.client.host = hello.substr(at + 1);
+    } else if (a == "--cddb-match") {
+        const int n = parseInt(value(), "CDDB match number");
+        if (n < 1) throw UsageError("CDDB match numbers start at 1");
+        cddb.options.matchIndex = size_t(n - 1);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// Looks the disc up and reports progress on stdout. Never throws.
+cdr::CddbLookupResult lookupDisc(const cdr::Toc& toc, const CddbSettings& cddb) {
+    cdr::CddbLookupResult result;
+    if (!cddb.enabled) {
+        result.error = "disabled (--no-cddb)";
+        return result;
+    }
+    std::printf("Looking up the disc on %s ...\n", cddb.options.server.c_str());
+    std::fflush(stdout);
+    try {
+        cdr::win::WinHttpClient http(std::string("cdreader/") + kVersion);
+        cdr::CddbOptions options = cddb.options;
+        options.client.version = kVersion;
+        result = cdr::lookupCddb(http, toc, options);
+    } catch (const std::exception& e) {
+        result = {};
+        result.error = e.what();
+    }
+    if (!result.found) {
+        std::printf("CDDB: %s\n\n", result.error.c_str());
+        return result;
+    }
+    if (result.matches.size() > 1 || !result.exact) {
+        std::printf("CDDB: %d %s match(es):\n", int(result.matches.size()), result.exact ? "exact" : "inexact");
+        for (size_t i = 0; i < result.matches.size(); ++i) {
+            const cdr::CddbMatch& m = result.matches[i];
+            std::printf("  %c%d. %s/%s  %s\n", i == result.chosen ? '*' : ' ', int(i + 1), m.category.c_str(),
+                        m.discId.c_str(), m.title.c_str());
+        }
+        if (cddb.options.matchIndex >= result.matches.size())
+            std::printf("  (--cddb-match %d is out of range, using match 1)\n", int(cddb.options.matchIndex + 1));
+        else if (result.matches.size() > 1)
+            std::printf("  (use --cddb-match <n> to pick another one)\n");
+    }
+    return result;
+}
+
+void printAlbum(const cdr::AlbumMetadata& album, FILE* out) {
+    std::fprintf(out, "Artist: %s\nAlbum:  %s\n", album.artist.c_str(), album.title.c_str());
+    if (!album.year.empty()) std::fprintf(out, "Year:   %s\n", album.year.c_str());
+    if (!album.genre.empty()) std::fprintf(out, "Genre:  %s\n", album.genre.c_str());
+}
+
+// "Title" or "Artist / Title" of a track, empty if unknown.
+std::string trackLabel(const cdr::AlbumMetadata& album, int number, int total) {
+    const cdr::TrackMetadata m = album.forTrack(number, total);
+    if (m.title.empty()) return {};
+    return m.artist != album.artist && !m.artist.empty() ? m.artist + " / " + m.title : m.title;
+}
+
 struct OpenedDrive {
     std::unique_ptr<cdr::win::SptiTransport> transport;
     std::unique_ptr<cdr::CdDrive> drive;
@@ -140,13 +236,15 @@ cdr::Toc readTocOrExplain(cdr::CdDrive& drive) {
     return drive.readToc();
 }
 
-void printToc(const cdr::Toc& toc, FILE* out) {
+void printToc(const cdr::Toc& toc, const cdr::AlbumMetadata& album, FILE* out) {
     std::fprintf(out, "CDDB disc id: %s\n", hex32(toc.cddbId()).c_str());
     std::fprintf(out, "AccurateRip disc id: %s\n", cdr::AccurateRipDiscId::fromToc(toc).toString().c_str());
     std::fprintf(out, "Track  Start LBA   Length     Type\n");
     for (const cdr::Track& t : toc.tracks) {
-        std::fprintf(out, "  %2d   %9u   %s   %s%s\n", t.number, t.startLba, cdr::formatMsf(t.lengthSectors).c_str(),
-                     t.isAudio ? "audio" : "data", t.preEmphasis ? " (pre-emphasis)" : "");
+        const std::string title = trackLabel(album, t.number, toc.lastTrack);
+        std::fprintf(out, "  %2d   %9u   %s   %-5s%s%s%s\n", t.number, t.startLba,
+                     cdr::formatMsf(t.lengthSectors).c_str(), t.isAudio ? "audio" : "data",
+                     t.preEmphasis ? " (pre-emphasis)" : "", title.empty() ? "" : "  ", title.c_str());
     }
     std::fprintf(out, "Lead-out at LBA %u, total %s\n", toc.leadOutLba, cdr::formatMsf(toc.leadOutLba).c_str());
 }
@@ -169,10 +267,21 @@ int cmdDrives() {
 }
 
 int cmdToc(const std::vector<std::string>& args) {
-    if (args.size() != 2) throw UsageError("toc takes exactly one drive argument");
-    OpenedDrive d = openDrive(parseDriveLetter(args[1]));
+    if (args.size() < 2) throw UsageError("toc needs a drive argument");
+    const char letter = parseDriveLetter(args[1]);
+    CddbSettings cddb;
+    for (size_t i = 2; i < args.size(); ++i)
+        if (!parseCddbOption(args, i, cddb)) throw UsageError("unknown option '" + args[i] + "'");
+
+    OpenedDrive d = openDrive(letter);
     std::printf("Drive: %s\n", d.info.displayName().c_str());
-    printToc(readTocOrExplain(*d.drive), stdout);
+    const cdr::Toc toc = readTocOrExplain(*d.drive);
+    const cdr::CddbLookupResult found = lookupDisc(toc, cddb);
+    if (found.found) {
+        printAlbum(found.album, stdout);
+        std::printf("\n");
+    }
+    printToc(toc, found.album, stdout);
     return 0;
 }
 
@@ -253,6 +362,7 @@ int cmdRip(const std::vector<std::string>& args) {
     std::string outputDir;
     std::set<int> wanted;
     cdr::RipOptions options;
+    CddbSettings cddb;
     bool accurateRip = true;
 
     for (size_t i = 2; i < args.size(); ++i) {
@@ -266,6 +376,7 @@ int cmdRip(const std::vector<std::string>& args) {
         else if (a == "-r" || a == "--retries") options.maxRetries = parseInt(value(), "retry count");
         else if (a == "--offset") options.readOffsetSamples = parseSignedInt(value(), "read offset");
         else if (a == "--verify") options.verify = true;
+        else if (parseCddbOption(args, i, cddb)) continue;
         else if (a == "--no-accuraterip") accurateRip = false;
         else throw UsageError("unknown option '" + a + "'");
     }
@@ -289,10 +400,20 @@ int cmdRip(const std::vector<std::string>& args) {
     if (std::abs(options.readOffsetSamples) > int(100 * cdr::kSamplesPerSector))
         throw UsageError("read offset out of range");
 
-    const fs::path dir = fs::u8path(outputDir.empty() ? "cd_" + hex32(toc.cddbId()) : outputDir);
+    std::printf("Drive: %s\n", d.info.displayName().c_str());
+
+    // Metadata is optional: a failed lookup only means generic names.
+    const cdr::CddbLookupResult found = lookupDisc(toc, cddb);
+    cdr::AlbumMetadata album;
+    if (found.found) {
+        album = found.album;
+        printAlbum(album, stdout);
+    }
+    album.discId = hex32(toc.cddbId());
+
+    const fs::path dir = fs::u8path(outputDir.empty() ? cdr::albumDirectoryName(album) : outputDir);
     fs::create_directories(dir);
 
-    std::printf("Drive: %s\n", d.info.displayName().c_str());
     std::printf("Read offset correction: %+d samples\n", options.readOffsetSamples);
     std::printf("Output: %s\n\n", dir.u8string().c_str());
 
@@ -308,28 +429,41 @@ int cmdRip(const std::vector<std::string>& args) {
         log << "CDDB disc id: " << hex32(toc.cddbId()) << "\n";
         log << "AccurateRip disc id: " << cdr::AccurateRipDiscId::fromToc(toc).toString() << "\n";
         for (const cdr::Track& t : toc.tracks) {
-            std::snprintf(line, sizeof line, "Track %2d  LBA %7u  %s  %s\n", t.number, t.startLba,
+            std::snprintf(line, sizeof line, "Track %2d  LBA %7u  %s  %-5s", t.number, t.startLba,
                           cdr::formatMsf(t.lengthSectors).c_str(), t.isAudio ? "audio" : "data");
-            log << line;
+            const std::string title = trackLabel(album, t.number, toc.lastTrack);
+            log << line << (title.empty() ? "" : "  ") << title << "\n";
         }
         log << "\n";
     }
+    if (!cddb.enabled) {
+        log << "CDDB lookup: disabled\n\n";
+    } else if (!found.found) {
+        log << "CDDB lookup (" << cddb.options.server << "): " << found.error << "\n\n";
+    } else {
+        log << "CDDB lookup (" << cddb.options.server << "): " << found.matches.size()
+            << (found.exact ? " exact" : " inexact") << " match(es)\n";
+        for (size_t i = 0; i < found.matches.size(); ++i) {
+            const cdr::CddbMatch& m = found.matches[i];
+            log << (i == found.chosen ? "  * " : "    ") << i + 1 << ". " << m.category << "/" << m.discId << "  "
+                << m.title << "\n";
+        }
+        log << "Artist: " << album.artist << "\nAlbum: " << album.title << "\nYear: " << album.year
+            << "\nGenre: " << album.genre << "\n\n";
+    }
 
     const std::string format = "wav";
-    cdr::AlbumMetadata album;
-    album.discId = hex32(toc.cddbId());
 
     cdr::Ripper ripper(*d.drive, toc, options);
     int problems = 0;
     std::vector<ArTrack> arTracks;
     for (const cdr::Track& t : selected) {
         std::unique_ptr<cdr::AudioWriter> writer = cdr::createAudioWriter(format);
-        char base[32];
-        std::snprintf(base, sizeof base, "Track%02d", t.number);
-        const std::string name = base + std::string(".") + writer->extension();
-        const fs::path file = dir / name;
+        const cdr::TrackMetadata metadata = album.forTrack(t.number, toc.lastTrack);
+        const std::string name = cdr::trackFileBaseName(metadata) + "." + writer->extension();
+        const fs::path file = dir / fs::u8path(name);
 
-        writer->open(file, album.forTrack(t.number, toc.lastTrack));
+        writer->open(file, metadata);
         int lastPercent = -1;
         cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, t);
         cdr::TrackRipResult r = ripper.ripTrack(
