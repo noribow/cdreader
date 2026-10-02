@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "cdreader/alac_writer.h"
 #include "cdreader/flac_writer.h"
 #include "cdreader/wav_writer.h"
 #ifdef CDREADER_HAVE_OPUS
@@ -14,7 +15,7 @@
 namespace cdr {
 
 std::vector<std::string> audioFormats() {
-    std::vector<std::string> formats = {"wav", "flac"};
+    std::vector<std::string> formats = {"wav", "flac", "alac"};
 #ifdef CDREADER_HAVE_OPUS
     formats.push_back("opus");
 #endif
@@ -27,10 +28,11 @@ std::vector<std::string> audioFormats() {
 bool isLossyFormat(const std::string& format) { return format == "opus" || format == "vorbis"; }
 
 std::unique_ptr<AudioWriter> createAudioWriter(const std::string& format, const EncoderSettings& settings) {
-    if (format == "wav" || format == "flac") {
+    if (format == "wav" || format == "flac" || format == "alac") {
         if (!settings.empty())
             throw std::invalid_argument(format + " is lossless: a bitrate or quality does not apply");
         if (format == "wav") return std::make_unique<WavWriter>();
+        if (format == "alac") return std::make_unique<AlacWriter>();
         return std::make_unique<FlacWriter>();
     }
 #ifdef CDREADER_HAVE_OPUS

@@ -1,6 +1,6 @@
 # cdreader
 
-音楽 CD (CD-DA) をリッピングして WAV / FLAC / Opus / Ogg Vorbis ファイルに保存するツールです。
+音楽 CD (CD-DA) をリッピングして WAV / FLAC / ALAC (M4A) / Opus / Ogg Vorbis ファイルに保存するツールです。
 対象環境は **Windows** (コマンドライン) と **Android** (USB 接続の外付け CD ドライブ) です。
 
 > **このプロジェクトは [Claude Code](https://claude.com/claude-code) (Anthropic の AI コーディングエージェント) を利用して開発しています。**
@@ -11,6 +11,8 @@
 - SCSI/MMC コマンド (`READ TOC`, `READ CD`) でドライブから直接オーディオセクタを読み取り
 - 44.1 kHz / 16 bit / ステレオの WAV、または可逆圧縮の FLAC で保存 (トラックごとに `NN - 曲名.wav` / `NN - 曲名.flac`、曲名が不明なら `TrackNN.wav`)
 - FLAC エンコーダは外部ライブラリを使わない自前実装 (Android でもそのままビルド可能)。MD5 署名・タグ・シークテーブル付き
+- 可逆圧縮の **ALAC** (Apple Lossless、MP4 コンテナの `.m4a`、iTunes 形式のタグ付き) でも保存可能。Apple 製品 (ミュージック・iPhone など) 向けの形式で、
+  エンコーダと MP4 の書き出しも外部ライブラリなしの自前実装
 - 非可逆圧縮の **Opus** (Ogg Opus、`.opus`) と **Vorbis** (Ogg Vorbis、`.ogg`) でも保存可能 (libopus / libvorbis を使用。ビットレート・品質を指定可能)
 - `--single-file` で全トラックを 1 ファイルのイメージとして保存
 - WAV へのタグ書き込み (RIFF `LIST`/`INFO` と ID3v2.4 の `id3 ` チャンク、UTF-8)
@@ -36,6 +38,7 @@ cdreader rip D: --verify -r 10      2 回読み比較、リトライ 10 回
 cdreader rip D: --offset 6          読み取りオフセット +6 サンプルで補正
 cdreader rip D: --single-file       全トラックを 1 つの WAV と CUE シートに保存
 cdreader rip D: -f flac             FLAC で保存
+cdreader rip D: -f alac             ALAC (Apple Lossless、.m4a) で保存
 cdreader rip D: -f opus             Opus で保存 (VBR 160 kbit/s)
 cdreader rip D: -f opus -b 128      Opus 128 kbit/s で保存
 cdreader rip D: -f vorbis -q 6      Ogg Vorbis 品質 6 で保存
@@ -48,7 +51,7 @@ cdreader offset D:                  読み取りオフセットを AccurateRip �
 | オプション | 説明 |
 | --- | --- |
 | `-o, --output <dir>` | 出力先ディレクトリ (既定: `アーティスト - アルバム`。CDDB で見つからなければ `cd_<CDDB ID>`) |
-| `-f, --format <name>` | 出力フォーマット: `wav` / `flac` / `opus` / `vorbis` (既定: `wav`。`opus` / `vorbis` はビルド時に有効にした場合のみ) |
+| `-f, --format <name>` | 出力フォーマット: `wav` / `flac` / `alac` / `opus` / `vorbis` (既定: `wav`。`alac` は `.m4a`。`opus` / `vorbis` はビルド時に有効にした場合のみ) |
 | `-b, --bitrate <kbps>` | 非可逆フォーマットの目標ビットレート (kbit/s、VBR)。`opus`: 6〜510 (既定 160)、`vorbis`: 45〜500 (平均ビットレート、`--quality` の代わり) |
 | `-q, --quality <q>` | `vorbis` の VBR 品質 (oggenc と同じ -1〜10、小数可。既定 5 ≒ 160 kbit/s)。`opus` には指定できません |
 | `-t, --tracks <list>` | リッピングするトラック (例: `1,3-5`)。既定は全オーディオトラック |
@@ -128,11 +131,41 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - MCN (カタログ番号) と ISRC は現状読み取っていないため空です。プリギャップ (`INDEX 00`) も含みません。
 - トラックごとのリッピング (`--single-file` なし) では埋め込みません (1 ファイル 1 トラックのため)。
 
+### ALAC (M4A) 出力
+
+`--format alac` を指定すると、各トラックを ALAC (Apple Lossless Audio Codec、可逆圧縮) で MP4 コンテナの `.m4a` ファイルに保存します
+([#24](https://github.com/noribow/cdreader/issues/24))。デコードすると元の PCM とビット単位で一致します (FFmpeg でのデコードをテストで確認)。
+iTunes / ミュージック・iPhone など Apple 製品向けの可逆圧縮形式で、それ以外の環境では FLAC を推奨します
+(デコード結果は FFmpeg で確認していますが、Apple 製品での実機確認はまだ行っていません)。
+
+- エンコーダは `core/` 内の自前実装で、外部ライブラリに依存しません (FLAC と同じく Android でもそのままビルドできます)。
+  ビットストリームは Apple が公開している ALAC のリファレンス実装 ([macosforge/alac](https://github.com/macosforge/alac)、Apache License 2.0)
+  の仕様に従っています。Apple のソースコードは取り込んでおらず、形式に従って書き直したものです。
+  - フレームは 4096 サンプル (最後のフレームのみ短い)。マジッククッキー (`ALACSpecificConfig`) は Apple の推奨値
+    (frameLength 4096、bitDepth 16、pb 40 / mb 10 / kb 14、maxRun 255、44100 Hz、2 ch) に、実際の最大フレームサイズと平均ビットレートを入れて書きます。
+  - ステレオ行列 (mixBits 2、mixRes 0〜4: L/R・L/S・M/S など 5 通り) をフレームの先頭部分で比較して選択。
+  - 予測器は ALAC の適応型 (符号 LMS) で、チャンネルごとに次数 0 / 4 / 8 / 16 と初期係数 (そのフレームの最小二乗解、
+    または Apple のエンコーダと同じく前のフレームで適応させた 4 次の係数) の組み合わせから、実際に符号化して最小のものを選びます
+    (16 次は 8 次が最小のときだけ試します)。残差は ALAC の適応ゴロム符号 (ゼロの連続はラン長で) で符号化します。
+  - 圧縮しても小さくならないフレーム (白色雑音など) は非圧縮の「エスケープ」フレームで書きます。デコーダによって解釈が分かれうる
+    まれなケース (予測和の 32 ビットオーバーフロー、ゼロ連続の直後の値 0xFFFF) もエスケープフレームにします。
+  - 圧縮率は本プロジェクトの FLAC (`flac -5` 相当) とほぼ同等 (テスト用の音楽的な信号で FLAC より 2〜3% 大きい程度、
+    純音に近い信号ではより小さい) で、FFmpeg 内蔵の ALAC エンコーダより小さくなります (`alac_ffmpeg` テストで比較を表示)。
+    速度は FLAC の半分程度 (x86-64 の 1 コアで実時間の約 40 倍) です。
+- MP4 の構成: `ftyp` (`M4A `、互換 `M4A ` / `mp42` / `isom`)、`mdat` (フレームを順に書き込み、サイズは最後に確定)、
+  `moov` (ファイル末尾。`mvhd`、`trak` (`tkhd`、`mdia` (`mdhd` タイムスケール 44100、`hdlr` `soun`、`minf` (`smhd`、`dinf`/`dref`、
+  `stbl` (`stsd` の `alac` サンプルエントリとマジッククッキー、`stts`、`stsc`、`stsz`、`stco` / `co64`))))、`udta`/`meta`/`ilst`)。
+  長さ (`mvhd` / `tkhd` / `mdhd` / `stts`) はサンプル単位で正確です。4 GB を超える場合は 64 ビットのサイズ・オフセットを使います。
+- タグ (iTunes 形式、UTF-8): `©nam` タイトル、`©ART` アーティスト、`©alb` アルバム、`aART` アルバムアーティスト、`trkn` トラック番号 / 総数、
+  `©day` 年、`©gen` ジャンル、`©too` エンコーダ、`----:com.apple.iTunes:CDDB` (CDDB ディスク ID)。
+- `--single-file` も使えます (CUE シートの `FILE` の種類は `WAVE`)。CUE シートやチャプターのファイル内への埋め込みは行いません (FLAC のみ)。
+- `rip.log` の `Encoder:` 行は `ALAC (built-in encoder), lossless, MP4` です。
+
 ### 非可逆圧縮 (Opus / Vorbis)
 
 `--format opus` / `--format vorbis` で、非可逆圧縮のファイルを作ります。
 携帯プレーヤーやスマートフォン向けの「聴く用」のファイルを想定しています (保存用には FLAC を推奨)。
-`--bitrate` / `--quality` を `wav` / `flac` に指定するとエラーになります。使ったコーデックと設定は `rip.log` の `Encoder:` 行に記録されます。
+`--bitrate` / `--quality` を `wav` / `flac` / `alac` に指定するとエラーになります。使ったコーデックと設定は `rip.log` の `Encoder:` 行に記録されます。
 
 | 形式 | ファイル | エンコーダ | 既定 | 指定 |
 | --- | --- | --- | --- | --- |
@@ -163,7 +196,8 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - **AAC**: 高品質なフリーのエンコーダは Fraunhofer FDK AAC だけですが、そのライセンスは FSF / OSI のフリーソフトウェアライセンスとして
   認められておらず (特許の扱いを含む)、再配布に問題があります。FFmpeg 内蔵のエンコーダなどは品質が劣ります。
 - 同程度以上の音質・互換性は Opus (多くの環境で再生可能) や Vorbis で得られます。MP3 / AAC が必要な場合は、FLAC で保存してから
-  外部のエンコーダで変換してください。
+  外部のエンコーダで変換してください。Apple 製品向けには、M4A の可逆圧縮である ALAC (`--format alac`) で保存できます
+  (M4A への対応 [#24](https://github.com/noribow/cdreader/issues/24) は ALAC のみで、AAC は上記の理由で対象外です)。
 
 ### AccurateRip による照合
 
@@ -226,7 +260,8 @@ Read offset: +6  (matched v1+v2, confidence 25; use: cdreader rip D: --offset 6)
 
 トラックのメタデータ (タイトル・アーティスト・アルバム・トラック番号・年・ジャンル・CDDB ディスク ID) を WAV に書き込みます。
 タイトルなどは CDDB ([#6](https://github.com/noribow/cdreader/issues/6)) で取得できた場合に入ります (取得できなければトラック番号とディスク ID のみ)。
-FLAC のタグは `VORBIS_COMMENT` に、Opus / Vorbis のタグは同じ形式の Vorbis コメントに書きます (FLAC 出力・非可逆圧縮の節を参照)。
+FLAC のタグは `VORBIS_COMMENT` に、Opus / Vorbis のタグは同じ形式の Vorbis コメントに、ALAC (M4A) のタグは iTunes 形式の `ilst` に書きます
+(FLAC 出力・ALAC 出力・非可逆圧縮の節を参照)。
 
 - RIFF `LIST`/`INFO` チャンク: `INAM` タイトル、`IART` アーティスト、`IPRD` アルバム、`ITRK` トラック番号、`ICRD` 年、`IGNR` ジャンル、`ICMT` CDDB ディスク ID。
 - `id3 ` チャンク (ID3v2.4、UTF-8): `TIT2` `TPE1` `TALB` `TPE2` `TRCK` (`番号/総数`) `TDRC` `TCON` `TXXX:DISCID`。
@@ -262,7 +297,7 @@ FLAC のタグは `VORBIS_COMMENT` に、Opus / Vorbis のタグは同じ形式�
 
 ## 使い方 (Android)
 
-Android 端末に USB の外付け CD/DVD ドライブを接続し、アプリから直接オーディオトラックを読み取って FLAC・WAV・Opus・Vorbis で保存します。
+Android 端末に USB の外付け CD/DVD ドライブを接続し、アプリから直接オーディオトラックを読み取って FLAC・ALAC (M4A)・WAV・Opus・Vorbis で保存します。
 Windows 版と同じコアを使うため、CDDB による曲名の取得 (タグ・ファイル名)、AccurateRip による照合、`rip.log` も同じ内容です。
 root 化は不要です (Android の USB ホスト API で得たファイルディスクリプタ経由で、USB Mass Storage Bulk-Only Transport の
 SCSI/MMC コマンドを送ります)。
@@ -286,13 +321,13 @@ SCSI/MMC コマンドを送ります)。
    アーティスト・アルバム名・曲名を表示します。候補が複数あるときは一覧の上の選択欄で切り替えられます。
    ディスクを入れ替えたら「TOC を再読込」を押します。
 3. 「保存先フォルダ」で保存先を選びます (Storage Access Framework。選んだフォルダは次回以降も使われます)。
-4. 形式 (FLAC (既定) / WAV / Opus / Vorbis。Opus は VBR 160 kbit/s、Vorbis は品質 5 の固定設定)、必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値)、「2 回読みして比較」、
+4. 形式 (FLAC (既定) / ALAC (M4A) / WAV / Opus / Vorbis。Opus は VBR 160 kbit/s、Vorbis は品質 5 の固定設定)、必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値)、「2 回読みして比較」、
    「AccurateRip で照合」(既定でオン) を設定し、保存するトラックにチェックを付けて「リッピング」を押します。
 5. リッピング後、AccurateRip の結果がトラックごとに表示されます
    (例: `Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2` — 一致したチェックサムの版、v2 / v1 それぞれの一致件数、
    登録件数の合計、一致したプレス数 / そのトラックの登録があるプレス数)。1 トラックも一致しない場合は読み取りオフセットを確認してください。
 
-保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`。Opus は `.opus`、Vorbis は `.ogg`) と `rip.log` が作られます。
+保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`。ALAC は `.m4a`、Opus は `.opus`、Vorbis は `.ogg`) と `rip.log` が作られます。
 ファイルにはタグ (曲名・アーティスト・アルバム・年・ジャンル・トラック番号・CDDB ID) が書き込まれます。
 `rip.log` には Windows 版と同じく、ドライブ・設定・TOC・CDDB の結果・トラックごとの CRC32 / リトライ回数 / 読めなかったセクタ数・
 AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
@@ -316,7 +351,7 @@ Opus / Vorbis 出力用のライブラリは、CMake の構成時に `FetchConte
 | `CDREADER_WITH_VORBIS` (`ON`) | [xiph/ogg](https://github.com/xiph/ogg) `v1.3.5` + [xiph/vorbis](https://github.com/xiph/vorbis) `v1.3.7` | BSD 3-Clause | `vorbis` |
 
 - オフラインでビルドする場合や不要な場合は `-DCDREADER_WITH_OPUS=OFF -DCDREADER_WITH_VORBIS=OFF` を指定します。
-  その形式は `--help` の一覧に出なくなり、指定するとエラーになります (WAV / FLAC は常に使えます)。
+  その形式は `--help` の一覧に出なくなり、指定するとエラーになります (WAV / FLAC / ALAC は常に使えます)。
 - libopus はそれ自身の CMake でビルドします (CPU に応じた SIMD 最適化を含む)。libogg / libvorbis は CMake 対応が古いため、
   `cmake/Codecs.cmake` でソースから直接ライブラリを定義しています。
 - ライブラリのコードには本プロジェクトの警告オプション (`/W4`, `-Wall -Wextra -Wpedantic`) を適用せず、警告も表示しません。
@@ -354,6 +389,13 @@ ffprobe / MediaInfo / ExifTool / ogginfo などの外部ツールで確認でき
 FLAC は MD5 / CRC / ビット書き込み / Rice 符号の単体テストと、テスト用の簡易デコーダ (`tests/flac_decoder.*`) による往復テストに加え、
 公式 `flac` コマンドがインストールされていれば (`apt-get install flac` など)、さまざまな合成信号を `flac -t` で検証・`flac -d` でデコードして
 元の PCM と一致することを確認するテスト (`flac_roundtrip`) と、埋め込み CUE シートを `metaflac` で読み出し・再取り込みして確認するテスト (`flac_cuesheet`) も実行されます (無い場合はスキップ)。
+ALAC (M4A) は、マジッククッキーのバイト列、適応ゴロム符号のビット列、フレームヘッダー (部分フレーム・エスケープ・mixRes・次数)、
+非圧縮フレームへのフォールバック、極端な予測係数 (int16 の折り返し) を単体テストで確認し、テスト用の MP4 リーダー・ALAC デコーダ
+(`tests/alac_decoder.*`、Apple のリファレンスデコーダと同じ手順で独立に実装) で全ボックスの入れ子とサイズ、`stts` / `stsc` / `stsz` / `stco` の整合、
+長さ、タグを検証して合成信号を往復させます。`ffmpeg` がインストールされていれば (`apt-get install ffmpeg` など)、すべての合成信号
+(無音・正弦波・雑音・フルスケール・1〜12289 サンプルの長さ・音楽的な信号など) を `ffmpeg -i x.m4a -f s16le` でデコードして元の PCM と
+ビット単位で一致すること、`ffprobe` でコーデック `alac`・サンプル数・タグ (日本語を含む) が読めることを確認し、本プロジェクトの FLAC と
+FFmpeg の ALAC エンコーダとのサイズ比較を表示するテスト (`alac_ffmpeg`) が実行されます (無い場合はスキップ)。
 CDDB は偽の `HttpClient` を使い (ネットワークには接続しません)、問い合わせコマンドの生成・応答コード・xmcd エントリの解析・ファイル名の変換を検証します。
 AccurateRip はネットワークに接続せず (偽の `HttpClient` を使用)、実在のディスクの ID・データベース応答と、独立した参照実装で求めたチェックサムで検証します。
 Opus / Vorbis は、ヘッダー (`OpusHead` / `OpusTags`、Vorbis の 3 つのヘッダー) のバイト列とページ構成、
@@ -367,7 +409,7 @@ DC ゲイン・阻止域 (折り返し成分 -100 dB 以下) を確認します�
 `cdreader_usb_tests` は仮想 USB デバイス (`tests/fake_usb_device.*`) を使って Android 版の USB Bulk-Only Transport
 (CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング) を検証します。
 `cdreader_rip_session_tests` は Android 版のリッピング処理 (`platform/android/rip_session.*`) を仮想 USB デバイスと偽の `HttpClient` で検証します
-(FLAC / WAV 出力とデコード結果の一致、Opus / Vorbis 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`)。
+(FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`)。
 
 ### Android アプリ
 
@@ -411,12 +453,14 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   http      オンライン照会用 HTTP インターフェース (実装はプラットフォーム側)
   wav_writer, crc32
   flac_writer, flac_encoder, md5  FLAC エンコーダ (外部ライブラリなし)
+  alac_writer, alac_encoder  ALAC エンコーダと M4A 出力 (外部ライブラリなし)
+  mp4       MP4 コンテナのボックス・サンプルテーブル・iTunes タグの生成 (コーデック非依存)
   resampler サンプリングレート変換 (44.1 → 48 kHz、Opus 用)
   opus_writer, vorbis_writer  Ogg Opus / Ogg Vorbis (libopus / libvorbis、CMake オプションで有効時のみ)
 platform/windows/   SPTI による ScsiTransport 実装、ドライブ列挙、WinHTTP クライアント
 platform/android/   USB Mass Storage Bulk-Only Transport による ScsiTransport 実装 (プロトコル部分は
                     プラットフォーム非依存)、usbdevfs によるエンドポイント I/O、リッピング処理
-                    (rip_session: CDDB・FLAC/WAV/Opus/Vorbis・AccurateRip・rip.log。JNI 非依存でテスト可能)、JNI ブリッジ
+                    (rip_session: CDDB・FLAC/ALAC/WAV/Opus/Vorbis・AccurateRip・rip.log。JNI 非依存でテスト可能)、JNI ブリッジ
 app/cli/            Windows 用コマンドラインツール
 cmake/Codecs.cmake  Opus / Vorbis ライブラリの取得とビルド
 android/            Android アプリ (Kotlin、Gradle)
@@ -451,7 +495,8 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
   - [ ] MCN / ISRC の読み取り (CUE シート・FLAC の CUESHEET への記録)
   - [x] Ogg Opus、Ogg Vorbis — [#13](https://github.com/noribow/cdreader/issues/13)
   - [ ] Ogg FLAC
-  - [ ] M4A (AAC / ALAC)、MKA (Matroska)
+  - [x] M4A (ALAC) — [#24](https://github.com/noribow/cdreader/issues/24) (AAC はライセンス上の理由で対応しません)
+  - [ ] MKA (Matroska)
   - [ ] プリギャップ (`INDEX 00`) と HTOA の検出 (サブチャンネル Q の読み取り)
 - [ ] セキュアモードでのドライブキャッシュ回避 (現状の `--verify` はキャッシュされたデータを再読込する可能性があります)
 - [ ] Windows GUI

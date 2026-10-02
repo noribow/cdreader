@@ -49,7 +49,8 @@ struct EncoderSettings {
     bool empty() const { return !bitrateKbps && !quality; }
 };
 
-// Names accepted by createAudioWriter(), e.g. {"wav", "flac", "opus", "vorbis"}.
+// Names accepted by createAudioWriter(), e.g. {"wav", "flac", "alac", "opus", "vorbis"}
+// ("alac" writes Apple Lossless in an .m4a file).
 // The lossy formats are only listed when the codec library was built in
 // (CMake options CDREADER_WITH_OPUS / CDREADER_WITH_VORBIS).
 std::vector<std::string> audioFormats();

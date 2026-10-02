@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "alac_decoder.h"
 #include "bot_transport.h"
 #include "cdreader/accuraterip.h"
 #include "cdreader/cd_drive.h"
@@ -341,6 +342,37 @@ TEST(flac_rip_carries_cddb_tags_and_exact_audio) {
     CHECK(hasComment(d2, "ARTIST=Guest"));
     CHECK_EQ(rig.session.rippedTracks().size(), size_t(3));
     CHECK_EQ(rig.session.problemTracks(), 0);
+}
+
+TEST(alac_rip_carries_cddb_tags_and_exact_audio) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    rig.session.beginRip(settings("alac"));
+    TempDir dir;
+    const fs::path path = dir.path / "track2.m4a";
+    const cdr::RippedTrack& r = rig.session.ripTrack(2, path);
+    const Reference ref = referenceRip(2);
+    CHECK(r.result.clean());
+    CHECK_EQ(r.result.crc32, ref.crc32);
+    CHECK_EQ(r.accurateRipV2, ref.v2);
+    CHECK_STR(r.fileName, "02 - \xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91.m4a");
+    CHECK_STR(r.fileName, rig.session.trackFileName(2, "alac"));
+
+    const DecodedM4a d = decodeM4a(readFile(path));
+    CHECK(d.sampleEntryType == "alac");
+    CHECK_EQ(d.mediaDuration, uint64_t(ref.pcm.size() / 4));
+    CHECK(d.pcm == ref.pcm);
+    CHECK_STR(d.tags.at("\xA9nam"), "\xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91");
+    CHECK_STR(d.tags.at("\xA9" "ART"), "Guest");
+    CHECK_STR(d.tags.at("\xA9" "alb"), "Album: Live");
+    CHECK_STR(d.tags.at("aART"), "Various");
+    CHECK_STR(d.tags.at("trkn"), "2/3");
+    CHECK_STR(d.tags.at("\xA9" "day"), "1999");
+    CHECK_STR(d.tags.at("\xA9gen"), "Rock");
+    CHECK_STR(d.tags.at("----:com.apple.iTunes:CDDB"), rig.session.album().discId);
+    CHECK(contains(rig.session.ripLog(), "Format: alac\nEncoder: ALAC (built-in encoder), lossless"));
 }
 
 #if defined(CDREADER_HAVE_OPUS) || defined(CDREADER_HAVE_VORBIS)
