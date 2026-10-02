@@ -24,6 +24,7 @@
 #include "cdreader/audio_writer.h"
 #include "cdreader/resampler.h"
 #include "test_signals.h"
+#include "test_temp.h"
 
 namespace fs = std::filesystem;
 
@@ -277,7 +278,7 @@ int main(int argc, char** argv) {
     }
 
     Checker c;
-    c.dir = fs::temp_directory_path() / "cdreader_lossy_decode_check";
+    c.dir = cdr_test::testTempDir() / "cdreader_lossy_decode_check";
     fs::create_directories(c.dir);
     if (opus) checkOpus(c, tools);
     else std::printf("Opus: %s - skipped\n", haveOpus ? "opusdec / opusinfo not available" : "not built in");

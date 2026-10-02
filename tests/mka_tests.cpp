@@ -33,6 +33,7 @@
 #include "ebml_reader.h"
 #include "flac_decoder.h"
 #include "test_signals.h"
+#include "test_temp.h"
 
 namespace fs = std::filesystem;
 namespace id = cdr::mkv::id;
@@ -91,7 +92,7 @@ Bytes readFile(const fs::path& path) {
 }
 
 fs::path tempFile(const std::string& name) {
-    const fs::path dir = fs::temp_directory_path() / "cdreader_mka_tests";
+    const fs::path dir = cdr_test::testTempDir() / "cdreader_mka_tests";
     fs::create_directories(dir);
     return dir / name;
 }
@@ -851,7 +852,7 @@ int main() {
         }
         std::printf("%s %s\n", failures == before ? "[ OK ]" : "[FAIL]", name);
     }
-    fs::remove_all(fs::temp_directory_path() / "cdreader_mka_tests");
+    fs::remove_all(cdr_test::testTempDir() / "cdreader_mka_tests");
     std::printf("\n%s (%zu tests)\n", failures ? "FAILED" : "PASSED", registry().size());
     return failures ? 1 : 0;
 }

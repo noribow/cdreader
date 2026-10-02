@@ -549,6 +549,9 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build
 タグ・CUE シート・Ogg ページを検証します。
 環境変数 `CDREADER_TEST_OUTPUT` にディレクトリを指定すると、テストで作ったサンプル (タグ付き WAV、CUE、Ogg) をそこに残すので、
 ffprobe / MediaInfo / ExifTool / ogginfo などの外部ツールで確認できます。
+テストの一時ファイルは、テストプログラムごとにシステムの一時ディレクトリの下に作る専用のディレクトリ (`cdreader_test_<乱数>`) に書き、
+終了時に削除します。そのため `ctest -j` や複数のビルドツリーのテストを同時に実行しても衝突しません
+(`CDREADER_KEEP_TEST_TEMP=1` で削除せずに残します)。
 FLAC は MD5 / CRC / ビット書き込み / Rice 符号の単体テストと、テスト用の簡易デコーダ (`tests/flac_decoder.*`) による往復テストに加え、
 公式 `flac` コマンドがインストールされていれば (`apt-get install flac` など)、さまざまな合成信号を `flac -t` で検証・`flac -d` でデコードして
 元の PCM と一致することを確認するテスト (`flac_roundtrip`) と、埋め込み CUE シート (MCN・ISRC を含む) を `metaflac` で読み出し・再取り込みして確認するテスト (`flac_cuesheet`) も実行されます (無い場合はスキップ。

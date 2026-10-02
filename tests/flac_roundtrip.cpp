@@ -17,6 +17,7 @@
 
 #include "cdreader/flac_writer.h"
 #include "test_signals.h"
+#include "test_temp.h"
 
 namespace fs = std::filesystem;
 
@@ -56,7 +57,7 @@ int main(int argc, char** argv) {
         return 77;
     }
     const std::string flac = quote(fs::u8path(argv[1]));
-    const fs::path dir = fs::temp_directory_path() / "cdreader_flac_roundtrip";
+    const fs::path dir = cdr_test::testTempDir() / "cdreader_flac_roundtrip";
     fs::create_directories(dir);
 
     int failures = 0;

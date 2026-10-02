@@ -56,6 +56,7 @@
 #include "fake_drive.h"
 #include "flac_decoder.h"
 #include "test_signals.h"
+#include "test_temp.h"
 
 namespace {
 
@@ -451,7 +452,7 @@ TEST(not_ready_without_disc) {
 }
 
 TEST(wav_writer_produces_valid_header) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.wav";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test.wav";
     const std::vector<uint8_t> pcm = expectedTrackData(0, 2);
     {
         cdr::WavWriter wav;
@@ -1298,7 +1299,7 @@ std::vector<uint8_t> readAll(const std::filesystem::path& path) {
 // Encodes `pcm` with FlacWriter (in chunks of `chunk` bytes) and returns the file contents.
 std::vector<uint8_t> encodeFlac(const std::vector<uint8_t>& pcm, const cdr::TrackMetadata& meta = {},
                                 size_t chunk = cdr::kSectorBytes) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.flac";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test.flac";
     {
         cdr::FlacWriter flac;
         flac.open(path, meta);
@@ -1520,7 +1521,7 @@ TEST(flac_encoder_picks_cheap_representations) {
 }
 
 TEST(flac_writer_rejects_partial_sample) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_partial.flac";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_partial.flac";
     bool threw = false;
     {
         cdr::FlacWriter flac;
@@ -1744,7 +1745,7 @@ TEST(id3v2_tag_frames) {
 }
 
 TEST(wav_writer_writes_tags_after_data) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test_tags.wav";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test_tags.wav";
     cdr::TrackMetadata m = sampleAlbum().forTrack(1, 3);
     m.title = "日本語のタイトル";
     for (size_t dataSize : {size_t(2 * cdr::kSectorBytes), size_t(1001)}) {  // odd size needs a pad byte
@@ -1869,7 +1870,7 @@ TEST(single_file_rip_is_contiguous_with_offset) {
         options.readOffsetSamples = offset;
         cdr::Ripper ripper(drive, toc, options);
 
-        const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test_image.wav";
+        const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test_image.wav";
         std::vector<uint8_t> concatenated;
         {
             cdr::WavWriter image;
@@ -2140,7 +2141,7 @@ TEST(flac_writer_embeds_cuesheet) {
     cdr::FlacWriter writer;
     CHECK(writer.canEmbedCueSheet());
     writer.setEmbeddedCueSheet(sampleEmbeddedCue());
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_cuesheet_test.flac";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_cuesheet_test.flac";
     cdr::TrackMetadata meta;
     meta.album = "Album";
     writer.open(path, meta);
@@ -2190,7 +2191,7 @@ TEST(single_file_flac_rip_with_embedded_cuesheet) {
     for (const cdr::Track& t : toc.tracks) cue.totalSectors += t.lengthSectors;
     cue.text = cdr::formatCueSheet(album, tracks);
 
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_image_test.flac";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_image_test.flac";
     cdr::FlacWriter writer;
     writer.setEmbeddedCueSheet(cue);
     writer.open(path, album.forTrack(0, toc.lastTrack));
@@ -2329,7 +2330,7 @@ void checkOggFlacGranules(const OggFlac& o, uint64_t totalSamples) {
 
 std::vector<uint8_t> encodeOggFlac(const std::vector<uint8_t>& pcm, const cdr::TrackMetadata& meta,
                                    const cdr::EmbeddedCueSheet* cue = nullptr, size_t chunk = cdr::kSectorBytes) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.oga";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test.oga";
     {
         cdr::OggFlacWriter writer;
         CHECK(writer.canEmbedCueSheet());
@@ -2459,7 +2460,7 @@ TEST(oggflac_writer_embeds_cuesheet) {
         CHECK_EQ(c.tracks[3].offset, uint64_t(99 * 588));
     }
     // The CUESHEET block is the same as in the native FLAC file.
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_cuesheet_test.flac";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_cuesheet_test.flac";
     {
         cdr::FlacWriter flac;
         flac.setEmbeddedCueSheet(cue);
@@ -2472,7 +2473,7 @@ TEST(oggflac_writer_embeds_cuesheet) {
 }
 
 TEST(oggflac_writer_rejects_partial_sample) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_partial.oga";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_partial.oga";
     bool threw = false;
     {
         cdr::OggFlacWriter writer;
@@ -2785,7 +2786,7 @@ DecodedOpus checkAndDecodeOpus(const std::vector<uint8_t>& file) {
 }
 
 TEST(opus_writer_stream_structure_and_length) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.opus";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test.opus";
     const cdr::Resampler lengths(44100, 48000, 2);
     for (size_t samples : {size_t(0), size_t(1), size_t(147), size_t(1000), size_t(44100), size_t(44100 * 3 + 17)}) {
         const testsig::Signal s = testsig::tonesPcm(samples);
@@ -2804,7 +2805,7 @@ TEST(opus_writer_stream_structure_and_length) {
 }
 
 TEST(opus_writer_decodes_close_to_input) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.opus";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test.opus";
     const size_t samples = 44100 * 4 + 5;
     const testsig::Signal s = testsig::tonesPcm(samples);
     // The exact signal at 48 kHz (computed once, it is slow to evaluate).
@@ -2846,7 +2847,7 @@ TEST(opus_writer_decodes_close_to_input) {
 }
 
 TEST(opus_writer_rejects_partial_sample) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_partial.opus";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_partial.opus";
     cdr::OpusWriter writer;
     writer.open(path, {});
     const uint8_t bytes[3] = {1, 2, 3};
@@ -2948,7 +2949,7 @@ DecodedVorbis checkAndDecodeVorbis(const std::vector<uint8_t>& file) {
 }
 
 TEST(vorbis_writer_stream_structure_and_length) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.ogg";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test.ogg";
     for (size_t samples : {size_t(0), size_t(1), size_t(1000), size_t(44100), size_t(44100 * 3 + 17)}) {
         const testsig::Signal s = testsig::tonesPcm(samples);
         cdr::VorbisWriter writer;
@@ -2969,7 +2970,7 @@ TEST(vorbis_writer_stream_structure_and_length) {
 }
 
 TEST(vorbis_writer_decodes_close_to_input) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.ogg";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test.ogg";
     const size_t samples = 44100 * 4 + 5;
     const testsig::Signal s = testsig::tonesPcm(samples);
     std::vector<size_t> sizes;
@@ -3034,7 +3035,7 @@ cdr::TrackMetadata alacSampleMetadata() {
 std::vector<uint8_t> writeM4a(const std::vector<uint8_t>& pcm, const cdr::TrackMetadata& meta,
                               cdr::alac::EncoderOptions options = {}, const std::string& name = "alac.m4a",
                               unsigned* escaped = nullptr) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / ("cdreader_test_" + name);
+    const std::filesystem::path path = cdr_test::testTempDir() / ("cdreader_test_" + name);
     {
         cdr::AlacWriter w(options);
         w.open(path, meta);
@@ -3347,7 +3348,7 @@ TEST(alac_m4a_edge_cases) {
     CHECK(decodeM4a(writeM4a(one.pcm, m, {}, "alac_trk.m4a")).tags.at("trkn") == "7/0");
 
     // Input ending in the middle of a sample is an error.
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test_alac_partial.m4a";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test_alac_partial.m4a";
     cdr::AlacWriter w;
     w.open(path, {});
     const uint8_t bytes[6] = {};
@@ -3412,7 +3413,7 @@ TEST(alac_compression_against_flac) {
     // Our ALAC should be in the same league as our FLAC on music-like audio.
     const testsig::Signal s = testsig::music(44100 * 3);
     const DecodedM4a d = decodeM4a(writeM4a(s.pcm, {}, {}, "alac_ratio.m4a"));
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test_ratio.flac";
+    const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_test_ratio.flac";
     {
         cdr::FlacWriter w;
         w.open(path, {});
@@ -3743,7 +3744,7 @@ TEST(flac_rip_tags_isrc_per_track) {
     cdr::Ripper ripper(drive, toc, {});
     for (int n : {1, 2}) {
         const std::filesystem::path path =
-            std::filesystem::temp_directory_path() / ("cdreader_isrc_" + std::to_string(n) + ".flac");
+            cdr_test::testTempDir() / ("cdreader_isrc_" + std::to_string(n) + ".flac");
         cdr::FlacWriter writer;
         writer.open(path, album.forTrack(n, 3));
         ripper.ripTrack(*toc.findTrack(n), [&](const uint8_t* p, size_t b) { writer.write(p, b); });
@@ -4277,7 +4278,7 @@ TEST(single_file_image_with_htoa_and_gaps) {
         CHECK(cue.text.find("    INDEX 00 00:10:00\r\n    INDEX 01 00:12:00\r\n    INDEX 02 00:13:25\r\n") !=
               std::string::npos);
 
-        const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_htoa_image.flac";
+        const std::filesystem::path path = cdr_test::testTempDir() / "cdreader_htoa_image.flac";
         cdr::FlacWriter writer;
         writer.setEmbeddedCueSheet(cue);
         writer.open(path, album.forTrack(0, 3));
@@ -4344,7 +4345,7 @@ TEST(single_file_htoa_gaps_in_ogg_flac_and_alac) {
     auto encode = [&](const std::string& format, const std::string& name) {
         std::unique_ptr<cdr::AudioWriter> w = cdr::createAudioWriter(format);
         if (w->canEmbedCueSheet()) w->setEmbeddedCueSheet(cue);
-        const std::filesystem::path path = std::filesystem::temp_directory_path() / name;
+        const std::filesystem::path path = cdr_test::testTempDir() / name;
         w->open(path, album.forTrack(0, 3));
         for (size_t pos = 0; pos < image.size(); pos += 4000)
             w->write(image.data() + pos, std::min<size_t>(4000, image.size() - pos));
