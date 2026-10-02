@@ -12,6 +12,7 @@
 - 44.1 kHz / 16 bit / ステレオの WAV で保存 (トラックごとに `TrackNN.wav`)
 - 読み取りエラー時のリトライ、失敗したブロックはセクタ単位で再読込し、読めないセクタだけを無音で補完
 - `--verify` で 2 回読みして一致を確認 (セキュアモード)
+- ドライブの読み取りオフセット補正 (`--offset`、EAC / AccurateRip と同じ値)
 - トラックごとの CRC32 と `rip.log` (TOC・結果) を出力
 - CD-Extra (エンハンスド CD) のデータトラック・セッション間ギャップを考慮
 - freedb (CDDB) ディスク ID の計算
@@ -24,6 +25,7 @@ cdreader toc D:                     TOC (トラック一覧) を表示
 cdreader rip D:                     全オーディオトラックを cd_<CDDB ID>\ に保存
 cdreader rip D: -t 1,3-5 -o out     トラック 1,3,4,5 を out\ に保存
 cdreader rip D: --verify -r 10      2 回読み比較、リトライ 10 回
+cdreader rip D: --offset 6          読み取りオフセット +6 サンプルで補正
 ```
 
 | オプション | 説明 |
@@ -32,8 +34,21 @@ cdreader rip D: --verify -r 10      2 回読み比較、リトライ 10 回
 | `-t, --tracks <list>` | リッピングするトラック (例: `1,3-5`)。既定は全オーディオトラック |
 | `-r, --retries <n>` | 読み取り失敗時のリトライ回数 (既定: 5) |
 | `--verify` | 全ブロックを 2 回読みして比較 (低速) |
+| `--offset <n>` | 読み取りオフセット補正 (サンプル単位、負の値も可。既定: 0) |
 
 終了コード: `0` 成功 / `1` エラー / `2` 読めないセクタがあった。
+
+### 読み取りオフセット補正
+
+CD ドライブは機種ごとに、要求した位置から一定サンプル数ずれた音声データを返します (読み取りオフセット)。
+補正しないとトラックの境界が数サンプル〜数百サンプルずれ、AccurateRip などで照合できません。
+
+- 値は [AccurateRip のドライブオフセット一覧](https://www.accuraterip.com/driveoffsets.htm) で
+  `cdreader drives` に表示される機種名を探し、"Correction Offset" の値を `--offset` に指定します
+  (EAC の「読み取りオフセット補正値」と同じ符号です。例: `+6`, `+667`, `-472`)。
+- 1 サンプル = 4 バイト (16 bit ステレオ)。`+N` の場合、各トラックはドライブが返すデータの N サンプル後ろから切り出されます。
+- 補正によってディスクの先頭より前・リードアウトより後 (CD-Extra ではデータセッションとの間) にはみ出した部分は、
+  多くのドライブで読めないため無音で埋めます。その数は `rip.log` に記録されます。
 
 ドライブへのアクセスは SCSI パススルー (`IOCTL_SCSI_PASS_THROUGH_DIRECT`) を使います。
 "Access is denied" になる環境では管理者として実行してください。
@@ -65,7 +80,7 @@ cmake --build build-win
 cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
-テストは仮想ドライブ (`tests/fake_drive.*`) を使い、TOC 解析・リトライ・不良セクタ処理・2 回読み比較・WAV 出力を検証します。
+テストは仮想ドライブ (`tests/fake_drive.*`) を使い、TOC 解析・リトライ・不良セクタ処理・2 回読み比較・オフセット補正・WAV 出力を検証します。
 
 ## 構成
 
@@ -88,7 +103,7 @@ Android 版では USB ホスト API 経由の USB Mass Storage (Bulk-Only Transp
 ## 今後の予定
 
 - [ ] Android 版 (USB 外付け CD ドライブ、NDK + Kotlin UI)
-- [ ] ドライブ読み取りオフセット補正
+- [ ] オフセット値の自動検出 (AccurateRip データベースとの照合)、リードイン/リードアウトのオーバーリード
 - [ ] AccurateRip / MusicBrainz ディスク ID 対応
 - [ ] FLAC 出力、CD-TEXT・メタデータ取得によるファイル名付け
 - [ ] セキュアモードでのドライブキャッシュ回避 (現状の `--verify` はキャッシュされたデータを再読込する可能性があります)

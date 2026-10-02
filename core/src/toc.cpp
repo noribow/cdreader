@@ -61,6 +61,16 @@ const Track* Toc::findTrack(int number) const {
     return nullptr;
 }
 
+Toc::LbaRange Toc::audioRange(const Track& track) const {
+    LbaRange range{track.startLba, track.endLba()};
+    size_t i = 0;
+    while (i < tracks.size() && tracks[i].number != track.number) ++i;
+    if (i == tracks.size()) return range;
+    for (size_t j = i; j > 0 && tracks[j - 1].isAudio; --j) range.begin = tracks[j - 1].startLba;
+    for (size_t j = i + 1; j < tracks.size() && tracks[j].isAudio; ++j) range.end = tracks[j].endLba();
+    return range;
+}
+
 size_t Toc::audioTrackCount() const {
     size_t n = 0;
     for (const Track& t : tracks) n += t.isAudio ? 1 : 0;

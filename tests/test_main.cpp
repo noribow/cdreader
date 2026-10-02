@@ -1,5 +1,6 @@
 // Minimal self-contained test runner (no external dependencies).
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -63,6 +64,39 @@ std::vector<uint8_t> expectedTrackData(uint32_t start, uint32_t length) {
         for (size_t b = 0; b < cdr::kSectorBytes; ++b)
             v[size_t(s) * cdr::kSectorBytes + b] = FakeDrive::sampleByte(start + s, b);
     return v;
+}
+
+// Offset-corrected reference: the bytes starting `offsetSamples` after the
+// track start, with silence wherever that falls outside [readableBegin, readableEnd).
+std::vector<uint8_t> expectedWithOffset(uint32_t start, uint32_t length, int offsetSamples,
+                                        uint32_t readableBegin, uint32_t readableEnd) {
+    std::vector<uint8_t> v(size_t(length) * cdr::kSectorBytes);
+    const int64_t firstByte = (int64_t(start) * cdr::kSamplesPerSector + offsetSamples) * cdr::kBytesPerSample;
+    for (size_t i = 0; i < v.size(); ++i) {
+        const int64_t abs = firstByte + int64_t(i);
+        const int64_t lba = abs >= 0 ? abs / cdr::kSectorBytes : -1;
+        if (lba < int64_t(readableBegin) || lba >= int64_t(readableEnd)) continue;
+        v[i] = FakeDrive::sampleByte(uint32_t(lba), size_t(abs % cdr::kSectorBytes));
+    }
+    return v;
+}
+
+struct OffsetRip {
+    cdr::TrackRipResult result;
+    std::vector<uint8_t> bytes;
+};
+
+OffsetRip ripWithOffset(FakeDrive& fake, int trackNumber, int offset) {
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    cdr::RipOptions options;
+    options.readOffsetSamples = offset;
+    cdr::Ripper ripper(drive, toc, options);
+    OffsetRip out;
+    out.result = ripper.ripTrack(*toc.findTrack(trackNumber), [&](const uint8_t* p, size_t n) {
+        out.bytes.insert(out.bytes.end(), p, p + n);
+    });
+    return out;
 }
 
 struct Collected {
@@ -161,7 +195,7 @@ TEST(rip_clean_track_returns_exact_audio) {
     FakeDrive fake = makeAudioDisc();
     cdr::CdDrive drive(fake);
     cdr::Toc toc = drive.readToc();
-    cdr::Ripper ripper(drive, {});
+    cdr::Ripper ripper(drive, toc, {});
     Collected out;
     uint32_t lastDone = 0, lastTotal = 0;
     cdr::TrackRipResult r = ripper.ripTrack(*toc.findTrack(2), out.sink(), [&](uint32_t d, uint32_t t) {
@@ -184,9 +218,10 @@ TEST(rip_retries_transient_errors) {
     FakeDrive fake = makeAudioDisc();
     fake.failuresBySector[310] = 2;
     cdr::CdDrive drive(fake);
-    cdr::Ripper ripper(drive, {});
+    cdr::Toc toc = drive.readToc();
+    cdr::Ripper ripper(drive, toc, {});
     Collected out;
-    cdr::TrackRipResult r = ripper.ripTrack(*drive.readToc().findTrack(2), out.sink());
+    cdr::TrackRipResult r = ripper.ripTrack(*toc.findTrack(2), out.sink());
     CHECK(r.clean());
     CHECK_EQ(r.retries, 2u);
     CHECK(out.bytes == expectedTrackData(300, 150));
@@ -196,9 +231,10 @@ TEST(rip_isolates_unreadable_sector) {
     FakeDrive fake = makeAudioDisc();
     fake.failuresBySector[320] = -1;
     cdr::CdDrive drive(fake);
-    cdr::Ripper ripper(drive, {2, false});
+    cdr::Toc toc = drive.readToc();
+    cdr::Ripper ripper(drive, toc, {2, false});
     Collected out;
-    cdr::TrackRipResult r = ripper.ripTrack(*drive.readToc().findTrack(2), out.sink());
+    cdr::TrackRipResult r = ripper.ripTrack(*toc.findTrack(2), out.sink());
     CHECK_EQ(r.unreadableSectors, 1u);
     CHECK(!r.clean());
     std::vector<uint8_t> expected = expectedTrackData(300, 150);
@@ -211,9 +247,10 @@ TEST(rip_verify_detects_unstable_data) {
     FakeDrive fake = makeAudioDisc();
     fake.unstableSectors[5] = true;
     cdr::CdDrive drive(fake);
-    cdr::Ripper ripper(drive, {1, true});
+    cdr::Toc toc = drive.readToc();
+    cdr::Ripper ripper(drive, toc, {1, true});
     Collected out;
-    cdr::TrackRipResult r = ripper.ripTrack(*drive.readToc().findTrack(1), out.sink());
+    cdr::TrackRipResult r = ripper.ripTrack(*toc.findTrack(1), out.sink());
     CHECK_EQ(r.unreadableSectors, 1u);
     CHECK(r.retries > 0);
 }
@@ -222,12 +259,77 @@ TEST(rip_verify_clean_disc_reads_twice) {
     FakeDrive fake = makeAudioDisc();
     cdr::CdDrive drive(fake);
     cdr::Toc toc = drive.readToc();
-    cdr::Ripper ripper(drive, {0, true});
+    cdr::Ripper ripper(drive, toc, {0, true});
     Collected out;
     cdr::TrackRipResult r = ripper.ripTrack(*toc.findTrack(1), out.sink());
     CHECK(r.clean());
     const int blocks = int((300 + cdr::kMaxSectorsPerRead - 1) / cdr::kMaxSectorsPerRead);
     CHECK_EQ(fake.readCommands, 2 * blocks);
+}
+
+TEST(audio_range_spans_consecutive_audio_tracks) {
+    FakeDrive fake({{0, true}, {5000, false}, {8000, false}, {20000, true}}, 30000);
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    cdr::Toc::LbaRange r = toc.audioRange(*toc.findTrack(3));
+    CHECK_EQ(r.begin, 5000u);
+    CHECK_EQ(r.end, 20000u - cdr::kSessionGapSectors);
+}
+
+TEST(offset_zero_matches_plain_rip) {
+    FakeDrive fake = makeAudioDisc();
+    OffsetRip r = ripWithOffset(fake, 2, 0);
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK_EQ(r.result.paddedSamples, 0u);
+}
+
+TEST(offset_positive_shifts_into_next_track) {
+    for (int offset : {6, 48, 588, 667, 1176 + 30}) {
+        FakeDrive fake = makeAudioDisc();
+        OffsetRip r = ripWithOffset(fake, 2, offset);
+        CHECK_EQ(r.bytes.size(), size_t(150) * cdr::kSectorBytes);
+        CHECK(r.bytes == expectedWithOffset(300, 150, offset, 0, 750));
+        CHECK_EQ(r.result.paddedSamples, 0u);
+        CHECK(r.result.clean());
+    }
+}
+
+TEST(offset_negative_shifts_into_previous_track) {
+    for (int offset : {-6, -472, -588, -1500}) {
+        FakeDrive fake = makeAudioDisc();
+        OffsetRip r = ripWithOffset(fake, 2, offset);
+        CHECK(r.bytes == expectedWithOffset(300, 150, offset, 0, 750));
+        CHECK_EQ(r.result.paddedSamples, 0u);
+    }
+}
+
+TEST(offset_pads_silence_past_lead_out) {
+    FakeDrive fake = makeAudioDisc();
+    OffsetRip r = ripWithOffset(fake, 3, 667);
+    CHECK(r.bytes == expectedWithOffset(450, 300, 667, 0, 750));
+    CHECK_EQ(r.result.paddedSamples, 667u);
+    CHECK(r.result.clean());
+    const size_t tail = 667 * cdr::kBytesPerSample;  // the last 667 samples are silence
+    CHECK(std::all_of(r.bytes.end() - tail, r.bytes.end(), [](uint8_t b) { return b == 0; }));
+}
+
+TEST(offset_pads_silence_before_first_sector) {
+    FakeDrive fake = makeAudioDisc();
+    OffsetRip r = ripWithOffset(fake, 1, -30);
+    CHECK(r.bytes == expectedWithOffset(0, 300, -30, 0, 750));
+    CHECK_EQ(r.result.paddedSamples, 30u);
+    CHECK(r.result.clean());
+}
+
+TEST(offset_does_not_read_into_data_session) {
+    // The sectors between the audio session and the data track must not be read.
+    FakeDrive fake({{0, false}, {20000, false}, {50000, true}}, 60000);
+    const uint32_t audioEnd = 50000 - cdr::kSessionGapSectors;
+    for (uint32_t s = audioEnd; s < audioEnd + 4; ++s) fake.failuresBySector[s] = -1;
+    OffsetRip r = ripWithOffset(fake, 2, 700);
+    CHECK(r.result.clean());
+    CHECK_EQ(r.result.paddedSamples, 700u);
+    CHECK(r.bytes == expectedWithOffset(20000, audioEnd - 20000, 700, 0, audioEnd));
 }
 
 TEST(not_ready_without_disc) {

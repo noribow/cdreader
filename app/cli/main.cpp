@@ -4,6 +4,7 @@
 #include <shellapi.h>
 
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -42,6 +43,8 @@ void printUsage() {
         "  -o, --output <dir>    Output directory (default: cd_<CDDB id>)\n"
         "  -t, --tracks <list>   Tracks to rip, e.g. 1,3-5 (default: all audio tracks)\n"
         "  -r, --retries <n>     Retries per failing read (default: 5)\n"
+        "      --offset <n>      Drive read offset correction in samples, e.g. 6 or -472\n"
+        "                        (same value as EAC / AccurateRip; default: 0)\n"
         "      --verify          Read everything twice and compare (slower)\n"
         "\n"
         "<drive> is a drive letter such as D or D:\n",
@@ -68,14 +71,20 @@ char parseDriveLetter(const std::string& arg) {
     throw UsageError("invalid drive '" + arg + "' (expected a letter such as D or D:)");
 }
 
-int parseInt(const std::string& s, const char* what) {
+int parseSignedInt(const std::string& s, const char* what) {
     try {
         size_t used = 0;
         int v = std::stoi(s, &used);
-        if (used == s.size() && v >= 0) return v;
+        if (used == s.size() && !s.empty() && s[0] != ' ') return v;
     } catch (const std::exception&) {
     }
     throw UsageError(std::string("invalid ") + what + " '" + s + "'");
+}
+
+int parseInt(const std::string& s, const char* what) {
+    const int v = parseSignedInt(s, what);
+    if (v < 0) throw UsageError(std::string("invalid ") + what + " '" + s + "'");
+    return v;
 }
 
 std::set<int> parseTrackList(const std::string& spec) {
@@ -171,6 +180,7 @@ int cmdRip(const std::vector<std::string>& args) {
         if (a == "-o" || a == "--output") outputDir = value();
         else if (a == "-t" || a == "--tracks") wanted = parseTrackList(value());
         else if (a == "-r" || a == "--retries") options.maxRetries = parseInt(value(), "retry count");
+        else if (a == "--offset") options.readOffsetSamples = parseSignedInt(value(), "read offset");
         else if (a == "--verify") options.verify = true;
         else throw UsageError("unknown option '" + a + "'");
     }
@@ -190,18 +200,24 @@ int cmdRip(const std::vector<std::string>& args) {
     for (int n : wanted)
         if (!toc.findTrack(n)) throw UsageError("track " + std::to_string(n) + " is not on this disc");
     if (selected.empty()) throw std::runtime_error("no audio tracks to rip");
+    // Far beyond any real drive (known offsets are within about +-3000 samples).
+    if (std::abs(options.readOffsetSamples) > int(100 * cdr::kSamplesPerSector))
+        throw UsageError("read offset out of range");
 
     const fs::path dir = fs::u8path(outputDir.empty() ? "cd_" + hex32(toc.cddbId()) : outputDir);
     fs::create_directories(dir);
 
     std::printf("Drive: %s\n", d.info.displayName().c_str());
+    std::printf("Read offset correction: %+d samples\n", options.readOffsetSamples);
     std::printf("Output: %s\n\n", dir.u8string().c_str());
 
     std::ofstream log(dir / "rip.log");
     log << "cdreader " << kVersion << " rip log\n"
         << "Drive: " << d.info.displayName() << "\n"
         << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
-        << "\n\n";
+        << "\n"
+        << "Read offset correction: " << (options.readOffsetSamples > 0 ? "+" : "") << options.readOffsetSamples
+        << " samples\n\n";
     {
         char line[256];
         log << "CDDB disc id: " << hex32(toc.cddbId()) << "\n";
@@ -213,7 +229,7 @@ int cmdRip(const std::vector<std::string>& args) {
         log << "\n";
     }
 
-    cdr::Ripper ripper(*d.drive, options);
+    cdr::Ripper ripper(*d.drive, toc, options);
     int problems = 0;
     for (const cdr::Track& t : selected) {
         char name[32];
@@ -238,7 +254,9 @@ int cmdRip(const std::vector<std::string>& args) {
         const std::string status = r.clean() ? "OK" : std::to_string(r.unreadableSectors) + " unreadable sector(s)";
         std::printf("  CRC32 %s  %s%s\n", hex32(r.crc32).c_str(), status.c_str(),
                     r.retries ? ("  (" + std::to_string(r.retries) + " retries)").c_str() : "");
-        log << name << "  CRC32 " << hex32(r.crc32) << "  retries " << r.retries << "  " << status << "\n";
+        log << name << "  CRC32 " << hex32(r.crc32) << "  retries " << r.retries << "  " << status;
+        if (r.paddedSamples) log << "  (" << r.paddedSamples << " samples outside the disc padded with silence)";
+        log << "\n";
         if (!r.clean()) ++problems;
     }
 
