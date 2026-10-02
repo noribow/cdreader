@@ -13,16 +13,20 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.text.method.ScrollingMovementMethod
 import android.view.View
 import android.view.WindowInsets
+import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ListView
 import android.widget.ProgressBar
+import android.widget.RadioButton
+import android.widget.RadioGroup
+import android.widget.Spinner
 import android.widget.TextView
-import android.widget.Toast
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -32,10 +36,11 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * Single screen: connect to a USB CD drive, show its TOC, rip the selected
- * tracks to WAV files in a folder chosen with the Storage Access Framework.
- * USB I/O and ripping run on one worker thread ([worker]); the native
- * session is only touched from there (except cancel()).
+ * Single screen: connect to a USB CD drive, show its TOC (with titles from
+ * CDDB), rip the selected tracks to FLAC or WAV files in a folder chosen with
+ * the Storage Access Framework and check them against AccurateRip.
+ * USB I/O, network lookups and ripping run on one worker thread ([worker]);
+ * the native session is only touched from there (except cancel()).
  */
 class MainActivity : Activity() {
     private companion object {
@@ -44,12 +49,18 @@ class MainActivity : Activity() {
         const val PREFS = "settings"
         const val PREF_FOLDER = "outputTree"
         const val PREF_OFFSET = "readOffset"
+        const val PREF_FORMAT = "format"
+        const val PREF_CDDB = "cddb"
+        const val PREF_ACCURATERIP = "accurateRip"
         const val MAX_RETRIES = 5
         const val READY_WAIT_SECONDS = 30
+        const val USER_AGENT = "cdreader/0.1.0 (Android)"
+        const val CDDB_SERVER = ""  // the default server (gnudb.org)
     }
 
     private lateinit var usbManager: UsbManager
     private val worker: ExecutorService = Executors.newSingleThreadExecutor()
+    private val http = HttpGet(USER_AGENT)
 
     private lateinit var buttonConnect: Button
     private lateinit var buttonFolder: Button
@@ -58,9 +69,16 @@ class MainActivity : Activity() {
     private lateinit var textDisc: TextView
     private lateinit var textFolder: TextView
     private lateinit var textStatus: TextView
+    private lateinit var textResults: TextView
     private lateinit var listTracks: ListView
+    private lateinit var spinnerMatch: Spinner
     private lateinit var editOffset: EditText
     private lateinit var checkVerify: CheckBox
+    private lateinit var checkCddb: CheckBox
+    private lateinit var checkAccurateRip: CheckBox
+    private lateinit var groupFormat: RadioGroup
+    private lateinit var radioFlac: RadioButton
+    private lateinit var radioWav: RadioButton
     private lateinit var progress: ProgressBar
 
     // Owned by the worker thread once opened.
@@ -70,9 +88,15 @@ class MainActivity : Activity() {
     @Volatile private var session: CdSession? = null
     private val sessionLock = Any()  // cancel() from the UI thread vs. close() on the worker
 
+    // Read by the worker when a disc is loaded.
+    @Volatile private var cddbEnabled = true
+    // Set on the UI thread; stops a rip between tracks, even before it reached native code.
+    @Volatile private var cancelRequested = false
+
     // UI thread state.
     private var driveName = ""
     private var toc: DiscToc? = null
+    private var metadata: DiscMetadata? = null
     private var outputTree: Uri? = null
     private var ripping = false
 
@@ -105,21 +129,53 @@ class MainActivity : Activity() {
         textDisc = findViewById(R.id.textDisc)
         textFolder = findViewById(R.id.textFolder)
         textStatus = findViewById(R.id.textStatus)
+        textResults = findViewById(R.id.textResults)
         listTracks = findViewById(R.id.listTracks)
+        spinnerMatch = findViewById(R.id.spinnerMatch)
         editOffset = findViewById(R.id.editOffset)
         checkVerify = findViewById(R.id.checkVerify)
+        checkCddb = findViewById(R.id.checkCddb)
+        checkAccurateRip = findViewById(R.id.checkAccurateRip)
+        groupFormat = findViewById(R.id.groupFormat)
+        radioFlac = findViewById(R.id.radioFlac)
+        radioWav = findViewById(R.id.radioWav)
         progress = findViewById(R.id.progress)
+        textResults.movementMethod = ScrollingMovementMethod()
         applySystemBarInsets(findViewById(R.id.root))
 
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         editOffset.setText(prefs.getInt(PREF_OFFSET, 0).toString())
         prefs.getString(PREF_FOLDER, null)?.let { setOutputTree(Uri.parse(it)) }
+        if (prefs.getString(PREF_FORMAT, "flac") == "wav") radioWav.isChecked = true else radioFlac.isChecked = true
+        cddbEnabled = prefs.getBoolean(PREF_CDDB, true)
+        checkCddb.isChecked = cddbEnabled
+        checkAccurateRip.isChecked = prefs.getBoolean(PREF_ACCURATERIP, true)
 
         buttonConnect.setOnClickListener { if (connection == null) connect() else reloadDisc() }
         buttonFolder.setOnClickListener {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQUEST_FOLDER)
         }
         buttonRip.setOnClickListener { if (ripping) cancelRip() else startRip() }
+        groupFormat.setOnCheckedChangeListener { _, _ ->
+            prefs.edit().putString(PREF_FORMAT, selectedFormat()).apply()
+        }
+        checkAccurateRip.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(PREF_ACCURATERIP, checked).apply()
+        }
+        checkCddb.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(PREF_CDDB, checked).apply()
+            cddbEnabled = checked
+            if (toc != null && !ripping) lookUpAgain(0)
+        }
+        spinnerMatch.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                // Also called for the selection made in showMetadata().
+                val meta = metadata ?: return
+                if (position != meta.chosenMatch && toc != null && !ripping) lookUpAgain(position)
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
 
         val filter = IntentFilter().apply {
             addAction(ACTION_USB_PERMISSION)
@@ -233,12 +289,16 @@ class MainActivity : Activity() {
         }
     }
 
-    // Worker thread: waits for the disc to spin up, then reads the TOC.
+    // Worker thread: waits for the disc to spin up, reads the TOC, then looks
+    // the disc up on CDDB.
     private fun loadDisc(s: CdSession) {
         runOnUiThread {
             toc = null
+            metadata = null
             listTracks.adapter = null
+            spinnerMatch.visibility = View.GONE
             textDisc.text = ""
+            textResults.visibility = View.GONE
             setStatus("ディスクを待っています…")
         }
         var ready = s.isReady()
@@ -251,9 +311,39 @@ class MainActivity : Activity() {
         if (!ready) throw IOException("ディスクが挿入されていないか、準備ができていません")
         val disc = s.readToc()
         runOnUiThread { showToc(disc) }
+        lookUp(s, cddbEnabled, 0)
+    }
+
+    // Worker thread. A failed lookup only means generic names.
+    private fun lookUp(s: CdSession, enabled: Boolean, matchIndex: Int) {
+        if (enabled) runOnUiThread { setStatus("CDDB で検索しています…") }
+        val meta = try {
+            s.lookupCddb(enabled, CDDB_SERVER, matchIndex, http)
+        } catch (e: Exception) {
+            null
+        }
+        runOnUiThread {
+            if (meta != null) showMetadata(meta)
+            setBusy(false)
+        }
+    }
+
+    /** After the CDDB switch or the chosen match changed. */
+    private fun lookUpAgain(matchIndex: Int) {
+        val enabled = cddbEnabled
+        setBusy(true)
+        worker.execute {
+            val s = session
+            if (s == null) {
+                runOnUiThread { setBusy(false) }
+                return@execute
+            }
+            lookUp(s, enabled, matchIndex)
+        }
     }
 
     private fun cancelRip() {
+        cancelRequested = true
         synchronized(sessionLock) { session?.cancel() }
     }
 
@@ -264,7 +354,9 @@ class MainActivity : Activity() {
         massStorage = null
         device = null
         toc = null
+        metadata = null
         listTracks.adapter = null
+        spinnerMatch.visibility = View.GONE
         textDisc.text = ""
         buttonConnect.text = getString(R.string.connect)
         updateRipButton()
@@ -291,46 +383,47 @@ class MainActivity : Activity() {
             ?: return setStatus("読み取りオフセットは整数で指定してください")
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(PREF_OFFSET, offset).apply()
         val verify = checkVerify.isChecked
-        val drive = driveName
+        val format = selectedFormat()
+        val accurateRip = checkAccurateRip.isChecked
 
         ripping = true
+        cancelRequested = false
         setBusy(true)
         buttonRip.isEnabled = true
         buttonRip.text = getString(R.string.cancel)
         progress.progress = 0
+        textResults.text = ""
+        textResults.visibility = View.GONE
 
         worker.execute {
-            val temp = File(cacheDir, "rip.wav")
-            val log = StringBuilder()
-            log.append("cdreader (Android) rip log\n")
-                .append("Drive: ").append(drive).append('\n')
-                .append("CDDB disc id: ").append(disc.cddbHex).append('\n')
-                .append("Read offset: ").append(offset).append(" samples\n")
-                .append("Verify: ").append(if (verify) "yes" else "no").append("\n\n")
+            val temp = File(cacheDir, "rip.$format")
             var message: String
+            var results: String? = null
             try {
-                val dir = createDocument(treeDocument(tree), DocumentsContract.Document.MIME_TYPE_DIR, "cd_${disc.cddbHex}")
+                s.beginRip(format, offset, MAX_RETRIES, verify)
+                val dir = createDocument(treeDocument(tree), DocumentsContract.Document.MIME_TYPE_DIR, s.albumFolderName())
                 var problems = 0
                 for ((index, track) in selected.withIndex()) {
+                    if (cancelRequested) throw CancellationException()
                     val label = "トラック ${track.number} (${index + 1}/${selected.size})"
                     runOnUiThread { setStatus("$label を読み取り中…") }
-                    val r = s.ripTrack(track.number, temp.path, offset, MAX_RETRIES, verify) { done, total ->
+                    val r = s.ripTrack(track.number, temp.path) { done, total ->
                         val permille = if (total > 0) (1000L * done / total).toInt() else 0
                         runOnUiThread {
                             progress.progress = permille
                             setStatus("$label  ${permille / 10}%")
                         }
                     }
-                    val name = "Track%02d.wav".format(track.number)
-                    copyToDocument(temp, createDocument(dir, "audio/x-wav", name))
+                    copyToDocument(temp, createDocument(dir, mimeType(format), s.trackFileName(track.number, format)))
                     if (!r.clean) problems++
-                    log.append("Track %2d  %s  CRC32 %08X  retries %d  unreadable sectors %d  padded samples %d\n"
-                        .format(track.number, name, r.crc32, r.retries, r.unreadableSectors, r.paddedSamples))
                 }
+                if (accurateRip) runOnUiThread { setStatus("AccurateRip データベースを照会しています…") }
+                val summary = s.checkAccurateRip(accurateRip, http)
+                val log = s.ripLog()
+                writeText(createDocument(dir, "application/octet-stream", "rip.log"), log)
+                results = describeAccurateRip(summary)
                 message = if (problems == 0) "完了しました (${selected.size} トラック)"
                 else "完了しましたが、$problems トラックに読めないセクタがありました (rip.log を参照)"
-                log.append('\n').append(if (problems == 0) "All tracks ripped without errors" else "Finished with errors").append('\n')
-                writeText(createDocument(dir, "application/octet-stream", "rip.log"), log.toString())
             } catch (e: CancellationException) {
                 message = "キャンセルしました"
             } catch (e: Exception) {
@@ -343,8 +436,47 @@ class MainActivity : Activity() {
                 buttonRip.text = getString(R.string.rip)
                 setBusy(false)
                 setStatus(message)
+                if (results != null) {
+                    textResults.text = results
+                    textResults.scrollTo(0, 0)
+                    textResults.visibility = View.VISIBLE
+                }
             }
         }
+    }
+
+    private fun selectedFormat(): String = if (radioWav.isChecked) "wav" else "flac"
+
+    private fun mimeType(format: String): String = if (format == "flac") "audio/flac" else "audio/x-wav"
+
+    // e.g. "Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2"
+    private fun describeAccurateRip(summary: AccurateRipSummary): String {
+        val lines = mutableListOf<String>()
+        when (summary.status) {
+            AccurateRipStatus.DISABLED -> lines += "AccurateRip: 照合しませんでした"
+            AccurateRipStatus.NOT_FOUND -> lines += "AccurateRip: このディスクはデータベースに未登録です"
+            AccurateRipStatus.ERROR -> lines += "AccurateRip: 照会に失敗しました (${summary.error})"
+            AccurateRipStatus.FOUND -> {
+                lines += "AccurateRip: %d / %d トラックが一致 (データベース登録 %d トラック, プレス %d 種)".format(
+                    summary.accurateTracks, summary.tracks.size, summary.tracksInDatabase, summary.pressings
+                )
+                if (summary.accurateTracks == 0 && summary.tracksInDatabase > 0)
+                    lines += "一致しません。読み取りオフセットを確認してください"
+                for (t in summary.tracks) {
+                    lines += when {
+                        t.accurate -> "Track %02d: 一致 (%s) v2 %d / v1 %d / %d 件, プレス %d/%d".format(
+                            t.number, t.matchedVersion, t.v2Confidence, t.v1Confidence, t.totalConfidence,
+                            t.matchingPressings, t.pressings
+                        )
+                        t.inDatabase -> "Track %02d: 不一致 v2 0 / v1 0 / %d 件, プレス 0/%d".format(
+                            t.number, t.totalConfidence, t.pressings
+                        )
+                        else -> "Track %02d: データベースに未登録".format(t.number)
+                    }
+                }
+            }
+        }
+        return lines.joinToString("\n")
     }
 
     private fun treeDocument(tree: Uri): Uri =
@@ -354,9 +486,9 @@ class MainActivity : Activity() {
         DocumentsContract.createDocument(contentResolver, parent, mimeType, name)
             ?: throw IOException("$name を作成できませんでした")
 
-    // The WAV header is patched at the end, so the file is written locally and
-    // then streamed through the document's ParcelFileDescriptor (providers
-    // may hand out non-seekable pipes).
+    // WAV and FLAC headers are patched at the end, so the file is written
+    // locally and then streamed through the document's ParcelFileDescriptor
+    // (providers may hand out non-seekable pipes).
     private fun copyToDocument(source: File, document: Uri) {
         val pfd = contentResolver.openFileDescriptor(document, "w") ?: throw IOException("cannot open $document")
         pfd.use {
@@ -374,19 +506,58 @@ class MainActivity : Activity() {
 
     private fun showToc(disc: DiscToc) {
         toc = disc
-        val audio = disc.tracks.count { it.isAudio }
-        textDisc.text = "%d トラック  全長 %s  CDDB %s".format(
-            disc.tracks.size, formatMsf(disc.leadOutLba), disc.cddbHex
+        metadata = null
+        showDiscInfo()
+        showTracks(checked = disc.tracks.map { it.isAudio })
+        setStatus("${disc.tracks.count { it.isAudio }} 個のオーディオトラック")
+    }
+
+    private fun showMetadata(meta: DiscMetadata) {
+        val disc = toc ?: return
+        metadata = meta
+        showDiscInfo()
+        showTracks(checked = disc.tracks.indices.map { listTracks.isItemChecked(it) })
+        if (meta.matches.size > 1) {
+            spinnerMatch.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, meta.matches)
+            spinnerMatch.setSelection(meta.chosenMatch, false)
+            spinnerMatch.visibility = View.VISIBLE
+        } else {
+            spinnerMatch.visibility = View.GONE
+        }
+        val audio = "${disc.tracks.count { it.isAudio }} 個のオーディオトラック"
+        setStatus(
+            when {
+                meta.found && meta.matches.size > 1 -> "CDDB: ${meta.matches.size} 件の候補から選択できます  $audio"
+                meta.found -> "CDDB: 見つかりました  $audio"
+                meta.message == "disabled" -> audio
+                else -> "CDDB: 見つかりませんでした (${meta.message})  $audio"
+            }
         )
-        val rows = disc.tracks.map { t ->
+    }
+
+    private fun showDiscInfo() {
+        val disc = toc ?: return
+        val meta = metadata
+        val header = "%d トラック  全長 %s  CDDB %s".format(disc.tracks.size, formatMsf(disc.leadOutLba), disc.cddbHex)
+        textDisc.text = if (meta != null && meta.found) {
+            val year = if (meta.year.isNotEmpty()) " (${meta.year})" else ""
+            "${meta.artist} / ${meta.album}$year\n$header"
+        } else {
+            header
+        }
+    }
+
+    private fun showTracks(checked: List<Boolean>) {
+        val disc = toc ?: return
+        val labels = metadata?.trackLabels.orEmpty()
+        val rows = disc.tracks.mapIndexed { i, t ->
             val kind = if (t.isAudio) "" else "  (データ)"
             val emphasis = if (t.preEmphasis) "  (プリエンファシス)" else ""
-            "%02d   %s%s%s".format(t.number, formatMsf(t.lengthSectors), kind, emphasis)
+            val title = labels.getOrNull(i).orEmpty().let { if (it.isEmpty()) "" else "  $it" }
+            "%02d   %s%s%s%s".format(t.number, formatMsf(t.lengthSectors), title, kind, emphasis)
         }
         listTracks.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_multiple_choice, rows)
-        disc.tracks.forEachIndexed { i, t -> listTracks.setItemChecked(i, t.isAudio) }
-        setStatus("$audio 個のオーディオトラック")
-        setBusy(false)
+        disc.tracks.forEachIndexed { i, t -> listTracks.setItemChecked(i, t.isAudio && checked.getOrElse(i) { true }) }
     }
 
     private fun setOutputTree(uri: Uri) {
@@ -401,6 +572,11 @@ class MainActivity : Activity() {
         buttonFolder.isEnabled = !busy
         editOffset.isEnabled = !busy
         checkVerify.isEnabled = !busy
+        checkCddb.isEnabled = !busy
+        checkAccurateRip.isEnabled = !busy
+        radioFlac.isEnabled = !busy
+        radioWav.isEnabled = !busy
+        spinnerMatch.isEnabled = !busy
         listTracks.isEnabled = !busy
         updateRipButton(busy)
     }

@@ -219,7 +219,8 @@ FLAC のタグは `VORBIS_COMMENT` に書きます (FLAC 出力の節を参照)�
 
 ## 使い方 (Android)
 
-Android 端末に USB の外付け CD/DVD ドライブを接続し、アプリから直接オーディオトラックを読み取って WAV で保存します。
+Android 端末に USB の外付け CD/DVD ドライブを接続し、アプリから直接オーディオトラックを読み取って FLAC または WAV で保存します。
+Windows 版と同じコアを使うため、CDDB による曲名の取得 (タグ・ファイル名)、AccurateRip による照合、`rip.log` も同じ内容です。
 root 化は不要です (Android の USB ホスト API で得たファイルディスクリプタ経由で、USB Mass Storage Bulk-Only Transport の
 SCSI/MMC コマンドを送ります)。
 
@@ -231,18 +232,31 @@ SCSI/MMC コマンドを送ります)。
   Y 字ケーブル、または給電機能付きの USB ハブ経由での接続を推奨します
 - インターフェースクラス 8 (Mass Storage)、プロトコル 0x50 (Bulk-Only) のドライブ (一般的な USB CD/DVD ドライブ)。
   UAS 専用のドライブには未対応です
+- CDDB と AccurateRip の照会にはインターネット接続が必要です (アプリは `INTERNET` 権限を使います)。
+  接続できなくてもリッピング自体は行えます
 
 ### 使い方
 
 1. ドライブに音楽 CD を入れ、端末に接続します。「cdreader を開きますか?」と表示されたら開きます
    (表示されない場合はアプリを起動して「ドライブに接続」を押し、USB へのアクセスを許可します)。
-2. ドライブ名とトラック一覧 (長さ) が表示されます。ディスクを入れ替えたら「TOC を再読込」を押します。
+2. ドライブ名とトラック一覧 (長さ) が表示されます。「CDDB で曲名を取得」がオン (既定) なら CDDB (gnudb.org) で検索し、
+   アーティスト・アルバム名・曲名を表示します。候補が複数あるときは一覧の上の選択欄で切り替えられます。
+   ディスクを入れ替えたら「TOC を再読込」を押します。
 3. 「保存先フォルダ」で保存先を選びます (Storage Access Framework。選んだフォルダは次回以降も使われます)。
-4. 必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値) と「2 回読みして比較」を設定し、
-   保存するトラックにチェックを付けて「リッピング」を押します。
+4. 形式 (FLAC / WAV)、必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値)、「2 回読みして比較」、
+   「AccurateRip で照合」(既定でオン) を設定し、保存するトラックにチェックを付けて「リッピング」を押します。
+5. リッピング後、AccurateRip の結果がトラックごとに表示されます
+   (例: `Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2` — 一致したチェックサムの版、v2 / v1 それぞれの一致件数、
+   登録件数の合計、一致したプレス数 / そのトラックの登録があるプレス数)。1 トラックも一致しない場合は読み取りオフセットを確認してください。
 
-保存先フォルダの下に `cd_<CDDB ID>/TrackNN.wav` と `rip.log` (CRC32・リトライ回数・読めなかったセクタ数) が作られます。
+保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`) と `rip.log` が作られます。
+ファイルにはタグ (曲名・アーティスト・アルバム・年・ジャンル・トラック番号・CDDB ID) が書き込まれます。
+`rip.log` には Windows 版と同じく、ドライブ・設定・TOC・CDDB の結果・トラックごとの CRC32 / リトライ回数 / 読めなかったセクタ数・
+AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
 読み取り中は「キャンセル」で中断できます。リトライ回数は 5 回固定です。
+CDDB や AccurateRip に接続できなかった場合も、リッピングはそのまま行われます (ファイル名は `TrackNN`、結果は `rip.log` に記録)。
+AccurateRip のデータベースは HTTP でしか提供されていないため、`www.accuraterip.com` に限って平文通信を許可しています
+(`res/xml/network_security_config.xml`)。
 
 ## ビルド
 
@@ -282,6 +296,8 @@ CDDB は偽の `HttpClient` を使い (ネットワークには接続しませ�
 AccurateRip はネットワークに接続せず (偽の `HttpClient` を使用)、実在のディスクの ID・データベース応答と、独立した参照実装で求めたチェックサムで検証します。
 `cdreader_usb_tests` は仮想 USB デバイス (`tests/fake_usb_device.*`) を使って Android 版の USB Bulk-Only Transport
 (CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング) を検証します。
+`cdreader_rip_session_tests` は Android 版のリッピング処理 (`platform/android/rip_session.*`) を仮想 USB デバイスと偽の `HttpClient` で検証します
+(FLAC / WAV 出力とデコード結果の一致、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`)。
 
 ### Android アプリ
 
@@ -296,8 +312,9 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Android Studio で `android/` フォルダを開いてビルドすることもできます。
-ネイティブ部分はリポジトリ直下の `CMakeLists.txt` を `externalNativeBuild` から使い、コア・USB トランスポート・JNI を
-`libcdreader_jni.so` にまとめます。GitHub Actions の `android` ジョブがデバッグ APK を成果物としてアップロードします。
+ネイティブ部分はリポジトリ直下の `CMakeLists.txt` を `externalNativeBuild` から使い、コア・USB トランスポート・
+リッピング処理 (`rip_session`)・JNI を `libcdreader_jni.so` にまとめます。CDDB / AccurateRip の HTTP 通信は JNI から
+Kotlin 側の `HttpGet` (`HttpURLConnection`) を呼び出して行います (ワーカースレッド上で実行)。GitHub Actions の `android` ジョブがデバッグ APK を成果物としてアップロードします。
 
 Linux では JNI ブリッジのコンパイル確認だけを行うこともできます (要 JDK):
 
@@ -326,7 +343,8 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   flac_writer, flac_encoder, md5  FLAC エンコーダ (外部ライブラリなし)
 platform/windows/   SPTI による ScsiTransport 実装、ドライブ列挙、WinHTTP クライアント
 platform/android/   USB Mass Storage Bulk-Only Transport による ScsiTransport 実装 (プロトコル部分は
-                    プラットフォーム非依存)、usbdevfs によるエンドポイント I/O、JNI ブリッジ
+                    プラットフォーム非依存)、usbdevfs によるエンドポイント I/O、リッピング処理
+                    (rip_session: CDDB・FLAC/WAV・AccurateRip・rip.log。JNI 非依存でテスト可能)、JNI ブリッジ
 app/cli/            Windows 用コマンドラインツール
 android/            Android アプリ (Kotlin、Gradle)
 tests/              仮想ドライブ・仮想 USB デバイスを使ったユニットテスト
@@ -341,7 +359,10 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
 
 - [ ] Android 版 (USB 外付け CD ドライブ、NDK + Kotlin UI) — [#9](https://github.com/noribow/cdreader/issues/9)
   (実装済み・実機での動作確認待ち)
-- [ ] Android 版の改善: 保存先へ直接書き込む (現在は一時ファイル経由でコピー)、リトライ回数の設定、UAS 専用ドライブ対応
+- [ ] Android 版の FLAC・CDDB・AccurateRip 対応 — [#18](https://github.com/noribow/cdreader/issues/18)
+  (実装済み・実機での動作確認待ち)
+- [ ] Android 版の改善: 保存先へ直接書き込む (現在は一時ファイル経由でコピー)、リトライ回数の設定、UAS 専用ドライブ対応、
+  CUE シート・シングルファイル出力、読み取りオフセットの自動検出、CDDB サーバーの設定
 - [x] AccurateRip 対応 (照合、オフセット値の自動検出) — [#5](https://github.com/noribow/cdreader/issues/5)
 - [ ] リードイン/リードアウトのオーバーリード
 - [x] CDDB 対応 (ディスク情報の取得) — [#6](https://github.com/noribow/cdreader/issues/6)

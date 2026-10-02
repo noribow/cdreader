@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The AccurateRip database is only served over plain HTTP; everything else
+     (e.g. CDDB at gnudb.org) keeps the default HTTPS-only policy. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">www.accuraterip.com</domain>
+    </domain-config>
+</network-security-config>
