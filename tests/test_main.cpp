@@ -4600,12 +4600,13 @@ TEST(gaps_htoa_detected_and_confirmed) {
     CHECK_EQ(gaps.find(1)->index00Lba(), 0u);
     CHECK_EQ(gaps.pregap(2), 150u);
     const std::vector<std::string> log = gaps.logLines();
-    CHECK(log.size() == 5);
-    if (log.size() == 5) {
+    CHECK(log.size() == 6);  // ... and the Q frame statistics
+    if (log.size() == 6) {
         CHECK(log[1] == "HTOA (hidden track before track 1): 01:02.00, LBA 0-4649, confirmed by the Q sub-channel");
         CHECK(log[2] == "Track  1  pregap 01:02.00  INDEX 00 at LBA 0 (HTOA)");
         CHECK(log[3] == "Track  2  pregap 00:02.00  INDEX 00 at LBA 8850");
         CHECK(log[4] == "Track  3  pregap 00:00.00");
+        CHECK(log[5].rfind("Q frames: ", 0) == 0);
     }
     // Known from the TOC without detection.
     const cdr::DiscGaps toc0 = cdr::gapsFromToc(toc);
@@ -4621,7 +4622,8 @@ TEST(gaps_htoa_detected_and_confirmed) {
     CHECK_EQ(cdr::htoaSectors(mixedToc), 0u);
     const cdr::DiscGaps mixedGaps = cdr::detectGaps(mixedDrive, mixedToc);
     CHECK(mixedGaps.tracks.size() == 1 && mixedGaps.tracks[0].status == cdr::TrackIndexes::Status::Skipped);
-    CHECK(mixedGaps.logLines().back() == "Track  2  pregap not searched (follows a data track)");
+    CHECK(mixedGaps.logLines().size() == 3 &&
+          mixedGaps.logLines()[1] == "Track  2  pregap not searched (follows a data track)");
 }
 
 TEST(gaps_later_index_points) {
@@ -4722,6 +4724,292 @@ TEST(gaps_read_budget) {
     CHECK(gaps.find(5)->status == cdr::TrackIndexes::Status::Unknown);
     CHECK(gaps.find(5)->detail == "read budget exhausted");
     CHECK_EQ(gaps.pregap(5), 0u);
+}
+
+// The disc of issue #41 (HL-DT-ST BP71N over USB): 33 tracks, track 20 with
+// a 2 s pregap, track 21 at LBA 89912, track 31 with 1 s, the short track 32
+// (12.02 s) with 3 s and track 33 at LBA 148562. Other tracks have no pregap.
+FakeDrive makeIssue41Disc() {
+    std::vector<uint32_t> starts;
+    for (uint32_t i = 0; i < 19; ++i) starts.push_back(i * 3600);
+    starts.push_back(69807);
+    starts.push_back(89912);
+    for (uint32_t i = 1; i <= 9; ++i) starts.push_back(89912 + 3600 * i);
+    for (uint32_t s : {123510u, 147660u, 148562u}) starts.push_back(s);
+    FakeDrive fake = makeDisc(starts, 160000);
+    fake.pregaps = {{20, 150}, {21, 91}, {31, 75}, {32, 225}, {33, 1}};
+    return fake;
+}
+
+bool startsWith(const std::string& s, const std::string& prefix) { return s.rfind(prefix, 0) == 0; }
+
+// The first line starting with `prefix` ("" if none).
+std::string findLine(const std::vector<std::string>& lines, const std::string& prefix) {
+    for (const std::string& l : lines)
+        if (startsWith(l, prefix)) return l;
+    return {};
+}
+
+TEST(gaps_issue41_mode3_frames_on_the_boundaries) {
+    // The Q frame of the first sector of INDEX 00 of track 21 (LBA 89821) and
+    // of track 33 (LBA 148561) is a mode 2 / 3 frame: it carries no position.
+    // The search used to narrow down to that one sector, read it again and
+    // again, and give up, leaving the log of the issue:
+    //   Track 20  pregap 00:02.00  INDEX 00 at LBA 69657  (INDEX 02+: no usable Q frame near LBA 89821)
+    //   Track 21  pregap unknown (no usable Q frame near LBA 89821)
+    //   Track 33  pregap unknown (no usable Q frame near LBA 148561)
+    // Now the boundary is taken at the first sector seen in the new index, to
+    // +-1 sector, and the INDEX 02 scan of track 20 does not repeat the search.
+    for (cdr::QSource source : {cdr::QSource::Auto, cdr::QSource::FormattedQ}) {
+        FakeDrive fake = makeIssue41Disc();
+        fake.otherAdrSectors = {89821, 148561};
+        cdr::CdDrive drive(fake);
+        const cdr::Toc toc = drive.readToc();
+        const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc, forced(source));
+        CHECK(gaps.status == cdr::DiscGaps::Status::Detected);
+        CHECK_EQ(gaps.pregap(20), 150u);
+        CHECK_EQ(gaps.pregap(21), 90u);
+        CHECK_EQ(gaps.pregap(31), 75u);
+        CHECK_EQ(gaps.pregap(32), 225u);
+        CHECK_EQ(gaps.pregap(33), 0u);
+        CHECK_EQ(gaps.unresolvedSectors, 2u);
+        CHECK(gaps.find(20)->detail.empty());
+        const std::vector<std::string> log = gaps.logLines();
+        const std::string t21 = findLine(log, "Track 21  ");
+        CHECK(t21 == "Track 21  pregap 00:01.15  INDEX 00 at LBA 89822  (INDEX 00 may start 1 sector "
+                             "earlier: no position in the Q frame at LBA 89821)");
+        const std::string t33 = findLine(log, "Track 33  ");
+        CHECK(t33 == "Track 33  pregap 00:00.00  (INDEX 00 may start 1 sector earlier: no position in "
+                             "the Q frame at LBA 148561)");
+        const std::string q = findLine(log, "Q frames: ");
+        CHECK(q.find(" ADR 2/3") != std::string::npos);
+        CHECK(q.find("position delta min 0 / max 0 / median 0") != std::string::npos);
+        CHECK(findLine(log, "Q delay").empty());
+        CHECK(gaps.reads <= 110);  // the old search needed 103 reads (and failed)
+        CHECK_EQ(gaps.reads, unsigned(fake.subQReads + fake.subChannelCommands + fake.readCommands));
+    }
+}
+
+TEST(gaps_issue41_constant_q_delay) {
+    // The same disc on a drive returning the Q frame of sector n + 2 with
+    // sector n: when few positions were left the reads never held one of
+    // them (the old search left tracks 20, 21, 31 and 32 unknown). The delay
+    // is measured and the reads are moved by it.
+    FakeDrive fake = makeIssue41Disc();
+    fake.qDelay = 2;
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc);
+    CHECK(gaps.status == cdr::DiscGaps::Status::Detected);
+    for (const auto& [track, pregap] : fake.pregaps) CHECK_EQ(gaps.pregap(track), pregap);
+    CHECK_EQ(gaps.qDelay, 2);
+    CHECK_EQ(gaps.unresolvedSectors, 0u);
+    const std::vector<std::string> log = gaps.logLines();
+    CHECK(!findLine(log, "Q delay: +2 sectors (the Q frame read with sector n is that of n + 2").empty());
+    const std::string q = findLine(log, "Q frames: ");
+    CHECK(q.find("position delta min +2 / max +2 / median +2") != std::string::npos);
+    CHECK(gaps.reads <= 110);
+}
+
+TEST(gaps_q_delay_detected_and_compensated) {
+    // Delays of -3..+3 sectors, with and without CRC, both READ CD selections:
+    // every pregap and index point exactly, the delay found.
+    for (int delay = -3; delay <= 3; ++delay) {
+        for (cdr::QSource source : {cdr::QSource::FormattedQ, cdr::QSource::RawPW}) {
+            for (bool crc : {true, false}) {
+                if (!crc && source == cdr::QSource::RawPW) continue;
+                FakeDrive fake = makeDisc({0, 3000, 6000, 9000, 12000}, 15000);
+                fake.pregaps = {{2, 150}, {3, 1}, {5, 2}};
+                fake.laterIndexes[2] = {3500};
+                fake.laterIndexes[4] = {9001};
+                fake.qDelay = delay;
+                fake.formattedQCrc = crc;
+                cdr::CdDrive drive(fake);
+                const cdr::Toc toc = drive.readToc();
+                const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc, forced(source));
+                CHECK(gaps.status == cdr::DiscGaps::Status::Detected);
+                CHECK_EQ(gaps.pregap(2), 150u);
+                CHECK_EQ(gaps.pregap(3), 1u);
+                CHECK_EQ(gaps.pregap(4), 0u);
+                CHECK_EQ(gaps.pregap(5), 2u);
+                CHECK(gaps.laterIndexes(2) == std::vector<uint32_t>({3500}));
+                CHECK(gaps.laterIndexes(4) == std::vector<uint32_t>({9001}));
+                CHECK_EQ(gaps.qDelay, delay);
+                CHECK_EQ(gaps.unresolvedSectors, 0u);
+                CHECK(gaps.reads <= 200);
+                const std::string line = findLine(gaps.logLines(), "Q delay: ");
+                CHECK(line.empty() == (delay == 0));
+                if (delay == 1) CHECK(startsWith(line, "Q delay: +1 sector (the Q frame read with sector n is that of n + 1;"));
+                if (delay == -3) CHECK(startsWith(line, "Q delay: -3 sectors (the Q frame read with sector n is that of n - 3;"));
+            }
+        }
+    }
+    // No delay: the reads are those of the search without any of this (the
+    // same count as before #41).
+    FakeDrive plain = makeDisc({0, 3000, 6000, 9000, 12000}, 15000);
+    plain.pregaps = {{2, 150}, {3, 1}, {5, 2}};
+    cdr::CdDrive plainDrive(plain);
+    const cdr::DiscGaps gaps = cdr::detectGaps(plainDrive, plainDrive.readToc());
+    CHECK_EQ(gaps.qDelay, 0);
+    CHECK_EQ(gaps.widerProbes, 0u);
+    CHECK(gaps.fallbackProbes.empty());
+    CHECK(findLine(gaps.logLines(), "Q retries").empty());
+}
+
+TEST(gaps_mode3_runs_around_boundaries) {
+    // Runs of mode 2 / 3 frames next to every boundary (and real discs' 1 in
+    // ~100 elsewhere), on top of a +1 delay: the positions next to the
+    // boundary are found with wider reads.
+    FakeDrive fake = makeDisc({0, 3000, 6000, 9000}, 12000);
+    fake.pregaps = {{2, 150}, {3, 30}, {4, 0}};
+    fake.otherAdrEvery = 97;
+    fake.qDelay = 1;
+    for (uint32_t b : {2850u, 3000u, 5970u, 6000u, 9000u}) {
+        for (uint32_t s = b - 6; s < b - 1; ++s) fake.otherAdrSectors.insert(s);  // up to 2 sectors before
+        for (uint32_t s = b + 1; s < b + 6; ++s) fake.otherAdrSectors.insert(s);  // from 1 sector after
+    }
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc, forced(cdr::QSource::FormattedQ));
+    CHECK(gaps.status == cdr::DiscGaps::Status::Detected);
+    CHECK_EQ(gaps.pregap(2), 150u);
+    CHECK_EQ(gaps.pregap(3), 30u);
+    CHECK_EQ(gaps.pregap(4), 0u);
+    CHECK_EQ(gaps.unresolvedSectors, 0u);
+    CHECK(gaps.qFrames.otherAdr > 0);
+
+    // A run over the boundary itself: no frame tells where INDEX 00 starts
+    // within it, so the first sector seen in INDEX 00 is taken (up to 3
+    // sectors without a position); a longer run leaves the track unknown.
+    FakeDrive run = makeDisc({0, 3000, 6000}, 9000);
+    run.pregaps = {{2, 150}, {3, 30}};
+    for (uint32_t s = 2848; s <= 2850; ++s) run.otherAdrSectors.insert(s);  // INDEX 00 of track 2 at 2850
+    for (uint32_t s = 5965; s <= 5975; ++s) run.otherAdrSectors.insert(s);  // ... of track 3 at 5970
+    cdr::CdDrive runDrive(run);
+    const cdr::DiscGaps runGaps = cdr::detectGaps(runDrive, runDrive.readToc());
+    CHECK_EQ(runGaps.pregap(2), 149u);
+    CHECK(startsWith(runGaps.find(2)->detail,
+                     "INDEX 00 may start 3 sectors earlier: no position in the Q frames at LBA 2848-2850; "));
+    CHECK(runGaps.find(3) && runGaps.find(3)->status == cdr::TrackIndexes::Status::Unknown);
+    CHECK(startsWith(runGaps.find(3)->detail, "no usable Q frame near LBA "));
+    CHECK(runGaps.find(3)->detail.find(" [79 Q frames: 37 ADR 2/3, 42 out of window, position delta 0; also tried "
+                                       "raw P-W, READ SUB-CHANNEL]") != std::string::npos);
+    CHECK(runGaps.status == cdr::DiscGaps::Status::Partial);
+}
+
+TEST(gaps_formatted_q_failing_near_boundaries_falls_back) {
+    // Formatted Q comes back empty (all zero) within 20 sectors of each
+    // boundary but raw P-W works: those probes are answered by raw P-W.
+    auto make = [] {
+        FakeDrive fake = makeDisc({0, 3000, 6000}, 9000);
+        fake.pregaps = {{2, 150}, {3, 30}};
+        for (uint32_t b : {2850u, 3000u, 5970u, 6000u})
+            for (uint32_t s = b - 20; s < b + 20; ++s) fake.formattedQBlank.insert(s);
+        return fake;
+    };
+    FakeDrive fake = make();
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::DiscGaps gaps = cdr::detectGaps(drive, toc);
+    CHECK(gaps.status == cdr::DiscGaps::Status::Detected);
+    CHECK(gaps.source == cdr::QSource::FormattedQ);
+    CHECK(gaps.pregap(2) == 150 && gaps.pregap(3) == 30);
+    CHECK(gaps.fallbackProbes.count(cdr::QSource::RawPW) && gaps.fallbackProbes.at(cdr::QSource::RawPW) > 0);
+    CHECK(gaps.qFrames.other > 0);  // the empty frames
+    const std::string retries = findLine(gaps.logLines(), "Q retries: ");
+    CHECK(retries.find(" with READ CD with raw P-W sub-channel") != std::string::npos);
+    CHECK_EQ(gaps.reads, unsigned(fake.subQReads + fake.subChannelCommands + fake.readCommands));
+
+    // Without raw P-W either: READ SUB-CHANNEL after a READ CD of the sector.
+    FakeDrive noRaw = make();
+    noRaw.rawSubChannelSupported = false;
+    cdr::CdDrive noRawDrive(noRaw);
+    gaps = cdr::detectGaps(noRawDrive, toc);
+    CHECK(gaps.pregap(2) == 150 && gaps.pregap(3) == 30);
+    CHECK(gaps.fallbackProbes.count(cdr::QSource::CurrentPosition) == 1);
+    CHECK(gaps.fallbackProbes.count(cdr::QSource::RawPW) == 0);
+    CHECK_EQ(gaps.qFrames.failedCommands, 1u);  // raw P-W was rejected once, then not tried again
+
+    // A method chosen by the user is not replaced.
+    FakeDrive forcedDrive = make();
+    cdr::CdDrive forcedCd(forcedDrive);
+    gaps = cdr::detectGaps(forcedCd, toc, forced(cdr::QSource::FormattedQ));
+    CHECK(gaps.fallbackProbes.empty());
+    CHECK(gaps.status == cdr::DiscGaps::Status::Partial);
+    CHECK_EQ(forcedDrive.subChannelCommands, 0);
+    CHECK(forcedDrive.lastReadCdCdb[10] == 0x02);
+}
+
+TEST(gaps_failure_diagnostics) {
+    // The reason of an unknown pregap says what the frames read looked like.
+    FakeDrive broken = makeDisc({0, 3000, 6000}, 9000);
+    broken.pregaps = {{2, 150}, {3, 20}};
+    broken.formattedQCrc = false;
+    for (uint32_t s = 2840; s <= 2860; ++s) broken.badQ[s] = -1;
+    cdr::CdDrive drive(broken);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc, forced(cdr::QSource::FormattedQ));
+    const cdr::TrackIndexes* t2 = gaps.find(2);
+    CHECK(t2 && t2->status == cdr::TrackIndexes::Status::Unknown);
+    CHECK(t2 && startsWith(t2->detail, "no usable Q frame near LBA "));
+    CHECK(t2 && t2->detail.find(" Q frames: ") != std::string::npos);
+    CHECK(t2 && t2->detail.find(" bad BCD") != std::string::npos);
+    CHECK(t2 && t2->detail.find("also tried") == std::string::npos);  // a forced method: no fallback
+    // Track 1 ends in the pregap of track 2, which is unknown: its INDEX 02
+    // scan does not repeat that search.
+    CHECK(gaps.find(1)->detail == "INDEX 02+: not searched (the pregap of track 2 is unknown)");
+    // The disc summary counts every frame once.
+    const cdr::QFrameStats& q = gaps.qFrames;
+    CHECK(q.frames > 0 && q.badBcd > 0);
+    CHECK_EQ(q.frames, q.used + q.rejected());
+    const std::string line = findLine(gaps.logLines(), "Q frames: ");
+    CHECK(startsWith(line, "Q frames: " + std::to_string(q.frames) + " read, " + std::to_string(q.used) +
+                                        " used; rejected: " + std::to_string(q.badBcd) + " bad BCD"));
+
+    // A clean disc: exact line.
+    FakeDrive clean = makeDisc({0, 3000}, 6000);
+    clean.pregaps = {{2, 150}};
+    cdr::CdDrive cleanDrive(clean);
+    const cdr::DiscGaps ok = cdr::detectGaps(cleanDrive, cleanDrive.readToc());
+    CHECK(ok.logLines().back() == "Q frames: " + std::to_string(ok.qFrames.frames) + " read, " +
+                                      std::to_string(ok.qFrames.frames) +
+                                      " used; rejected: none; position delta min 0 / max 0 / median 0");
+
+    // Summary formats.
+    cdr::QFrameStats s;
+    s.frames = 12;
+    s.otherAdr = 2;
+    s.crcErrors = 1;
+    s.farOff = 1;
+    s.outsideWindow = 5;
+    s.used = 3;
+    s.deltas = {{-1, 2}, {1, 5}, {2, 1}};
+    s.failedCommands = 1;
+    CHECK(s.summary() ==
+          "12 Q frames: 2 ADR 2/3, 1 CRC, 1 too far from the sector, 5 out of window, position delta -1..+2, "
+          "1 failed command");
+    CHECK(s.logLine() == "Q frames: 12 read, 3 used; rejected: 2 ADR 2/3, 1 CRC, 1 too far from the sector, 5 out "
+                         "of window; position delta min -1 / max +2 / median +1; 1 failed command");
+    cdr::QFrameStats sum = s;
+    sum.add(s);
+    CHECK(sum.frames == 24 && sum.deltas.at(1) == 10 && sum.rejected() == 18);
+}
+
+TEST(gaps_retries_respect_the_read_budget) {
+    // Every probe of the issue #41 disc near the mode 3 frames fails and is
+    // retried; the budget still bounds the commands sent.
+    for (unsigned budget : {20u, 45u, 60u}) {
+        FakeDrive fake = makeIssue41Disc();
+        fake.otherAdrSectors = {89821, 148561};
+        cdr::CdDrive drive(fake);
+        cdr::GapDetectionOptions options;
+        options.maxReads = budget;
+        const cdr::DiscGaps gaps = cdr::detectGaps(drive, drive.readToc(), options);
+        CHECK(gaps.reads <= budget);
+        CHECK_EQ(gaps.reads, unsigned(fake.subQReads + fake.subChannelCommands + fake.readCommands));
+        CHECK(gaps.status == cdr::DiscGaps::Status::Partial);
+        CHECK(gaps.find(33)->detail == "read budget exhausted");
+    }
 }
 
 TEST(cue_sheet_single_file_with_gaps_and_htoa) {
