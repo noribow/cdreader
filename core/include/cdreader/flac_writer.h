@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -10,7 +9,6 @@
 
 #include "cdreader/audio_writer.h"
 #include "cdreader/flac_encoder.h"
-#include "cdreader/md5.h"
 
 namespace cdr {
 
@@ -38,21 +36,15 @@ public:
     void write(const uint8_t* pcm, size_t bytes) override;
     void close() override;  // encodes the last block, patches STREAMINFO and SEEKTABLE
 
-    uint64_t totalSamples() const { return totalSamples_; }
+    uint64_t totalSamples() const { return stream_.totalSamples(); }
 
 private:
-    void encodeBlock(const uint8_t* pcm, unsigned samples);
     void writeBytes(const uint8_t* data, size_t size);
 
-    flac::FrameEncoder encoder_;
+    flac::StreamEncoder stream_;
     std::ofstream out_;
-    std::vector<uint8_t> pending_;  // PCM bytes not yet encoded (less than one block)
-    std::vector<int32_t> left_, right_;
     std::vector<uint64_t> frameOffsets_;  // byte offset of each frame from the first one
-    Md5 md5_;
-    uint64_t totalSamples_ = 0;
     uint64_t audioBytes_ = 0;  // encoded frame bytes
-    uint32_t minFrameBytes_ = 0, maxFrameBytes_ = 0;
     uint64_t reservedOffset_ = 0;  // file offset of the SEEKTABLE + PADDING area
     std::optional<EmbeddedCueSheet> cue_;
     uint64_t leadOutOffsetPos_ = 0;  // file offset of the CUESHEET lead-out offset (0: no CUESHEET)
