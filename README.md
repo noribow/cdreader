@@ -1,6 +1,6 @@
 # cdreader
 
-音楽 CD (CD-DA) をリッピングして WAV / FLAC / Opus / Ogg Vorbis ファイルに保存するツールです。
+音楽 CD (CD-DA) をリッピングして WAV / FLAC / Ogg FLAC / Opus / Ogg Vorbis ファイルに保存するツールです。
 対象環境は **Windows** (コマンドライン) と **Android** (USB 接続の外付け CD ドライブ) です。
 
 > **このプロジェクトは [Claude Code](https://claude.com/claude-code) (Anthropic の AI コーディングエージェント) を利用して開発しています。**
@@ -11,6 +11,7 @@
 - SCSI/MMC コマンド (`READ TOC`, `READ CD`, `READ SUB-CHANNEL`) でドライブから直接オーディオセクタを読み取り
 - 44.1 kHz / 16 bit / ステレオの WAV、または可逆圧縮の FLAC で保存 (トラックごとに `NN - 曲名.wav` / `NN - 曲名.flac`、曲名が不明なら `TrackNN.wav`)
 - FLAC エンコーダは外部ライブラリを使わない自前実装 (Android でもそのままビルド可能)。MD5 署名・タグ・シークテーブル付き
+- 同じ FLAC を Ogg コンテナに入れた **Ogg FLAC** (`.oga`) でも保存可能 (可逆圧縮、FLAC-to-Ogg マッピング 1.0)
 - 非可逆圧縮の **Opus** (Ogg Opus、`.opus`) と **Vorbis** (Ogg Vorbis、`.ogg`) でも保存可能 (libopus / libvorbis を使用。ビットレート・品質を指定可能)
 - `--single-file` で全トラックを 1 ファイルのイメージとして保存
 - WAV へのタグ書き込み (RIFF `LIST`/`INFO` と ID3v2.4 の `id3 ` チャンク、UTF-8)
@@ -37,6 +38,7 @@ cdreader rip D: --verify -r 10      2 回読み比較、リトライ 10 回
 cdreader rip D: --offset 6          読み取りオフセット +6 サンプルで補正
 cdreader rip D: --single-file       全トラックを 1 つの WAV と CUE シートに保存
 cdreader rip D: -f flac             FLAC で保存
+cdreader rip D: -f oggflac          Ogg FLAC (.oga) で保存
 cdreader rip D: -f opus             Opus で保存 (VBR 160 kbit/s)
 cdreader rip D: -f opus -b 128      Opus 128 kbit/s で保存
 cdreader rip D: -f vorbis -q 6      Ogg Vorbis 品質 6 で保存
@@ -50,14 +52,14 @@ cdreader offset D:                  読み取りオフセットを AccurateRip �
 | オプション | 説明 |
 | --- | --- |
 | `-o, --output <dir>` | 出力先ディレクトリ (既定: `アーティスト - アルバム`。CDDB で見つからなければ `cd_<CDDB ID>`) |
-| `-f, --format <name>` | 出力フォーマット: `wav` / `flac` / `opus` / `vorbis` (既定: `wav`。`opus` / `vorbis` はビルド時に有効にした場合のみ) |
+| `-f, --format <name>` | 出力フォーマット: `wav` / `flac` / `oggflac` / `opus` / `vorbis` (既定: `wav`。`opus` / `vorbis` はビルド時に有効にした場合のみ) |
 | `-b, --bitrate <kbps>` | 非可逆フォーマットの目標ビットレート (kbit/s、VBR)。`opus`: 6〜510 (既定 160)、`vorbis`: 45〜500 (平均ビットレート、`--quality` の代わり) |
 | `-q, --quality <q>` | `vorbis` の VBR 品質 (oggenc と同じ -1〜10、小数可。既定 5 ≒ 160 kbit/s)。`opus` には指定できません |
 | `-t, --tracks <list>` | リッピングするトラック (例: `1,3-5`)。既定は全オーディオトラック |
 | `-r, --retries <n>` | 読み取り失敗時のリトライ回数 (既定: 5) |
 | `--verify` | 全ブロックを 2 回読みして比較 (低速) |
 | `--offset <n>` | 読み取りオフセット補正 (サンプル単位、負の値も可。既定: 0) |
-| `--single-file` | 選択したトラックを 1 つのファイルにつなげて保存 (ディスクイメージ + CUE シート。FLAC ではファイル内にも CUE シートを埋め込み) |
+| `--single-file` | 選択したトラックを 1 つのファイルにつなげて保存 (ディスクイメージ + CUE シート。FLAC / Ogg FLAC ではファイル内にも CUE シートを埋め込み) |
 | `--no-cue-file` | 外部の `.cue` ファイルを書かない |
 | `--no-accuraterip` | リッピング後に AccurateRip データベースを照会しない (チェックサムは `rip.log` に記録されます) |
 | `--no-isrc` | MCN (カタログ番号) と ISRC を読み取らない (`toc` でも使えます)。読み取りに時間のかかるドライブ向け |
@@ -134,11 +136,28 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
   プリギャップ (`INDEX 00`) は含みません。
 - トラックごとのリッピング (`--single-file` なし) では埋め込みません (1 ファイル 1 トラックのため)。
 
+### Ogg FLAC 出力
+
+`--format oggflac` を指定すると、FLAC と同じ可逆圧縮のフレームを Ogg コンテナに入れた Ogg FLAC (`.oga`) で保存します
+([FLAC-to-Ogg マッピング 1.0](https://xiph.org/flac/ogg_mapping.html))。Ogg に対応したプレーヤー・ツール向けで、
+デコード結果は FLAC 出力と同じく元の PCM とビット単位で一致します (フレームは `--format flac` のものとバイト単位で同一)。
+
+- エンコーダは FLAC 出力と共通 (`flac::StreamEncoder`)、Ogg のページは Ogg Opus / Vorbis と共通の `OggStreamWriter` で書きます。
+- 最初のパケット: `0x7F` `FLAC`、マッピングのバージョン 1.0、ヘッダーパケット数、`fLaC`、`STREAMINFO` (MD5 署名を含む)。BOS ページにこのパケットだけを置きます。
+- 続くヘッダーパケット: メタデータブロックを 1 つずつ (`VORBIS_COMMENT`、`--single-file` では `CUESHEET`)。音声は新しいページから始まります。
+- 音声: 1 パケット = 1 FLAC フレーム (4096 サンプル)。グラニュール位置はそのページで完結したフレームまでのサンプル数、最後のページに EOS フラグ。
+- `SEEKTABLE` は書きません (Ogg ではグラニュール位置でシークするため)。`PADDING` も書きません (Ogg のタグ編集はファイルを書き直すため)。
+- `STREAMINFO` の総サンプル数・MD5・フレームサイズと `CUESHEET` のリードアウトは最後に確定するので、ファイルを閉じるときに
+  ヘッダーのページ (大きさは変わりません) を作り直して先頭に上書きします (CRC も再計算)。
+- タグと CUE シートの埋め込み (`CUESHEET` ブロック + `CUESHEET` タグ) は FLAC 出力と同じです。
+  `flac -t ファイル名.oga` で CRC と MD5 を検証できます。`metaflac` は Ogg FLAC を読めないため、埋め込み CUE シートは
+  `flac -d --cue=2.1-3.1 ファイル名.oga` (トラック 2 だけをデコード) や foobar2000 などで使えます。
+
 ### 非可逆圧縮 (Opus / Vorbis)
 
 `--format opus` / `--format vorbis` で、非可逆圧縮のファイルを作ります。
 携帯プレーヤーやスマートフォン向けの「聴く用」のファイルを想定しています (保存用には FLAC を推奨)。
-`--bitrate` / `--quality` を `wav` / `flac` に指定するとエラーになります。使ったコーデックと設定は `rip.log` の `Encoder:` 行に記録されます。
+`--bitrate` / `--quality` を `wav` / `flac` / `oggflac` に指定するとエラーになります。使ったコーデックと設定は `rip.log` の `Encoder:` 行に記録されます。
 
 | 形式 | ファイル | エンコーダ | 既定 | 指定 |
 | --- | --- | --- | --- | --- |
@@ -157,10 +176,10 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - **Vorbis**: 44.1 kHz のまま libvorbisenc でエンコードします。`--quality` は oggenc と同じ目盛り (内部では 1/10)、
   `--bitrate` は `oggenc -b` と同じく、ビットレート管理を使わずに平均がそのビットレートになる VBR です。
   グラニュール位置と最後のパケット (EOS) は libvorbis が決め、デコード結果は元のサンプル数ちょうどになります。
-- Ogg のページは FLAC と同じくコア内の `OggStreamWriter` で書きます (ヘッダーパケットはそれぞれ専用のページ、音声は新しいページから)。
+- Ogg のページは Ogg FLAC と同じくコア内の `OggStreamWriter` で書きます (ヘッダーパケットはそれぞれ専用のページ、音声は新しいページから)。
 - タグは FLAC と同じ Vorbis コメント (`TITLE`, `ARTIST`, `ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`, `TRACKTOTAL`, `DATE`, `GENRE`, `CDDB`, `ISRC`, `BARCODE`) を
   `OpusTags` / Vorbis のコメントヘッダーに書きます。
-- `--single-file` も使えます (CUE シートの `FILE` の種類は `WAVE`)。CUE シートのファイル内への埋め込みは FLAC のみです。
+- `--single-file` も使えます (CUE シートの `FILE` の種類は `WAVE`)。CUE シートのファイル内への埋め込みは FLAC / Ogg FLAC のみです。
 
 #### MP3 / AAC に対応しない理由
 
@@ -288,7 +307,7 @@ CD のサブチャンネル Q には、ディスクの **MCN** (Media Catalog Nu
 
 ## 使い方 (Android)
 
-Android 端末に USB の外付け CD/DVD ドライブを接続し、アプリから直接オーディオトラックを読み取って FLAC・WAV・Opus・Vorbis で保存します。
+Android 端末に USB の外付け CD/DVD ドライブを接続し、アプリから直接オーディオトラックを読み取って FLAC・Ogg FLAC・WAV・Opus・Vorbis で保存します。
 Windows 版と同じコアを使うため、CDDB による曲名の取得 (タグ・ファイル名)、AccurateRip による照合、`rip.log` も同じ内容です。
 root 化は不要です (Android の USB ホスト API で得たファイルディスクリプタ経由で、USB Mass Storage Bulk-Only Transport の
 SCSI/MMC コマンドを送ります)。
@@ -312,13 +331,13 @@ SCSI/MMC コマンドを送ります)。
    アーティスト・アルバム名・曲名を表示します。候補が複数あるときは一覧の上の選択欄で切り替えられます。
    ディスクを入れ替えたら「TOC を再読込」を押します。
 3. 「保存先フォルダ」で保存先を選びます (Storage Access Framework。選んだフォルダは次回以降も使われます)。
-4. 形式 (FLAC (既定) / WAV / Opus / Vorbis。Opus は VBR 160 kbit/s、Vorbis は品質 5 の固定設定)、必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値)、「2 回読みして比較」、
+4. 形式 (FLAC (既定) / Ogg FLAC / WAV / Opus / Vorbis。Opus は VBR 160 kbit/s、Vorbis は品質 5 の固定設定)、必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値)、「2 回読みして比較」、
    「AccurateRip で照合」(既定でオン) を設定し、保存するトラックにチェックを付けて「リッピング」を押します。
 5. リッピング後、AccurateRip の結果がトラックごとに表示されます
    (例: `Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2` — 一致したチェックサムの版、v2 / v1 それぞれの一致件数、
    登録件数の合計、一致したプレス数 / そのトラックの登録があるプレス数)。1 トラックも一致しない場合は読み取りオフセットを確認してください。
 
-保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`。Opus は `.opus`、Vorbis は `.ogg`) と `rip.log` が作られます。
+保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`。Ogg FLAC は `.oga`、Opus は `.opus`、Vorbis は `.ogg`) と `rip.log` が作られます。
 ファイルにはタグ (曲名・アーティスト・アルバム・年・ジャンル・トラック番号・CDDB ID、ディスクに記録されていれば ISRC と MCN) が書き込まれます。
 MCN / ISRC はリッピング開始時にディスクごとに 1 回読み取り、`rip.log` にも記録します。
 `rip.log` には Windows 版と同じく、ドライブ・設定・TOC・CDDB の結果・トラックごとの CRC32 / リトライ回数 / 読めなかったセクタ数・
@@ -384,6 +403,11 @@ FLAC は MD5 / CRC / ビット書き込み / Rice 符号の単体テストと、
 `ffprobe` があれば FLAC / WAV の `ISRC` / `BARCODE` タグが読めることも確認します)。
 MCN / ISRC は仮想ドライブの `READ SUB-CHANNEL` 応答で、CDB のバイト列、有効ビット 0、不正な文字・短い応答・形式コードやトラック番号の不一致、
 非対応ドライブ (ILLEGAL REQUEST) を検証します。
+Ogg FLAC は、最初のパケットのバイト列、パケット・ページ構成 (ヘッダーのページ、BOS / EOS、通し番号)、グラニュール位置、`STREAMINFO` の値を検証し、
+パケットから組み立て直した FLAC を簡易デコーダでデコードして元の PCM と一致すること、フレームが FLAC 出力とバイト単位で同一であることを確かめます。
+さらに `ogg_flac_check` が、インストールされているツールで `flac -t` / `flac -d` (ビット単位で一致)、埋め込み CUE シートの `CUESHEET` ブロックを使った
+`flac -d --cue=` によるトラックの切り出し、`ogginfo` (警告なし)、`ffmpeg` によるデコード (ビット単位で一致)、`ffprobe` によるタグの読み取りを確認します
+(どのツールも無い場合はスキップ。`metaflac` は Ogg FLAC を読めないため使いません)。
 CDDB は偽の `HttpClient` を使い (ネットワークには接続しません)、問い合わせコマンドの生成・応答コード・xmcd エントリの解析・ファイル名の変換を検証します。
 AccurateRip はネットワークに接続せず (偽の `HttpClient` を使用)、実在のディスクの ID・データベース応答と、独立した参照実装で求めたチェックサムで検証します。
 Opus / Vorbis は、ヘッダー (`OpusHead` / `OpusTags`、Vorbis の 3 つのヘッダー) のバイト列とページ構成、
@@ -397,7 +421,7 @@ DC ゲイン・阻止域 (折り返し成分 -100 dB 以下) を確認します�
 `cdreader_usb_tests` は仮想 USB デバイス (`tests/fake_usb_device.*`) を使って Android 版の USB Bulk-Only Transport
 (CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング) を検証します。
 `cdreader_rip_session_tests` は Android 版のリッピング処理 (`platform/android/rip_session.*`) を仮想 USB デバイスと偽の `HttpClient` で検証します
-(FLAC / WAV 出力とデコード結果の一致、Opus / Vorbis 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`)。
+(FLAC / Ogg FLAC / WAV 出力とデコード結果の一致、Opus / Vorbis 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`)。
 
 ### Android アプリ
 
@@ -442,12 +466,13 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   http      オンライン照会用 HTTP インターフェース (実装はプラットフォーム側)
   wav_writer, crc32
   flac_writer, flac_encoder, md5  FLAC エンコーダ (外部ライブラリなし)
+  ogg_flac_writer  Ogg FLAC (flac_encoder + ogg)
   resampler サンプリングレート変換 (44.1 → 48 kHz、Opus 用)
   opus_writer, vorbis_writer  Ogg Opus / Ogg Vorbis (libopus / libvorbis、CMake オプションで有効時のみ)
 platform/windows/   SPTI による ScsiTransport 実装、ドライブ列挙、WinHTTP クライアント
 platform/android/   USB Mass Storage Bulk-Only Transport による ScsiTransport 実装 (プロトコル部分は
                     プラットフォーム非依存)、usbdevfs によるエンドポイント I/O、リッピング処理
-                    (rip_session: CDDB・FLAC/WAV/Opus/Vorbis・AccurateRip・rip.log。JNI 非依存でテスト可能)、JNI ブリッジ
+                    (rip_session: CDDB・FLAC/Ogg FLAC/WAV/Opus/Vorbis・AccurateRip・rip.log。JNI 非依存でテスト可能)、JNI ブリッジ
 app/cli/            Windows 用コマンドラインツール
 cmake/Codecs.cmake  Opus / Vorbis ライブラリの取得とビルド
 android/            Android アプリ (Kotlin、Gradle)
@@ -482,7 +507,7 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
   - [ ] MCN / ISRC の読み取り (CUE シート・FLAC の CUESHEET・タグへの記録) — [#22](https://github.com/noribow/cdreader/issues/22)
     (実装済み・実機での動作確認待ち)
   - [x] Ogg Opus、Ogg Vorbis — [#13](https://github.com/noribow/cdreader/issues/13)
-  - [ ] Ogg FLAC
+  - [x] Ogg FLAC — [#21](https://github.com/noribow/cdreader/issues/21)
   - [ ] M4A (AAC / ALAC)、MKA (Matroska)
   - [ ] プリギャップ (`INDEX 00`) と HTOA の検出 (サブチャンネル Q の読み取り)
 - [ ] セキュアモードでのドライブキャッシュ回避 (現状の `--verify` はキャッシュされたデータを再読込する可能性があります)

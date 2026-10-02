@@ -343,6 +343,53 @@ TEST(flac_rip_carries_cddb_tags_and_exact_audio) {
     CHECK_EQ(rig.session.problemTracks(), 0);
 }
 
+// Packets of an Ogg FLAC file put back together as a native FLAC stream:
+// "fLaC" + the metadata blocks (the first packet's from offset 13) + the frames.
+std::vector<uint8_t> oggFlacAsNative(const std::vector<uint8_t>& ogg) {
+    std::vector<std::vector<uint8_t>> packets(1);
+    for (size_t pos = 0; pos + 27 <= ogg.size();) {
+        if (std::memcmp(&ogg[pos], "OggS", 4) != 0) throw std::runtime_error("bad Ogg page");
+        const size_t segments = ogg[pos + 26];
+        size_t body = pos + 27 + segments;
+        for (size_t i = 0; i < segments; ++i) {
+            const size_t length = ogg[pos + 27 + i];
+            packets.back().insert(packets.back().end(), ogg.begin() + long(body), ogg.begin() + long(body + length));
+            body += length;
+            if (length < 255) packets.emplace_back();
+        }
+        pos = body;
+    }
+    packets.pop_back();
+    if (packets.empty() || packets[0].size() != 51 || packets[0][0] != 0x7F) throw std::runtime_error("not Ogg FLAC");
+    std::vector<uint8_t> native(packets[0].begin() + 9, packets[0].end());
+    for (size_t i = 1; i < packets.size(); ++i) native.insert(native.end(), packets[i].begin(), packets[i].end());
+    return native;
+}
+
+TEST(oggflac_rip_carries_tags_and_exact_audio) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    rig.session.beginRip(settings("oggflac"));
+    TempDir dir;
+    const fs::path path = dir.path / "track";
+    const cdr::RippedTrack& r = rig.session.ripTrack(2, path);
+    const Reference ref = referenceRip(2);
+    CHECK_EQ(r.result.crc32, ref.crc32);
+    CHECK_EQ(r.accurateRipV2, ref.v2);
+    CHECK_STR(r.fileName, "02 - \xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91.oga");
+    CHECK_STR(r.fileName, rig.session.trackFileName(2, "oggflac"));
+    // STREAMINFO is patched at close (the first page rewritten): the total is right.
+    const DecodedFlac d = decodeFlac(oggFlacAsNative(readFile(path)));
+    CHECK_EQ(d.totalSamples, uint64_t(ref.pcm.size() / 4));
+    CHECK(d.pcm == ref.pcm);
+    CHECK(hasComment(d, "TITLE=\xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91"));
+    CHECK(hasComment(d, "ARTIST=Guest"));
+    CHECK(hasComment(d, "TRACKNUMBER=2"));
+    CHECK(contains(rig.session.ripLog(), "Format: oggflac\nEncoder: Ogg FLAC (built-in encoder), lossless"));
+}
+
 #if defined(CDREADER_HAVE_OPUS) || defined(CDREADER_HAVE_VORBIS)
 TEST(lossy_rips_carry_tags_and_log_the_encoder) {
     std::vector<std::string> formats;

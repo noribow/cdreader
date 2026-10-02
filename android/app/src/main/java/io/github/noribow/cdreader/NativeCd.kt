@@ -168,7 +168,7 @@ class CdSession private constructor(private val handle: Long) : Closeable {
     /** "NN - Title.flac" from CDDB, otherwise "TrackNN.flac". */
     fun trackFileName(track: Int, format: String): String = NativeCd.nativeTrackFileName(handle, track, format)
 
-    /** Starts a rip ([format] "wav" or "flac"); forgets the results of the previous one. */
+    /** Starts a rip ([format]: a name from [NativeCd.nativeFormats]); forgets the results of the previous one. */
     fun beginRip(format: String, readOffset: Int, maxRetries: Int, verify: Boolean) =
         NativeCd.nativeBeginRip(handle, format, readOffset, maxRetries, verify)
 
