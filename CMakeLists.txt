@@ -20,8 +20,10 @@ endif()
 
 # --- Platform independent core (shared with the future Android port) --------
 add_library(cdreader_core STATIC
+  core/src/audio_writer.cpp
   core/src/cd_drive.cpp
   core/src/crc32.cpp
+  core/src/metadata.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp
   core/src/toc.cpp
@@ -33,9 +35,10 @@ target_include_directories(cdreader_core PUBLIC core/include)
 if(WIN32)
   add_library(cdreader_windows STATIC
     platform/windows/spti_transport.cpp
+    platform/windows/winhttp_client.cpp
   )
   target_include_directories(cdreader_windows PUBLIC platform/windows)
-  target_link_libraries(cdreader_windows PUBLIC cdreader_core)
+  target_link_libraries(cdreader_windows PUBLIC cdreader_core winhttp)
   target_compile_definitions(cdreader_windows PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
   add_executable(cdreader app/cli/main.cpp)

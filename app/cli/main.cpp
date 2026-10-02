@@ -14,10 +14,11 @@
 #include <string>
 #include <vector>
 
+#include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
+#include "cdreader/metadata.h"
 #include "cdreader/ripper.h"
 #include "cdreader/toc.h"
-#include "cdreader/wav_writer.h"
 #include "spti_transport.h"
 
 namespace fs = std::filesystem;
@@ -229,18 +230,23 @@ int cmdRip(const std::vector<std::string>& args) {
         log << "\n";
     }
 
+    const std::string format = "wav";
+    cdr::AlbumMetadata album;
+    album.discId = hex32(toc.cddbId());
+
     cdr::Ripper ripper(*d.drive, toc, options);
     int problems = 0;
     for (const cdr::Track& t : selected) {
-        char name[32];
-        std::snprintf(name, sizeof name, "Track%02d.wav", t.number);
+        std::unique_ptr<cdr::AudioWriter> writer = cdr::createAudioWriter(format);
+        char base[32];
+        std::snprintf(base, sizeof base, "Track%02d", t.number);
+        const std::string name = base + std::string(".") + writer->extension();
         const fs::path file = dir / name;
 
-        cdr::WavWriter wav;
-        wav.open(file);
+        writer->open(file, album.forTrack(t.number, toc.lastTrack));
         int lastPercent = -1;
         cdr::TrackRipResult r = ripper.ripTrack(
-            t, [&](const uint8_t* pcm, size_t bytes) { wav.write(pcm, bytes); },
+            t, [&](const uint8_t* pcm, size_t bytes) { writer->write(pcm, bytes); },
             [&](uint32_t done, uint32_t total) {
                 int percent = total ? int(uint64_t(done) * 100 / total) : 100;
                 if (percent != lastPercent) {
@@ -249,7 +255,7 @@ int cmdRip(const std::vector<std::string>& args) {
                     lastPercent = percent;
                 }
             });
-        wav.close();
+        writer->close();
 
         const std::string status = r.clean() ? "OK" : std::to_string(r.unreadableSectors) + " unreadable sector(s)";
         std::printf("  CRC32 %s  %s%s\n", hex32(r.crc32).c_str(), status.c_str(),

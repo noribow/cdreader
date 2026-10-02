@@ -90,8 +90,11 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   cd_drive  MMC コマンド (INQUIRY, TEST UNIT READY, READ TOC, READ CD)
   toc       TOC 解析、CDDB ID
   ripper    リトライ・セクタ分割・verify を含むトラック読み取り
+  audio_writer  出力フォーマットの共通インターフェース (WAV など。コーデック・コンテナはここに追加)
+  metadata  アルバム / トラック情報 (タグ付け・ファイル名用)
+  http      オンライン照会用 HTTP インターフェース (実装はプラットフォーム側)
   wav_writer, crc32
-platform/windows/   SPTI による ScsiTransport 実装、ドライブ列挙
+platform/windows/   SPTI による ScsiTransport 実装、ドライブ列挙、WinHTTP クライアント
 app/cli/            Windows 用コマンドラインツール
 tests/              仮想ドライブを使ったユニットテスト
 ```

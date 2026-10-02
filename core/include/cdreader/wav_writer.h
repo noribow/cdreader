@@ -5,19 +5,23 @@
 #include <filesystem>
 #include <fstream>
 
+#include "cdreader/audio_writer.h"
+
 namespace cdr {
 
 // Writes 44.1 kHz / 16-bit / stereo PCM (the CD-DA format) as a RIFF WAVE file.
-class WavWriter {
+class WavWriter : public AudioWriter {
 public:
     WavWriter() = default;
-    ~WavWriter();
+    ~WavWriter() override;
     WavWriter(const WavWriter&) = delete;
     WavWriter& operator=(const WavWriter&) = delete;
 
-    void open(const std::filesystem::path& path);  // throws std::runtime_error
-    void write(const uint8_t* pcm, size_t bytes);
-    void close();                                  // patches the RIFF sizes
+    std::string extension() const override { return "wav"; }
+    void open(const std::filesystem::path& path, const TrackMetadata& metadata) override;
+    void open(const std::filesystem::path& path) { open(path, TrackMetadata{}); }  // throws std::runtime_error
+    void write(const uint8_t* pcm, size_t bytes) override;
+    void close() override;                         // patches the RIFF sizes
 
     uint64_t dataBytes() const { return dataBytes_; }
 

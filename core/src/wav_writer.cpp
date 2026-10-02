@@ -30,7 +30,7 @@ WavWriter::~WavWriter() {
     }
 }
 
-void WavWriter::open(const std::filesystem::path& path) {
+void WavWriter::open(const std::filesystem::path& path, const TrackMetadata&) {
     out_.open(path, std::ios::binary | std::ios::trunc);
     if (!out_) throw std::runtime_error("cannot create " + path.u8string());
     dataBytes_ = 0;

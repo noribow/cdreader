@@ -11,7 +11,9 @@
 #include <string>
 #include <vector>
 
+#include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
+#include "cdreader/metadata.h"
 #include "cdreader/crc32.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
@@ -330,6 +332,33 @@ TEST(offset_does_not_read_into_data_session) {
     CHECK(r.result.clean());
     CHECK_EQ(r.result.paddedSamples, 700u);
     CHECK(r.bytes == expectedWithOffset(20000, audioEnd - 20000, 700, 0, audioEnd));
+}
+
+TEST(album_metadata_for_track) {
+    cdr::AlbumMetadata album;
+    album.artist = "Artist";
+    album.title = "Album";
+    album.year = "1999";
+    album.discId = "0A0B0C03";
+    album.trackTitles = {"One", "Two"};
+    album.trackArtists = {"", "Guest"};
+    cdr::TrackMetadata m1 = album.forTrack(1, 3);
+    CHECK(m1.title == "One" && m1.artist == "Artist" && m1.album == "Album" && m1.albumArtist == "Artist");
+    CHECK_EQ(m1.trackNumber, 1);
+    CHECK_EQ(m1.trackTotal, 3);
+    CHECK(album.forTrack(2, 3).artist == "Guest");
+    cdr::TrackMetadata m3 = album.forTrack(3, 3);  // no title known
+    CHECK(m3.title.empty() && m3.year == "1999" && m3.discId == "0A0B0C03");
+}
+
+TEST(audio_writer_factory) {
+    const std::vector<std::string> formats = cdr::audioFormats();
+    CHECK(std::find(formats.begin(), formats.end(), "wav") != formats.end());
+    for (const std::string& f : formats) {
+        std::unique_ptr<cdr::AudioWriter> w = cdr::createAudioWriter(f);
+        CHECK(w != nullptr && w->extension() == f);
+    }
+    CHECK(cdr::createAudioWriter("no-such-format") == nullptr);
 }
 
 TEST(not_ready_without_disc) {
