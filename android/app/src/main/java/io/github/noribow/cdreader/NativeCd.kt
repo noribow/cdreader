@@ -7,6 +7,14 @@ fun interface RipProgressListener {
     fun onProgress(doneSectors: Int, totalSectors: Int)
 }
 
+/**
+ * Progress of [CdSession.ripImage] (#42): the part being read ([track] 0 is the
+ * hidden track before track 1) and the sectors done of the whole image.
+ */
+fun interface ImageProgressListener {
+    fun onProgress(track: Int, doneSectors: Int, totalSectors: Int)
+}
+
 /** Progress of the read offset detection (#37): track [step] of at most [steps], in sectors. */
 fun interface OffsetProgressListener {
     fun onProgress(step: Int, steps: Int, track: Int, doneSectors: Int, totalSectors: Int)
@@ -50,6 +58,14 @@ object NativeCd {
         offsetDetail: String,
     )
     @JvmStatic external fun nativeRipTrack(handle: Long, track: Int, path: String, listener: RipProgressListener?): IntArray
+    @JvmStatic external fun nativeImageFileNames(handle: Long, format: String, tracks: IntArray): Array<String>
+    @JvmStatic external fun nativeRipImage(
+        handle: Long,
+        tracks: IntArray,
+        imagePath: String,
+        cuePath: String,
+        listener: ImageProgressListener?,
+    ): IntArray
     @JvmStatic external fun nativeDetectOffset(handle: Long, http: HttpGet?, listener: OffsetProgressListener?): Array<String>
     @JvmStatic external fun nativeCheckAccurateRip(handle: Long, enabled: Boolean, http: HttpGet?): IntArray
     @JvmStatic external fun nativeAccurateRipError(handle: Long): String
@@ -203,6 +219,28 @@ data class RipResult(
 ) {
     val clean: Boolean get() = unreadableSectors == 0 && suspiciousSectors == 0
 }
+
+/** File names of a single-file rip (#42), see [CdSession.imageFileNames]. */
+data class ImageNames(
+    /** "Artist - Album.flac", or "CDImage.flac" without CDDB data. */
+    val imageFile: String,
+    /** "Artist - Album.cue" / "CDImage.cue". */
+    val cueFile: String,
+    /** The format carries the CUE sheet inside the file (FLAC, Ogg FLAC: CUESHEET; MKA: chapters). */
+    val embeddedCue: Boolean,
+    /** The image starts with the hidden track before track 1 (HTOA). */
+    val withHtoa: Boolean,
+)
+
+/** Result of [CdSession.ripImage]. */
+data class ImageResult(
+    /** CRC32 of all the audio in the image. */
+    val crc32: Int,
+    val embeddedCue: Boolean,
+    val withHtoa: Boolean,
+    /** Per part in image order: track number (0: the HTOA) and its result. */
+    val parts: List<Pair<Int, RipResult>>,
+)
 
 /** C2 error pointers of a rip (see [CdSession.c2Status]). */
 enum class C2Status { DISABLED, NOT_SUPPORTED, USED, GIVEN_UP }
@@ -386,6 +424,40 @@ class CdSession private constructor(private val handle: Long) : Closeable {
         return RipResult(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7] != 0, v[8], v[9], v[10], v[11], v[12])
     }
 
+    /**
+     * Single-file mode (#42): the names of the image of [tracks] (track
+     * numbers; empty: every audio track) in [format], from the CDDB data.
+     * Throws IllegalArgumentException when the tracks are not consecutive
+     * audio tracks (the file would be no image of the disc).
+     */
+    fun imageFileNames(format: String, tracks: List<Int>): ImageNames {
+        val v = NativeCd.nativeImageFileNames(handle, format, tracks.toIntArray())
+        return ImageNames(v[0], v[1], v[2] == "1", v[3] == "1")
+    }
+
+    /**
+     * Rips [tracks] (as [imageFileNames], in the format of [beginRip]) into
+     * one local file [imagePath] (seekable, as [ripTrack]), the HTOA first
+     * when the disc has one and track 1 is included, with the CUE sheet
+     * embedded where the format can carry it, and writes the CUE sheet to
+     * [cuePath]. AccurateRip checksums are computed per track, so
+     * [checkAccurateRip] and [ripLog] work as after [ripTrack]. Throws
+     * java.util.concurrent.CancellationException after [cancel],
+     * IllegalArgumentException for a selection that is no image and
+     * IOException on errors; both files are deleted then.
+     */
+    fun ripImage(tracks: List<Int>, imagePath: String, cuePath: String, listener: ImageProgressListener?): ImageResult {
+        val v = NativeCd.nativeRipImage(handle, tracks.toIntArray(), imagePath, cuePath, listener)
+        val parts = (0 until v[2]).map { k ->
+            val i = 3 + k * 14
+            v[i] to RipResult(
+                v[i + 1], v[i + 2], v[i + 3], v[i + 4], v[i + 5], v[i + 6], v[i + 7], v[i + 8] != 0, v[i + 9],
+                v[i + 10], v[i + 11], v[i + 12], v[i + 13]
+            )
+        }
+        return ImageResult(v[0], v[1] and 1 != 0, v[1] and 2 != 0, parts)
+    }
+
     /** Compares the tracks ripped since [beginRip] with the AccurateRip database. Never fails for network problems. */
     fun checkAccurateRip(enabled: Boolean, http: HttpGet): AccurateRipSummary {
         val v = NativeCd.nativeCheckAccurateRip(handle, enabled, http)
@@ -404,7 +476,7 @@ class CdSession private constructor(private val handle: Long) : Closeable {
     /** rip.log text of the current rip (same layout as the Windows CLI). */
     fun ripLog(): String = NativeCd.nativeRipLog(handle)
 
-    /** Thread-safe: makes a running [ripTrack] or [detectOffset] stop at the next block. */
+    /** Thread-safe: makes a running [ripTrack], [ripImage] or [detectOffset] stop at the next block. */
     fun cancel() = NativeCd.nativeCancel(handle)
 
     override fun close() {

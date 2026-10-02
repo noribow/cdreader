@@ -21,6 +21,7 @@
 #include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
+#include "cdreader/disc_image.h"
 #include "cdreader/http.h"
 #include "cdreader/offset_detect.h"
 #include "rip_session.h"
@@ -239,6 +240,27 @@ private:
     JNIEnv* env_;
     jobject httpGet_;
 };
+
+// Java int[] -> track numbers. Returns false with an exception pending on failure.
+bool fromJava(JNIEnv* env, jintArray array, std::vector<int>& out) {
+    out.clear();
+    if (array == nullptr) return true;
+    const jsize length = env->GetArrayLength(array);
+    std::vector<jint> values(static_cast<size_t>(length));
+    if (length > 0) env->GetIntArrayRegion(array, 0, length, values.data());
+    if (env->ExceptionCheck()) return false;
+    out.assign(values.begin(), values.end());
+    return true;
+}
+
+// The values nativeRipTrack() returns for one track (13 ints).
+void appendTrackResult(std::vector<jint>& v, const cdr::RippedTrack& r) {
+    v.insert(v.end(), {jint(r.result.sectors), jint(r.result.unreadableSectors), jint(r.result.retries),
+                       jint(r.result.paddedSamples), jint(r.result.crc32), jint(r.accurateRipV1),
+                       jint(r.accurateRipV2), jint(r.result.c2 ? 1 : 0), jint(r.result.c2ErrorSectors),
+                       jint(r.result.c2Rereads), jint(r.result.c2Unresolved),
+                       jint(r.result.suspiciousSectors.size()), jint(r.result.cacheDefeats)});
+}
 
 }  // namespace
 
@@ -497,17 +519,99 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTr
                 env->CallVoidMethod(listener, onProgress, jint(done), jint(total));
                 if (env->ExceptionCheck()) throw JavaExceptionPending{};
             });
-        return toJavaArray(env, std::vector<jint>{jint(r.result.sectors), jint(r.result.unreadableSectors),
-                                                  jint(r.result.retries), jint(r.result.paddedSamples),
-                                                  jint(r.result.crc32), jint(r.accurateRipV1), jint(r.accurateRipV2),
-                                                  jint(r.result.c2 ? 1 : 0), jint(r.result.c2ErrorSectors),
-                                                  jint(r.result.c2Rereads), jint(r.result.c2Unresolved),
-                                                  jint(r.result.suspiciousSectors.size()),
-                                                  jint(r.result.cacheDefeats)});
+        std::vector<jint> v;
+        appendTrackResult(v, r);
+        return toJavaArray(env, v);
     } catch (const cdr::RipCancelled&) {
         throwJava(env, "java/util/concurrent/CancellationException", "rip cancelled");
     } catch (const JavaExceptionPending&) {
         // propagate the listener's exception
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+    }
+    return nullptr;
+}
+
+// Single-file mode (#42): the names of the image of `tracks` (empty or null:
+// every audio track) in `format`, from the current metadata: [image file
+// ("Artist - Album.flac" / "CDImage.flac"), CUE sheet file ("... .cue"),
+// "1" if the format carries the CUE sheet inside the file (FLAC, Ogg FLAC:
+// CUESHEET; Matroska: chapters), "1" if the image starts with the HTOA].
+// Throws IllegalArgumentException when the tracks are not consecutive audio
+// tracks of the disc.
+JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeImageFileNames(JNIEnv* env, jclass,
+                                                                                            jlong handle,
+                                                                                            jstring format,
+                                                                                            jintArray tracks) {
+    std::string f;
+    std::vector<int> numbers;
+    if (!fromJava(env, format, f) || !fromJava(env, tracks, numbers)) return nullptr;
+    try {
+        const cdr::DiscImagePlan plan = session(handle)->rip.planImage(numbers, f);
+        const std::unique_ptr<cdr::AudioWriter> writer = cdr::createAudioWriter(f);
+        return toJavaArray(env, std::vector<std::string>{plan.fileName, plan.cueFileName,
+                                                         writer && writer->canEmbedCueSheet() ? "1" : "0",
+                                                         plan.withHtoa ? "1" : "0"});
+    } catch (const std::exception& e) {
+        throwJava(env, "java/lang/IllegalArgumentException", e.what());
+        return nullptr;
+    }
+}
+
+// Rips `tracks` (as nativeImageFileNames) into one local file at `imagePath`
+// in the format given to nativeBeginRip, with the CUE sheet embedded where
+// the format can carry it, and writes the CUE sheet to `cuePath` (empty: not
+// written). Calls listener.onProgress(track, done, total) with the part
+// being read (0: the HTOA) and the sectors of the whole image. Returns
+// [image CRC32, flags (1: CUE sheet embedded, 2: HTOA included), parts N,
+// then per part: track number (0: the HTOA) and the 13 values of
+// nativeRipTrack]. Throws java.util.concurrent.CancellationException after
+// nativeCancel(), IllegalArgumentException for a selection that is no image
+// and IOException on errors; both files are deleted then.
+JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipImage(JNIEnv* env, jclass,
+                                                                                    jlong handle, jintArray tracks,
+                                                                                    jstring imagePath,
+                                                                                    jstring cuePath,
+                                                                                    jobject listener) {
+    Session& s = *session(handle);
+    std::vector<int> numbers;
+    std::string image, cue;
+    if (!fromJava(env, tracks, numbers) || !fromJava(env, imagePath, image) || !fromJava(env, cuePath, cue))
+        return nullptr;
+
+    jmethodID onProgress = nullptr;
+    if (listener != nullptr) {
+        jclass cls = env->GetObjectClass(listener);
+        onProgress = env->GetMethodID(cls, "onProgress", "(III)V");
+        if (onProgress == nullptr) return nullptr;  // NoSuchMethodError pending
+    }
+
+    try {
+        const cdr::RippedImage& r = s.rip.ripImage(
+            numbers, std::filesystem::u8path(image), cue.empty() ? std::filesystem::path() : std::filesystem::u8path(cue),
+            [&](int track, uint32_t done, uint32_t total) {
+                if (onProgress == nullptr) return;
+                env->CallVoidMethod(listener, onProgress, jint(track), jint(done), jint(total));
+                if (env->ExceptionCheck()) throw JavaExceptionPending{};
+            });
+        const std::vector<cdr::RippedTrack>& ripped = s.rip.rippedTracks();
+        std::vector<jint> v = {jint(r.crc32), (r.embeddedCueSheet ? 1 : 0) | (r.plan.withHtoa ? 2 : 0),
+                               jint(ripped.size() + (r.htoa ? 1 : 0))};
+        if (r.htoa) {
+            v.push_back(0);
+            appendTrackResult(v, *r.htoa);
+        }
+        for (const cdr::RippedTrack& t : ripped) {
+            v.push_back(t.track.number);
+            appendTrackResult(v, t);
+        }
+        return toJavaArray(env, v);
+    } catch (const cdr::RipCancelled&) {
+        throwJava(env, "java/util/concurrent/CancellationException", "rip cancelled");
+    } catch (const JavaExceptionPending&) {
+        // propagate the listener's exception
+    } catch (const std::invalid_argument& e) {
+        throwJava(env, "java/lang/IllegalArgumentException", e.what());
     } catch (const std::exception& e) {
         throwIo(env, e.what());
     }

@@ -21,6 +21,8 @@
         <item>追い出し</item>
         <item>なし</item>
     </string-array>
+    <string name="single_file">ディスクを 1 ファイルに (CUE シート付き)</string>
+    <string name="single_file_note">選択した連続するトラックを「アーティスト - アルバム」(不明なら CDImage) の 1 ファイルと .cue ファイルに保存します。CUE シートは FLAC・Ogg FLAC ではファイル内にも埋め込み、MKA ではチャプターになります。WAV・ALAC・Opus・Vorbis は外部の .cue ファイルのみです。一時ファイルにディスク全体を書き出すため、端末の空き容量が必要です。</string>
     <string name="cddb_group">CDDB</string>
     <string name="cddb_server">サーバー URL (空欄: 既定のサーバー)</string>
     <string name="cddb_email">連絡先メールアドレス</string>

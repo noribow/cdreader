@@ -20,6 +20,8 @@
 #include "cdreader/accuraterip.h"
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
+#include "cdreader/crc32.h"
+#include "cdreader/gaps.h"
 #include "cdreader/http.h"
 #include "cdreader/ripper.h"
 #include "fake_drive.h"
@@ -84,14 +86,14 @@ FakeDrive makeAudioDisc() { return FakeDrive({{0, false}, {300, false}, {450, fa
 
 // A fake drive behind a fake USB bridge behind the BOT, as in the app.
 struct Rig {
-    FakeDrive fake = makeAudioDisc();
+    FakeDrive fake;
     FakeUsbDevice device{fake, 0};
     cdr::usb::BulkOnlyTransport bot{device, 0};
     cdr::CdDrive drive{bot};
     cdr::RipSession session{drive};
     // The cache detection (#34) times the fake drive's simulated commands; a
     // small reported buffer, so that the 10 second disc has room for its flush.
-    Rig() {
+    explicit Rig(FakeDrive disc = makeAudioDisc()) : fake(std::move(disc)) {
         fake.bufferKB = 200;
         session.setClock(fake);
     }
@@ -1169,6 +1171,363 @@ TEST(offset_detection_over_usb_failures_and_cancel) {
     // track read up to its end, #37).
     CHECK(d.tracks.size() == 3 && d.tracks[1].track == 1 && d.tracks[2].track == 3);
     CHECK_STR(d.agreement(), "2 of 3 tracks agreed, v1");
+}
+
+// --- Single-file mode (#42) ---------------------------------------------------
+
+static std::string readText(const fs::path& path) {
+    const std::vector<uint8_t> bytes = readFile(path);
+    return std::string(bytes.begin(), bytes.end());
+}
+
+// The PCM of a WAV file written by WavWriter (44-byte header, the data chunk first; tags follow it).
+static std::vector<uint8_t> wavPcm(const std::vector<uint8_t>& file) {
+    if (file.size() < 44 || std::memcmp(file.data() + 36, "data", 4) != 0) return {};
+    const size_t size = size_t(file[40]) | size_t(file[41]) << 8 | size_t(file[42]) << 16 | size_t(file[43]) << 24;
+    if (size > file.size() - 44) return {};
+    return std::vector<uint8_t>(file.begin() + 44, file.begin() + 44 + ptrdiff_t(size));
+}
+
+static uint32_t crcOf(const std::vector<uint8_t>& pcm) {
+    cdr::Crc32 crc;
+    crc.update(pcm.data(), pcm.size());
+    return crc.value();
+}
+
+// The sheet of the CDDB album of addCddbAlbum() as one image (no gaps on the disc).
+static std::string albumCue(const std::string& discId, const std::string& file) {
+    return "\xEF\xBB\xBF"
+           "REM COMMENT \"cdreader\"\r\n"
+           "REM GENRE Rock\r\n"
+           "REM DATE 1999\r\n"
+           "REM DISCID " + discId + "\r\n"
+           "PERFORMER \"Various\"\r\n"
+           "TITLE \"Album: Live\"\r\n"
+           "FILE \"" + file + "\" WAVE\r\n"
+           "  TRACK 01 AUDIO\r\n"
+           "    TITLE \"Opening\"\r\n"
+           "    PERFORMER \"The Artist\"\r\n"
+           "    INDEX 01 00:00:00\r\n"
+           "  TRACK 02 AUDIO\r\n"
+           "    TITLE \"\xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91\"\r\n"
+           "    PERFORMER \"Guest\"\r\n"
+           "    INDEX 01 00:04:00\r\n"
+           "  TRACK 03 AUDIO\r\n"
+           "    TITLE \"What?\"\r\n"
+           "    PERFORMER \"The Artist\"\r\n"
+           "    INDEX 01 00:06:00\r\n";
+}
+
+// The image is the per-track rips back to back (offset correction included),
+// with per-track CRCs / AccurateRip checksums, the .cue file and rip.log.
+TEST(image_wav_equals_per_track_rips_with_offsets) {
+    for (int offset : {0, 667, -1206}) {
+        Rig rig;
+        FakeHttp http;
+        addCddbAlbum(http);
+        rig.session.lookupCddb(&http, {});
+        rig.session.beginRip(settings("wav", offset));
+        const cdr::DiscImagePlan plan = rig.session.planImage({}, "wav");
+        CHECK_STR(plan.fileName, "Various - Album_ Live.wav");
+        CHECK_STR(plan.cueFileName, "Various - Album_ Live.cue");
+        CHECK(!plan.withHtoa);
+        TempDir dir;
+        std::vector<uint32_t> progress;
+        const cdr::RippedImage& image =
+            rig.session.ripImage({}, dir.path / "image.wav", dir.path / "image.cue",
+                                 [&](int, uint32_t done, uint32_t total) {
+                                     CHECK_EQ(total, 750u);
+                                     progress.push_back(done);
+                                 });
+        CHECK(!image.embeddedCueSheet);
+        CHECK(!image.htoa);
+        CHECK(std::is_sorted(progress.begin(), progress.end()));
+        CHECK(!progress.empty() && progress.back() == 750u);
+
+        std::vector<uint8_t> concatenated;
+        const std::vector<cdr::RippedTrack>& tracks = rig.session.rippedTracks();
+        CHECK_EQ(tracks.size(), size_t(3));
+        for (int n = 1; n <= 3; ++n) {
+            const Reference ref = referenceRip(n, offset);
+            concatenated.insert(concatenated.end(), ref.pcm.begin(), ref.pcm.end());
+            if (tracks.size() != 3) continue;
+            const cdr::RippedTrack& t = tracks[size_t(n - 1)];
+            CHECK_EQ(t.track.number, n);
+            CHECK_STR(t.fileName, "Track 0" + std::to_string(n));
+            CHECK_EQ(t.result.crc32, ref.crc32);
+            CHECK_EQ(t.accurateRipV1, ref.v1);
+            CHECK_EQ(t.accurateRipV2, ref.v2);
+        }
+        CHECK(wavPcm(readFile(dir.path / "image.wav")) == concatenated);
+        CHECK_EQ(image.crc32, crcOf(concatenated));
+        CHECK_STR(readText(dir.path / "image.cue"), albumCue(rig.session.album().discId, plan.fileName));
+        CHECK_STR(image.plan.cueSheet, readText(dir.path / "image.cue"));
+
+        // rip.log: the single-file layout of the CLI.
+        const std::string log = rig.session.ripLog();
+        char lines[512];
+        std::snprintf(lines, sizeof lines,
+                      "Folder: Various - Album_ Live\n"
+                      "Single file: Various - Album_ Live.wav\n"
+                      "Track 01  CRC32 %08X  retries 0  OK%s\n"
+                      "Track 02  CRC32 %08X  retries 0  OK\n"
+                      "Track 03  CRC32 %08X  retries 0  OK%s\n"
+                      "Various - Album_ Live.wav  CRC32 %08X\n",
+                      tracks.size() == 3 ? tracks[0].result.crc32 : 0,
+                      offset < 0 ? "  (1206 samples outside the disc padded with silence)" : "",
+                      tracks.size() == 3 ? tracks[1].result.crc32 : 0, tracks.size() == 3 ? tracks[2].result.crc32 : 0,
+                      offset > 0 ? "  (667 samples outside the disc padded with silence)" : "", image.crc32);
+        CHECK(contains(log, lines));
+        CHECK(!contains(log, "Embedded CUE sheet"));
+        CHECK(contains(log, "\nAll tracks ripped without errors\n"));
+    }
+}
+
+// FLAC and Ogg FLAC carry the CUE sheet (CUESHEET block and tag), Matroska
+// chapters; the other formats get only the .cue file.
+TEST(image_embeds_cue_sheet_where_supported) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    TempDir dir;
+    std::vector<uint8_t> pcm;
+    for (int n = 1; n <= 3; ++n) {
+        const Reference ref = referenceRip(n);
+        pcm.insert(pcm.end(), ref.pcm.begin(), ref.pcm.end());
+    }
+    const std::string cue = albumCue(rig.session.album().discId, "Various - Album_ Live.flac");
+    const std::string noBom = cue.substr(3);
+
+    rig.session.beginRip(settings("flac"));
+    const cdr::RippedImage& flac = rig.session.ripImage({}, dir.path / "i.flac", dir.path / "i.cue");
+    CHECK(flac.embeddedCueSheet);
+    CHECK_STR(flac.plan.fileName, "Various - Album_ Live.flac");
+    CHECK_STR(readText(dir.path / "i.cue"), cue);
+    const DecodedFlac d = decodeFlac(readFile(dir.path / "i.flac"));
+    CHECK(d.pcm == pcm);
+    CHECK(std::find(d.blockTypes.begin(), d.blockTypes.end(), 5) != d.blockTypes.end());  // CUESHEET
+    CHECK(hasComment(d, "CUESHEET=" + noBom));
+    CHECK(hasComment(d, "ALBUM=Album: Live"));
+    CHECK(contains(rig.session.ripLog(), "Single file: Various - Album_ Live.flac\nEmbedded CUE sheet: CUESHEET block and tag\nTrack 01  CRC32 "));
+
+    rig.session.beginRip(settings("oggflac"));
+    const cdr::RippedImage& ogg = rig.session.ripImage({}, dir.path / "i.oga", dir.path / "i.cue");
+    CHECK(ogg.embeddedCueSheet);
+    const DecodedFlac o = decodeFlac(oggFlacAsNative(readFile(dir.path / "i.oga")));
+    CHECK(o.pcm == pcm);
+    CHECK(hasComment(o, "CUESHEET=" + noBom.substr(0, noBom.find("FILE")) + "FILE \"Various - Album_ Live.oga\"" +
+                            noBom.substr(noBom.find(" WAVE\r\n"))));
+
+    rig.session.beginRip(settings("mka"));
+    const cdr::RippedImage& mka = rig.session.ripImage({}, dir.path / "i.mka", {});
+    CHECK(mka.embeddedCueSheet);
+    CHECK(!fs::exists(dir.path / "i.mka.cue"));
+    const std::string text = readText(dir.path / "i.mka");
+    CHECK(contains(text, "\x10\x43\xA7\x70"));  // Chapters
+    CHECK(contains(text, "What?"));
+    CHECK(contains(rig.session.ripLog(), "Embedded CUE sheet: Matroska chapters (one per track)\n"));
+
+    rig.session.beginRip(settings("alac"));
+    const cdr::RippedImage& alac = rig.session.ripImage({}, dir.path / "i.m4a", dir.path / "i.cue");
+    CHECK(!alac.embeddedCueSheet);
+    CHECK_STR(alac.plan.fileName, "Various - Album_ Live.m4a");
+    CHECK(contains(readText(dir.path / "i.cue"), "FILE \"Various - Album_ Live.m4a\" WAVE\r\n"));
+    CHECK(!contains(rig.session.ripLog(), "Embedded CUE sheet"));
+}
+
+// A disc with a hidden track before track 1 and pregaps (#25): the image
+// starts at LBA 0, the HTOA part has no AccurateRip checksums.
+TEST(image_with_htoa_and_pregaps) {
+    for (int offset : {0, 30, -30}) {
+        Rig rig(FakeDrive({{150, false}, {300, false}, {450, false}}, 750));
+        rig.fake.pregaps[3] = 30;
+        rig.session.beginRip(settings("flac", offset));
+        TempDir dir;
+        const cdr::RippedImage& image = rig.session.ripImage({1, 2, 3}, dir.path / "i.flac", dir.path / "i.cue");
+        CHECK(image.plan.withHtoa);
+        CHECK(image.htoa.has_value());
+        CHECK_STR(image.plan.fileName, "CDImage.flac");
+        CHECK_STR(image.plan.cueFileName, "CDImage.cue");
+        CHECK_STR(readText(dir.path / "i.cue"),
+                  "REM COMMENT \"cdreader\"\r\n"
+                  "REM DISCID " + rig.session.album().discId + "\r\n"
+                  "FILE \"CDImage.flac\" WAVE\r\n"
+                  "  TRACK 01 AUDIO\r\n"
+                  "    INDEX 00 00:00:00\r\n"
+                  "    INDEX 01 00:02:00\r\n"
+                  "  TRACK 02 AUDIO\r\n"
+                  "    INDEX 01 00:04:00\r\n"
+                  "  TRACK 03 AUDIO\r\n"
+                  "    INDEX 00 00:05:45\r\n"
+                  "    INDEX 01 00:06:00\r\n");
+
+        // The image: the whole disc from LBA 0, as ripped part by part with the core ripper.
+        FakeDrive ref({{150, false}, {300, false}, {450, false}}, 750);
+        cdr::CdDrive drive(ref);
+        const cdr::Toc toc = drive.readToc();
+        cdr::RipOptions options;
+        options.readOffsetSamples = offset;
+        cdr::Ripper ripper(drive, toc, options);
+        std::vector<uint8_t> expected;
+        std::vector<cdr::Track> parts = {cdr::htoaTrack(toc)};
+        parts.insert(parts.end(), toc.tracks.begin(), toc.tracks.end());
+        std::vector<uint32_t> v2;
+        for (const cdr::Track& t : parts) {
+            cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, t.number ? t : toc.tracks[0]);
+            ripper.ripTrack(t, [&](const uint8_t* p, size_t n) {
+                expected.insert(expected.end(), p, p + n);
+                ar.update(p, n);
+            });
+            if (t.number) v2.push_back(ar.v2());
+        }
+        CHECK_EQ(expected.size(), size_t(750) * cdr::kSectorBytes);
+        const DecodedFlac d = decodeFlac(readFile(dir.path / "i.flac"));
+        CHECK(d.pcm == expected);
+        CHECK_EQ(image.crc32, crcOf(expected));
+
+        // AccurateRip: the three tracks only.
+        const std::vector<cdr::RippedTrack>& tracks = rig.session.rippedTracks();
+        CHECK_EQ(tracks.size(), size_t(3));
+        for (size_t i = 0; i < tracks.size() && i < v2.size(); ++i) CHECK_EQ(tracks[i].accurateRipV2, v2[i]);
+        FakeHttp http;
+        const cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(rig.session.toc());
+        if (v2.size() == 3) http.accurateRip = reply(200, dbar(id, {{{7, v2[0]}, {7, v2[1]}, {7, v2[2]}}}));
+        const cdr::AccurateRipReport& report = rig.session.checkAccurateRip(&http);
+        CHECK_EQ(report.tracks.size(), size_t(3));
+        CHECK_EQ(report.accurateTracks(), 3);
+
+        const std::string log = rig.session.ripLog();
+        CHECK(contains(log, "Single file: CDImage.flac\nEmbedded CUE sheet: CUESHEET block and tag\n"
+                            "Track 00 (HTOA)  CRC32 "));
+        CHECK(contains(log, "\nTrack 01  CRC32 "));
+        CHECK(contains(log, "AccurateRip: 3 of 3 track(s) accurately ripped (v2: 3), 3 track(s) in database"));
+        CHECK(!contains(log, "Track 00  v1"));
+    }
+
+    // Without track 1 the HTOA is not part of the image.
+    Rig rig(FakeDrive({{150, false}, {300, false}, {450, false}}, 750));
+    rig.session.beginRip(settings("wav"));
+    TempDir dir;
+    const cdr::RippedImage& tail = rig.session.ripImage({2, 3}, dir.path / "i.wav", dir.path / "i.cue");
+    CHECK(!tail.plan.withHtoa && !tail.htoa);
+    CHECK_EQ(wavPcm(readFile(dir.path / "i.wav")).size(), size_t(450) * cdr::kSectorBytes);
+}
+
+// AccurateRip per track from the image stream, as for per-track files.
+TEST(image_accuraterip_per_track) {
+    Rig rig;
+    FakeHttp http;
+    const cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(rig.session.toc());
+    const Reference t1 = referenceRip(1, 6), t2 = referenceRip(2, 6), t3 = referenceRip(3, 6);
+    http.accurateRip = reply(200, dbar(id, {{{12, t1.v2}, {4, t2.v1}, {5, t3.v1 ^ 1}}}));
+    rig.session.beginRip(settings("flac", 6));
+    TempDir dir;
+    rig.session.ripImage({}, dir.path / "i.flac", dir.path / "i.cue");
+    const cdr::AccurateRipReport& report = rig.session.checkAccurateRip(&http);
+    CHECK(report.status == cdr::AccurateRipReport::Status::Found);
+    CHECK_EQ(report.accurateTracks(), 2);
+    CHECK_EQ(report.tracksInDatabase(), 3);
+    const std::string log = rig.session.ripLog();
+    char line[128];
+    std::snprintf(line, sizeof line, "Track 01  v1 %08X  v2 %08X  Accurately ripped with v2", t1.v1, t1.v2);
+    CHECK(contains(log, line));
+    CHECK(contains(log, "AccurateRip: 2 of 3 track(s) accurately ripped (v1: 1, v2: 1), 3 track(s) in database"));
+    CHECK(contains(log, "CDImage.flac  CRC32 "));
+}
+
+TEST(image_selection_is_validated) {
+    FakeDrive mixed({{0, false}, {300, false}, {450, true}}, 750);  // track 3 is data
+    Rig rig(std::move(mixed));
+    rig.session.beginRip(settings("wav"));
+    TempDir dir;
+    auto rejects = [&](const std::vector<int>& tracks) {
+        try {
+            rig.session.ripImage(tracks, dir.path / "i.wav", dir.path / "i.cue");
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    CHECK(rejects({1, 3}));  // a data track
+    CHECK(rejects({7}));
+    Rig plain;
+    plain.session.beginRip(settings("wav"));
+    auto plainRejects = [&](const std::vector<int>& tracks) {
+        try {
+            plain.session.ripImage(tracks, dir.path / "i.wav", dir.path / "i.cue");
+        } catch (const std::invalid_argument&) {
+            return true;
+        }
+        return false;
+    };
+    CHECK(plainRejects({1, 3}));  // not consecutive
+    CHECK(!fs::exists(dir.path / "i.wav") && !fs::exists(dir.path / "i.cue"));
+    // Every audio track: the data track is left out.
+    const cdr::DiscImagePlan plan = rig.session.planImage({}, "flac");
+    CHECK_EQ(plan.parts.size(), size_t(2));
+    CHECK_EQ(plan.totalSectors, 450u);
+}
+
+// Cancel or an error: no partial image or .cue file is left.
+TEST(image_cancel_and_errors_delete_partial_files) {
+    Rig rig;
+    rig.session.beginRip(settings("flac"));
+    TempDir dir;
+    const fs::path image = dir.path / "i.flac";
+    const fs::path cue = dir.path / "i.cue";
+    {
+        std::ofstream(cue) << "old";  // replaced or removed, never left half done
+    }
+    bool cancelled = false;
+    int calls = 0;
+    try {
+        rig.session.ripImage({}, image, cue, [&](int track, uint32_t, uint32_t) {
+            if (track == 2 && ++calls == 2) rig.session.cancel();
+        });
+    } catch (const cdr::RipCancelled&) {
+        cancelled = true;
+    }
+    CHECK(cancelled);
+    CHECK(!fs::exists(image));
+    CHECK(!fs::exists(cue));
+    CHECK(!rig.session.rippedImage());
+    CHECK(rig.session.rippedTracks().empty());
+
+    // An exception from the progress callback (e.g. the app's listener).
+    rig.session.beginRip(settings("wav"));
+    bool threw = false;
+    try {
+        rig.session.ripImage({}, image, cue, [&](int, uint32_t done, uint32_t) {
+            if (done > 400) throw std::runtime_error("listener failed");
+        });
+    } catch (const std::runtime_error& e) {
+        threw = std::string(e.what()) == "listener failed";
+    }
+    CHECK(threw);
+    CHECK(!fs::exists(image));
+    CHECK(!fs::exists(cue));
+
+    // The .cue file cannot be written: the image goes as well.
+    bool failed = false;
+    try {
+        rig.session.ripImage({}, image, dir.path / "missing" / "i.cue");
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    CHECK(failed);
+    CHECK(!fs::exists(image));
+
+    // The next rip works.
+    rig.session.beginRip(settings("wav"));
+    rig.session.ripImage({}, image, cue);
+    CHECK(fs::exists(image) && fs::exists(cue));
+    CHECK(rig.session.rippedImage().has_value());
+    // Per-track files afterwards replace the image's results.
+    rig.session.ripTrack(1, dir.path / "t.wav");
+    CHECK(!rig.session.rippedImage());
+    CHECK_EQ(rig.session.rippedTracks().size(), size_t(1));
+    CHECK(!contains(rig.session.ripLog(), "Single file"));
 }
 
 int main() {

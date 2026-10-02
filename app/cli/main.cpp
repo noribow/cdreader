@@ -23,6 +23,7 @@
 #include "cdreader/cddb.h"
 #include "cdreader/crc32.h"
 #include "cdreader/cue_sheet.h"
+#include "cdreader/disc_image.h"
 #include "cdreader/drive_cache.h"
 #include "cdreader/file_naming.h"
 #include "cdreader/gaps.h"
@@ -776,11 +777,10 @@ int cmdRip(const std::vector<std::string>& args) {
     const std::string extension = probe->extension();
     const std::string encoderText = probe->encoderDescription();
     const std::string albumBase = cdr::albumFileBase(album, "CDImage");
-    const std::string imageName = albumBase + "." + extension;
-    std::vector<cdr::CueTrack> cueTracks;
+    cdr::DiscImagePlan image;  // file names, parts and CUE sheet of the image (shared with the app, #42)
     if (singleFile) {
         try {
-            cueTracks = cdr::singleFileCueTracks(selected, imageName, album, gaps, withHtoa);
+            image = cdr::planDiscImage(selected, toc, album, gaps, withHtoa, extension);
         } catch (const std::invalid_argument& e) {
             throw UsageError(std::string("--single-file needs consecutive audio tracks (") + e.what() + ")");
         }
@@ -834,37 +834,24 @@ int cmdRip(const std::vector<std::string>& args) {
     std::vector<std::string> trackFiles;
     if (singleFile) {
         writer = cdr::createAudioWriter(format, encoder);
+        if (writer->canEmbedCueSheet()) writer->setEmbeddedCueSheet(image.embeddedCueSheet());
+        writer->open(dir / fs::u8path(image.fileName), album.forTrack(0, toc.lastTrack));
+        log << "Single file: " << image.fileName << "\n";
         if (writer->canEmbedCueSheet()) {
-            cdr::EmbeddedCueSheet embedded;
-            embedded.tracks = cueTracks;
-            embedded.mcn = album.mcn;
-            for (const cdr::Track& t : selected) embedded.totalSectors += t.lengthSectors;
-            if (withHtoa) embedded.totalSectors += gaps.htoaSectors;
-            embedded.text = cdr::formatCueSheet(album, cueTracks);
-            writer->setEmbeddedCueSheet(embedded);
-        }
-        writer->open(dir / fs::u8path(imageName), album.forTrack(0, toc.lastTrack));
-        log << "Single file: " << imageName << "\n";
-        if (writer->canEmbedCueSheet()) {
-            // FLAC: CUESHEET block + tag; Matroska: chapters (#23).
-            const char* what = extension != "mka" ? "CUESHEET block and tag"
-                               : withHtoa         ? "Matroska chapters (one per track, plus the HTOA)"
-                                                  : "Matroska chapters (one per track)";
-            std::printf("Embedded CUE sheet: %s in %s\n\n", what, imageName.c_str());
+            const std::string what = cdr::embeddedCueSheetDescription(extension, image.withHtoa);
+            std::printf("Embedded CUE sheet: %s in %s\n\n", what.c_str(), image.fileName.c_str());
             log << "Embedded CUE sheet: " << what << "\n";
         }
     }
     // The HTOA comes first (track 00): in the image before track 1, or in its own file.
-    std::vector<cdr::Track> parts = selected;
-    if (withHtoa) parts.insert(parts.begin(), cdr::htoaTrack(toc));
+    std::vector<cdr::Track> parts = singleFile ? image.parts : selected;
+    if (!singleFile && withHtoa) parts.insert(parts.begin(), cdr::htoaTrack(toc));
     std::string htoaFile;
     for (const cdr::Track& t : parts) {
         const bool htoa = t.number == 0;
         std::string name;
         if (singleFile) {
-            char base[32];
-            std::snprintf(base, sizeof base, htoa ? "Track %02d (HTOA)" : "Track %02d", t.number);
-            name = base;
+            name = cdr::DiscImagePlan::partName(t);
         } else {
             writer = cdr::createAudioWriter(format, encoder);
             cdr::TrackMetadata metadata = album.forTrack(t.number, toc.lastTrack);
@@ -906,24 +893,20 @@ int cmdRip(const std::vector<std::string>& args) {
         std::printf("  CRC32 %s  %s%s\n", hex32(r.crc32).c_str(), status.c_str(), notes.c_str());
         if (!r.c2Fallback.empty()) std::printf("  C2 reads given up: %s\n", r.c2Fallback.c_str());
         if (!r.cacheFallback.empty()) std::printf("  FUA given up: %s\n", r.cacheFallback.c_str());
-        log << name << "  CRC32 " << hex32(r.crc32) << "  retries " << r.retries << "  " << status;
-        if (r.paddedSamples) log << "  (" << r.paddedSamples << " samples outside the disc padded with silence)";
-        log << "\n";
-        for (const std::string& l : cdr::c2LogLines(r)) log << l << "\n";
-        for (const std::string& l : cdr::cacheLogLines(r)) log << l << "\n";
+        for (const std::string& l : cdr::trackRipLogLines(name, r)) log << l << "\n";
         if (!r.clean()) ++problems;
         if (!htoa) arTracks.push_back({t, ar.v1(), ar.v2()});
     }
     if (singleFile) {
         writer->close();
-        log << imageName << "  CRC32 " << hex32(imageCrc.value()) << "\n";
+        log << cdr::discImageCrcLogLine(image.fileName, imageCrc.value()) << "\n";
     }
 
     if (cueFile) {
         const std::string cueName = albumBase + ".cue";
         const std::string cue =
-            cdr::formatCueSheet(album, singleFile ? cueTracks
-                                                  : cdr::perTrackCueTracks(selected, trackFiles, album, gaps, htoaFile));
+            singleFile ? image.cueSheet
+                       : cdr::formatCueSheet(album, cdr::perTrackCueTracks(selected, trackFiles, album, gaps, htoaFile));
         std::ofstream out(dir / fs::u8path(cueName), std::ios::binary);
         out << cue;
         if (!out.flush()) throw std::runtime_error("failed to write " + cueName);

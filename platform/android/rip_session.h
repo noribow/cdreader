@@ -2,14 +2,16 @@
 
 // Ripping workflow of the Android app, kept free of JNI so that it can be
 // unit tested on any platform: CDDB lookup, per-track ripping to WAV / FLAC / Ogg FLAC / ALAC / Opus / Vorbis
-// with tags and CDDB based file names, AccurateRip checksums and lookup, and
-// the rip.log text. jni_bridge.cpp only converts arguments and results.
+// with tags and CDDB based file names, or the whole disc into one file with a
+// CUE sheet (#42), AccurateRip checksums and lookup, and the rip.log text.
+// jni_bridge.cpp only converts arguments and results.
 //
 // All calls must come from one thread at a time, except cancel().
 
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -20,6 +22,7 @@
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
 #include "cdreader/clock.h"
+#include "cdreader/disc_image.h"
 #include "cdreader/drive_cache.h"
 #include "cdreader/gaps.h"
 #include "cdreader/http.h"
@@ -51,7 +54,7 @@ struct RipSettings {
     // the tags and rip.log.
     bool readDiscCodes = true;
     // Detect pregaps / index points / the HTOA from the Q sub-channel (once
-    // per disc, #25). The app writes no CUE sheet yet: they go to rip.log.
+    // per disc, #25): rip.log, and the CUE sheet of ripImage() (#42).
     bool detectGaps = true;
     // Read with C2 error pointers when the drive supports them (#33);
     // beginRip() checks the drive and sets options.useC2 accordingly.
@@ -65,10 +68,20 @@ struct RipSettings {
 
 struct RippedTrack {
     Track track;
-    std::string fileName;  // e.g. "01 - Title.flac"
+    std::string fileName;  // e.g. "01 - Title.flac"; in a disc image the part's name ("Track 01")
     TrackRipResult result;
     uint32_t accurateRipV1 = 0;
     uint32_t accurateRipV2 = 0;
+};
+
+// A single-file rip (#42): the tracks in one file, as `cdreader rip --single-file`.
+struct RippedImage {
+    DiscImagePlan plan;          // file names, parts (HTOA first when included) and CUE sheet
+    // The writer carries the CUE sheet inside the file (FLAC / Ogg FLAC:
+    // CUESHEET block and tag; Matroska: chapters); otherwise only the .cue file has it.
+    bool embeddedCueSheet = false;
+    std::optional<RippedTrack> htoa;  // the HTOA part (no AccurateRip checksums: the database has none)
+    uint32_t crc32 = 0;               // CRC32 of all the PCM in the image
 };
 
 struct AccurateRipReport {
@@ -167,6 +180,31 @@ public:
     const RippedTrack& ripTrack(int number, const std::filesystem::path& path, const Ripper::Progress& progress = {});
     const std::vector<RippedTrack>& rippedTracks() const { return ripped_; }
 
+    // Single-file mode (#42). The image of `tracks` (track numbers; empty:
+    // every audio track) in `format`: "<Artist> - <Album>.<ext>" or
+    // "CDImage.<ext>", the CUE sheet text and the parts, from the current
+    // metadata and gaps. Throws std::invalid_argument for an unknown format,
+    // a track that is not an audio track on this disc or tracks that are not
+    // consecutive (the file would be no image of the disc).
+    DiscImagePlan planImage(const std::vector<int>& tracks, const std::string& format);
+    // Progress of ripImage(): the part being read (0: the HTOA) and the
+    // sectors done of the whole image.
+    using ImageProgress = std::function<void(int track, uint32_t doneSectors, uint32_t totalSectors)>;
+    // Rips `tracks` (as planImage(), in the format of beginRip()) into one
+    // file at `imagePath` (a seekable local file, as ripTrack()), the HTOA
+    // first when the disc has one and track 1 is included, with the CUE
+    // sheet embedded where the format can carry it, and writes the CUE sheet
+    // to `cuePath` (empty: not written). AccurateRip checksums are computed
+    // per track from the same PCM stream; the tracks' results replace those
+    // of earlier rips (rippedTracks(), with the part names as file names) and
+    // rip.log gets the single-file layout of the CLI. On cancel() (throws
+    // RipCancelled) or any error both files are deleted. Exceptions thrown
+    // by `progress` propagate (the files are deleted as well).
+    const RippedImage& ripImage(const std::vector<int>& tracks, const std::filesystem::path& imagePath,
+                                const std::filesystem::path& cuePath, const ImageProgress& progress = {});
+    // The image of the current rip (beginRip() and ripTrack() clear it).
+    const std::optional<RippedImage>& rippedImage() const { return image_; }
+
     // Read offset auto-detection (#37): looks the disc up in AccurateRip
     // (`http` null: status LookupFailed) and reads a few tracks. Clears a
     // pending cancel first; cancel() makes it return status Cancelled.
@@ -192,6 +230,10 @@ public:
     std::string ripLog();
 
 private:
+    // After a track or image part: the drive rejected C2 reads or FUA during
+    // it, so the rest of the rip does without.
+    void takeFallbacks(const Ripper& ripper, const TrackRipResult& result);
+
     CdDrive& drive_;
     std::optional<DriveInfo> driveInfo_;
     std::optional<std::string> driveName_;
@@ -210,6 +252,7 @@ private:
     std::optional<DriveCacheCheck> detectedCache_;  // Auto: the timing test of this disc
     std::string cacheFallback_;
     std::vector<RippedTrack> ripped_;
+    std::optional<RippedImage> image_;
     AccurateRipReport accurateRip_;
     bool accurateRipChecked_ = false;
     std::optional<OffsetDetection> detection_;
