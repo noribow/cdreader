@@ -66,6 +66,24 @@ ScsiResult CdDrive::readAudio(uint32_t lba, uint32_t count, uint8_t* out) {
     return r;
 }
 
+ScsiResult CdDrive::readAudioWithSubChannel(uint32_t lba, uint32_t count, SubChannelSelection selection,
+                                            uint8_t* out) {
+    // READ CD: expected sector type CD-DA, user data, sub-channel selection.
+    uint8_t cdb[12] = {
+        0xBE, 0x04,
+        uint8_t(lba >> 24), uint8_t(lba >> 16), uint8_t(lba >> 8), uint8_t(lba),
+        uint8_t(count >> 16), uint8_t(count >> 8), uint8_t(count),
+        0x10, uint8_t(selection), 0x00,
+    };
+    const size_t bytes = size_t(count) * (kSectorBytes + subChannelBytesPerSector(selection));
+    ScsiResult r = transport_.execute(cdb, sizeof cdb, out, bytes, DataDirection::In, kReadTimeout);
+    if (r.ok() && r.transferred != bytes) {
+        r.transportOk = false;
+        r.error = "short read (" + std::to_string(r.transferred) + " of " + std::to_string(bytes) + " bytes)";
+    }
+    return r;
+}
+
 ScsiResult CdDrive::readSubChannel(SubChannelFormat format, int track, uint8_t* out, size_t length, bool msf) {
     if (length > 0xFFFF) length = 0xFFFF;
     const uint8_t cdb[10] = {

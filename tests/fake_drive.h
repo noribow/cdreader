@@ -40,6 +40,33 @@ public:
     int subChannelCommands = 0;
     std::vector<uint8_t> lastSubChannelCdb;
 
+    // Q sub-channel of every sector (READ CD with sub-channel data, READ
+    // SUB-CHANNEL current position; #25). Track N's INDEX 00 starts
+    // pregaps[N] sectors before its TOC start (inside the previous track);
+    // track 1 starting after LBA 0 has an HTOA (INDEX 00 from LBA 0).
+    std::map<int, uint32_t> pregaps;
+    std::map<int, std::vector<uint32_t>> laterIndexes;  // LBAs of INDEX 02, 03, ... by track
+    bool formattedQSupported = true;      // READ CD sub-channel selection 010b
+    bool formattedQCrc = true;            // false: formatted Q with CRC bytes 0 (not reported)
+    bool rawSubChannelSupported = true;   // READ CD sub-channel selection 001b
+    bool currentPositionSupported = true; // READ SUB-CHANNEL format 01h
+    // n > 0: sectors with lba % n == n / 2 carry mode 2 / mode 3 (MCN / ISRC)
+    // frames instead of the position, alternately.
+    uint32_t otherAdrEvery = 0;
+    // The sector's Q frame is corrupt this many reads (-1: always): bit errors,
+    // so the CRC fails (formatted Q without CRC: unparsable BCD).
+    std::map<uint32_t, int> badQ;
+    // The sector's Q frame claims the wrong side of the track boundary this
+    // many reads, with the CRC of the right frame (caught by the CRC, not
+    // when the drive reports none).
+    std::map<uint32_t, int> wrongQ;
+    int subQReads = 0;  // READ CD commands with sub-channel data (not counted in readCommands)
+    std::vector<uint8_t> lastReadCdCdb;
+
+    // The 12 Q bytes (with CRC) of a sector as recorded on the disc.
+    void qFrame(uint32_t lba, uint8_t q[12]) const;
+    bool isPause(uint32_t lba) const;  // INDEX 00
+
     cdr::ScsiResult execute(const uint8_t* cdb, size_t cdbLength, void* data, size_t dataLength,
                             cdr::DataDirection direction, unsigned timeoutSeconds) override;
 
@@ -49,4 +76,8 @@ private:
     std::vector<FakeTrack> tracks_;
     uint32_t leadOut_;
     uint32_t unstableCounter_ = 0;
+    uint32_t lastReadLba_ = 0;
+
+    int trackAt(uint32_t lba) const;  // index into tracks_
+    void subQ(uint32_t lba, uint8_t selection, uint8_t* out);
 };

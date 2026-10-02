@@ -73,7 +73,7 @@ void FlacWriter::open(const std::filesystem::path& path, const TrackMetadata& me
         const std::vector<uint8_t> sheet =
             flac::cueSheet(*cue_, uint64_t(cue_->totalSectors) * kSamplesPerSector);
         putBlockHeader(head, kCueSheet, false, uint32_t(sheet.size()));
-        leadOutOffsetPos_ = head.size() + flac::cueSheetLeadOutOffsetPosition(cue_->tracks.size());
+        leadOutOffsetPos_ = head.size() + flac::cueSheetLeadOutOffsetPosition(*cue_);
         head.insert(head.end(), sheet.begin(), sheet.end());
     }
     reservedOffset_ = head.size();

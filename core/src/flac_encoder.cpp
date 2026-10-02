@@ -565,10 +565,33 @@ void putBigEndian(std::vector<uint8_t>& v, uint64_t x, int bytes) {
     for (int i = bytes - 1; i >= 0; --i) v.push_back(uint8_t(x >> (8 * i)));
 }
 
+// Index points of a track in the CUESHEET block: (number, offset in sectors
+// from the track offset). The track offset is its first index point: INDEX 00
+// when the pregap is in the file, otherwise INDEX 01 (as metaflac imports a sheet).
+std::vector<std::pair<uint8_t, uint32_t>> indexPoints(const CueTrack& t, uint32_t& trackOffset) {
+    std::vector<std::pair<uint8_t, uint32_t>> points;
+    const bool index00 = t.hasIndex00 && t.index00File.empty() && t.index00Sectors <= t.startSectors;
+    trackOffset = index00 ? t.index00Sectors : t.startSectors;
+    if (index00) points.emplace_back(0, 0);
+    points.emplace_back(1, t.startSectors - trackOffset);
+    for (size_t i = 0; i < t.laterIndexes.size() && i < 98; ++i)
+        if (t.laterIndexes[i] > t.startSectors) points.emplace_back(uint8_t(i + 2), t.laterIndexes[i] - trackOffset);
+    return points;
+}
+
 }  // namespace
 
 size_t cueSheetLeadOutOffsetPosition(size_t tracks) {
     return kCueHeaderBytes + tracks * (kCueTrackBytes + kCueIndexBytes);
+}
+
+size_t cueSheetLeadOutOffsetPosition(const EmbeddedCueSheet& cue) {
+    size_t position = kCueHeaderBytes;
+    for (const CueTrack& t : cue.tracks) {
+        uint32_t offset = 0;
+        position += kCueTrackBytes + indexPoints(t, offset).size() * kCueIndexBytes;
+    }
+    return position;
 }
 
 std::vector<uint8_t> cueSheet(const EmbeddedCueSheet& cue, uint64_t leadOutSamples) {
@@ -589,17 +612,21 @@ std::vector<uint8_t> cueSheet(const EmbeddedCueSheet& cue, uint64_t leadOutSampl
     v.resize(v.size() + 258, 0);
     v.push_back(uint8_t(cue.tracks.size() + 1));
     for (const CueTrack& t : cue.tracks) {
-        putBigEndian(v, uint64_t(t.startSectors) * kSamplesPerSector, 8);
+        uint32_t trackOffset = 0;
+        const std::vector<std::pair<uint8_t, uint32_t>> points = indexPoints(t, trackOffset);
+        putBigEndian(v, uint64_t(trackOffset) * kSamplesPerSector, 8);
         v.push_back(uint8_t(t.number));
         const size_t isrcAt = v.size();
         v.resize(v.size() + 12, 0);                          // ISRC: 12 ASCII characters, NUL = unknown
         if (isValidIsrc(t.isrc)) std::copy(t.isrc.begin(), t.isrc.end(), v.begin() + ptrdiff_t(isrcAt));
         v.push_back(uint8_t(t.preEmphasis ? 0x40 : 0x00));   // audio track, pre-emphasis flag
         v.resize(v.size() + 13, 0);
-        v.push_back(1);                                      // one index point: INDEX 01 at the track start
-        putBigEndian(v, 0, 8);
-        v.push_back(1);
-        v.resize(v.size() + 3, 0);
+        v.push_back(uint8_t(points.size()));                 // INDEX 01 (+ INDEX 00 before, INDEX 02+ after)
+        for (const auto& [number, offset] : points) {
+            putBigEndian(v, uint64_t(offset) * kSamplesPerSector, 8);
+            v.push_back(number);
+            v.resize(v.size() + 3, 0);
+        }
     }
     putBigEndian(v, leadOutSamples, 8);
     v.push_back(kLeadOutTrack);

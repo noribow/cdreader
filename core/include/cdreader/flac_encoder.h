@@ -83,10 +83,15 @@ inline std::vector<uint8_t> vorbisComment(const TrackMetadata& metadata, const s
 // Body of a CUESHEET metadata block for a CD image: one track per CueTrack
 // with INDEX 01 at its start, then the lead-out track (number 170) at
 // `leadOutSamples`. Offsets are in samples (588 per CD frame); the block is
-// marked as CD-DA when every offset is a multiple of 588.
+// marked as CD-DA when every offset is a multiple of 588. A track with
+// INDEX 00 in the file (#25) starts at INDEX 00, with index points 0 (offset
+// 0) and 1 (the pregap length), as metaflac --import-cuesheet-from builds
+// them; INDEX 02+ follow.
 std::vector<uint8_t> cueSheet(const EmbeddedCueSheet& cue, uint64_t leadOutSamples);
 
-// Position of the lead-out track's 64-bit offset inside a cueSheet() body.
+// Position of the lead-out track's 64-bit offset inside a cueSheet() body:
+// for `tracks` tracks with one index point each, or for `cue`.
 size_t cueSheetLeadOutOffsetPosition(size_t tracks);
+size_t cueSheetLeadOutOffsetPosition(const EmbeddedCueSheet& cue);
 
 }  // namespace cdr::flac

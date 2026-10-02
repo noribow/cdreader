@@ -1,5 +1,6 @@
 #include "cdreader/toc.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 
@@ -65,8 +66,23 @@ Toc::LbaRange Toc::audioRange(const Track& track) const {
     LbaRange range{track.startLba, track.endLba()};
     size_t i = 0;
     while (i < tracks.size() && tracks[i].number != track.number) ++i;
-    if (i == tracks.size()) return range;
-    for (size_t j = i; j > 0 && tracks[j - 1].isAudio; --j) range.begin = tracks[j - 1].startLba;
+    if (i == tracks.size()) {
+        // Not a TOC track: the HTOA (track 0, gaps.h) joins the audio run of
+        // the track that follows it.
+        for (const Track& next : tracks) {
+            if (next.isAudio && next.startLba == track.endLba()) {
+                range = audioRange(next);
+                range.begin = std::min(range.begin, track.startLba);
+                break;
+            }
+        }
+        return range;
+    }
+    size_t first = i;
+    while (first > 0 && tracks[first - 1].isAudio) --first;
+    // The run starts at the first track of the disc: an HTOA before it (from
+    // LBA 0) is readable audio as well.
+    range.begin = first == 0 ? 0 : tracks[first].startLba;
     for (size_t j = i + 1; j < tracks.size() && tracks[j].isAudio; ++j) range.end = tracks[j].endLba();
     return range;
 }

@@ -44,6 +44,12 @@ public:
     // Does not throw: the caller decides how to retry.
     ScsiResult readAudio(uint32_t lba, uint32_t count, uint8_t* out);
 
+    // READ CD of `count` CD-DA sectors with sub-channel data (#25): each sector
+    // is 2352 bytes of audio followed by subChannelBytesPerSector(selection)
+    // bytes. Does not throw; a drive that does not support the selection
+    // answers ILLEGAL REQUEST.
+    ScsiResult readAudioWithSubChannel(uint32_t lba, uint32_t count, SubChannelSelection selection, uint8_t* out);
+
     // READ SUB-CHANNEL (42h) with SubQ = 1: `length` bytes (at most 65535) of
     // Q sub-channel data in `format` into `out`; `track` selects the track
     // for the ISRC format (0 otherwise), `msf` the address format of the
