@@ -190,10 +190,10 @@ cdr::CddbLookupResult lookupDisc(const cdr::Toc& toc, const CddbSettings& cddb) 
         return result;
     }
     if (result.matches.size() > 1 || !result.exact) {
-        std::printf("CDDB: %zu %s match(es):\n", result.matches.size(), result.exact ? "exact" : "inexact");
+        std::printf("CDDB: %d %s match(es):\n", int(result.matches.size()), result.exact ? "exact" : "inexact");
         for (size_t i = 0; i < result.matches.size(); ++i) {
             const cdr::CddbMatch& m = result.matches[i];
-            std::printf("  %c%zu. %s/%s  %s\n", i == result.chosen ? '*' : ' ', i + 1, m.category.c_str(),
+            std::printf("  %c%d. %s/%s  %s\n", i == result.chosen ? '*' : ' ', int(i + 1), m.category.c_str(),
                         m.discId.c_str(), m.title.c_str());
         }
         if (cddb.options.matchIndex >= result.matches.size())
