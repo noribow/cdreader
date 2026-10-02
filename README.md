@@ -68,6 +68,9 @@ cdreader rip D: -f flac --htoa      1 曲目の前の隠しトラック (HTOA) �
 cdreader offset D:                  読み取りオフセットを AccurateRip で検出
 cdreader offset D: --save           検出したオフセットをこのドライブの値として保存
 cdreader offsets                    保存済みのオフセット (ドライブごと) の一覧
+cdreader config cddb-email you@example.com  CDDB に送る連絡先メールアドレスを保存 (gnudb で必要)
+cdreader config                     保存済みの設定の一覧
+cdreader cddb-test                  CDDB サーバーへの接続テスト
 ```
 
 | オプション | 説明 |
@@ -90,14 +93,31 @@ cdreader offsets                    保存済みのオフセット (ドライブ
 | `--no-gaps` | プリギャップ (`INDEX 00`)・`INDEX 02` 以降の検出をしない (`toc` でも使えます)。CUE シートは `INDEX 01` のみになります。HTOA は TOC から分かるため従来どおり扱います |
 | `--htoa` | トラックごとのリッピングで、1 曲目の前の隠しトラック (HTOA) をトラック 00 (`00 - Hidden Track.<拡張子>` / `Track00.<拡張子>`) としても保存する (シングルファイルでは常にイメージに含めます) |
 
-CDDB のオプション (`rip` と `toc` の両方で使えます):
+CDDB のオプション (`rip` と `toc` の両方で使えます。`--cddb-server` と `--cddb-hello` は `cddb-test` でも使えます。
+保存済みの設定 (「CDDB 設定」の節) より優先されます):
 
 | オプション | 説明 |
 | --- | --- |
 | `--no-cddb` | CDDB に問い合わせない |
-| `--cddb-server <url>` | CDDB サーバー (HTTP の CGI の URL。既定: `https://gnudb.gnudb.org/~cddb/cddb.cgi`) |
+| `--cddb-server <url>` | CDDB サーバー (HTTP / HTTPS の CGI の URL。既定: 設定 `cddb-server`、なければ `https://gnudb.gnudb.org/~cddb/cddb.cgi`) |
 | `--cddb-match <n>` | 候補が複数あるときに使う候補の番号 (1 から。既定: 1) |
-| `--cddb-hello <user@host>` | CDDB の hello に送るユーザー名とホスト名 (既定: `cdreader@localhost`。実際のユーザー名は送りません) |
+| `--cddb-hello <user@host>` | CDDB の hello に送る連絡先メールアドレス (`@` の前がユーザー名、後ろがホスト名として送られます。既定: 設定 `cddb-email`、なければ匿名の `cdreader@localhost`) |
+
+設定のコマンド ([#38](https://github.com/noribow/cdreader/issues/38)):
+
+| コマンド | 説明 |
+| --- | --- |
+| `cdreader config` | 保存済みの設定と既定値の一覧 |
+| `cdreader config <key>` | 1 つの設定の値を表示 |
+| `cdreader config <key> <value>` | 設定を検証して保存 |
+| `cdreader config <key> --unset` | 既定値に戻す |
+| `cdreader cddb-test [--cddb-server <url>] [--cddb-hello <user@host>]` | CDDB サーバーへの接続テスト (`stat` コマンドを 1 回送り、サーバーの応答を表示。終了コード 0 成功 / 1 失敗) |
+
+| 設定 (`<key>`) | 内容 |
+| --- | --- |
+| `cddb-server` | CDDB サーバーの URL (`http://` または `https://`) |
+| `cddb-email` | CDDB の hello に送る連絡先メールアドレス (`user@host` 形式) |
+| `cddb-app-name` / `cddb-app-version` | hello に送るアプリ名 / バージョン (既定: `cdreader` / プログラムのバージョン。通常は変更不要) |
 
 終了コード: `0` 成功 / `1` エラー / `2` 読めないセクタ、または疑わしい位置 (C2) があった。
 
@@ -112,6 +132,37 @@ CDDB のオプション (`rip` と `toc` の両方で使えます):
 - コンピレーション (`Various Artists` など、曲名が `アーティスト / 曲名` 形式) は曲ごとのアーティストに分けます。
 - UTF-8 として不正なデータ (古い Latin-1 のエントリ) は Latin-1 として読み替えます (Shift_JIS など他の文字コードで登録されたエントリは文字化けします)。
 - 通信エラーや該当なしでもリッピングは中断せず、従来どおり `cd_<CDDB ID>\TrackNN.wav` に保存します。
+- サーバーが hello (挨拶) を拒否した場合は、画面と `rip.log` に対処方法 (`Hint: ... set a contact e-mail address in the CDDB settings ...`) を表示します (次の節を参照)。
+
+### CDDB 設定 (サーバーと連絡先メールアドレス)
+
+CDDB の問い合わせには毎回 hello (`ユーザー名 ホスト名 アプリ名 バージョン`) を付けます。
+既定のサーバー gnudb.org は、利用者 (開発者) の **連絡先メールアドレス** を hello に含めることを求めており、
+匿名の hello (`cdreader localhost cdreader 0.1.0`) には次のように応答して検索に応じません:
+
+```
+500 Unknown application, developer email for cdreader 0.1.0
+```
+
+このため、gnudb を使う場合はご自分の連絡先メールアドレスを設定してください。アドレスは `@` で分けて
+hello のユーザー名とホスト名として送られます (例: `you@example.com` → `hello=you example.com cdreader 0.1.0`)。
+
+- Windows: `cdreader config cddb-email you@example.com` で保存します (毎回指定するなら `--cddb-hello you@example.com`)。
+  別のサーバーを使うには `cdreader config cddb-server <url>`。`cdreader cddb-test` で設定を確認できます。
+  設定は `%APPDATA%\cdreader\settings.txt` (読み取りオフセットの `drive_offsets.txt` と同じフォルダ。`APPDATA` が無ければ
+  `cdreader.exe` と同じフォルダ) に `key=value` 形式で保存されます。コマンドラインのオプションは保存値より優先されます。
+- Android: 「詳細設定」の「CDDB」で「連絡先メールアドレス」を入力します (「Android の使い方」を参照)。
+
+接続テストは CDDB の `stat` コマンド (サーバーの状態表示。ディスクも検索も不要で応答が短い) を、検索と同じ URL・hello・`proto=6` で 1 回送ります。
+2xx の応答なら成功です。サーバーが gnudb なのにメールアドレスが未設定の場合は、成功しても注意を表示します
+(サーバーが `stat` で hello を確認しない場合、検索だけが拒否されることがあるためです)。
+
+検索や接続テストの失敗が hello に関するもの (応答コード 409 / 431、または `email`・`e-mail`・`hello`・`handshake`・`unknown application` を含む応答)
+の場合は、CDDB 設定で連絡先メールアドレスを設定するよう案内します (Windows・`rip.log` は英語、Android の画面は日本語)。
+
+**プライバシーについて**: 入力したメールアドレスは CDDB サーバーに (検索のたびに URL の一部として) 送信されます。
+cdreader は既定ではどんな個人のアドレスも送らず、設定しない限り匿名の hello のままです。設定を消せば (`cdreader config cddb-email --unset`、
+Android では欄を空にする) 匿名に戻ります。`rip.log` にはアドレスを記録しません。
 
 ファイル名・フォルダ名は Windows / Android で使えない文字 (`< > : " / \ | ? *` と制御文字) を `_` に置き換え、
 末尾のピリオド・空白を取り除き、`CON` や `NUL` などの予約名には先頭に `_` を付けます。日本語などはそのまま使います。
@@ -630,6 +681,14 @@ SCSI/MMC コマンドを送ります)。
    - 「C2 エラーポインタを使う (対応ドライブのみ)」(既定でオン。オフにすると Windows 版の `--no-c2` と同じ。「C2 エラーポインタ」の節を参照)
    - 「キャッシュ対策」: 自動 (既定) / FUA / 追い出し / なし (Windows 版の `--cache auto|fua|flush|none`。「ドライブキャッシュ対策」の節を参照)。
      自動ではディスクごとに最初のリッピング開始時に数秒かけてドライブを試験します
+   - 「CDDB」([#38](https://github.com/noribow/cdreader/issues/38)。「CDDB 設定」の節を参照):
+     「サーバー URL」(空欄なら既定の gnudb。欄に既定の URL が薄く表示されます)、
+     「連絡先メールアドレス」(gnudb は開発者/利用者の連絡先メールを要求します。入力したアドレスはサーバーに送信されます。空欄なら匿名)。
+     入力内容はその場で検証し (形式が正しくない場合は欄にエラーを表示し、保存しません)、正しい値を次回以降も使います。
+     「接続テスト」でサーバーに `stat` を送り、結果 (サーバーの応答またはエラー) を横に表示します。
+     テストが成功し、表示中のディスクが CDDB で見つかっていなければ、新しい設定で検索し直します。
+     リッピング中・検索中は変更できません。
+     検索が連絡先メールアドレスの未設定で拒否された場合は、設定を促すダイアログ (「設定する」で欄を開きます) を表示します
 5. リッピング後、C2 の結果 (使ったかどうか、C2 エラーのセクタ数・再読込回数・疑わしい位置のあるトラック)、
    キャッシュ対策の結果 (判定結果と使った方法、再読込前に行った対策の回数) と
    AccurateRip の結果がトラックごとに表示されます
@@ -740,6 +799,9 @@ ALAC (M4A) は、マジッククッキーのバイト列、適応ゴロム符号
 ビット単位で一致すること、`ffprobe` でコーデック `alac`・サンプル数・タグ (日本語を含む) が読めることを確認し、本プロジェクトの FLAC と
 FFmpeg の ALAC エンコーダとのサイズ比較を表示するテスト (`alac_ffmpeg`) が実行されます (無い場合はスキップ)。
 CDDB は偽の `HttpClient` を使い (ネットワークには接続しません)、問い合わせコマンドの生成・応答コード・xmcd エントリの解析・ファイル名の変換を検証します。
+CDDB 設定 (#38) は、メールアドレスの有無による hello と URL、サーバー URL・メールアドレス・アプリ名の検証、設定ファイル (`key=value`) の往復と壊れた行の無視、
+接続テスト (成功・gnudb でアドレス未設定・hello の拒否・その他のエラー・通信エラー・CDDB でない応答)、
+gnudb の実際の応答 `500 Unknown application, developer email for cdreader 0.1.0` からの案内文への対応付けと `rip.log` の `Hint:` 行を検証します。
 AccurateRip はネットワークに接続せず (偽の `HttpClient` を使用)、実在のディスクの ID・データベース応答と、独立した参照実装で求めたチェックサムで検証します。
 Opus / Vorbis は、ヘッダー (`OpusHead` / `OpusTags`、Vorbis の 3 つのヘッダー) のバイト列とページ構成、
 グラニュール位置 (pre-skip、最後のページでの長さの切り詰め)、EOS フラグを検証し、libopus / libvorbis のデコーダでデコードして
@@ -759,7 +821,7 @@ Matroska (`cdreader_mka_tests`) は、EBML の可変長整数・各要素の符�
 (CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング、
 C2 付き読み取りの転送サイズ 24 × 2646 バイト) を検証します。
 `cdreader_rip_session_tests` は Android 版のリッピング処理 (`platform/android/rip_session.*`) を仮想 USB デバイスと偽の `HttpClient` で検証します
-(FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`、C2 の有効・無効・非対応・切り替えと `rip.log` の C2 の行、キャッシュ対策の設定・ディスクごとに 1 回の判定・`none` でコマンドを送らないこと・FUA から追い出しへの切り替えと `rip.log` の行、USB 経由のオフセット自動検出 (オフセット 0 で不一致 → 検出 → 検出値でのリッピングで全トラック一致)・照会失敗・未登録・キャンセルと `rip.log` のオフセットの出所の行)。
+(FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`、C2 の有効・無効・非対応・切り替えと `rip.log` の C2 の行、キャッシュ対策の設定・ディスクごとに 1 回の判定・`none` でコマンドを送らないこと・FUA から追い出しへの切り替えと `rip.log` の行、USB 経由のオフセット自動検出 (オフセット 0 で不一致 → 検出 → 検出値でのリッピングで全トラック一致)・照会失敗・未登録・キャンセルと `rip.log` のオフセットの出所の行、設定した CDDB サーバー・連絡先メールアドレスでの問い合わせと、hello を拒否されたときの `rip.log` の `Hint:` 行)。
 
 読み取りオフセットの自動検出 (#37) は、仮想ドライブと偽の AccurateRip データ (各トラックを指定のオフセットで読んだチェックサム) で、正のオフセット (+6, +667)・負のオフセット (-1164, -472)・v1 / v2、トラックの選び方 (中間・登録件数・長さ・`-t`)、候補が割れる場合、互いにずれたプレス、1 トラックだけ一致、一致なし、登録トラックが 1 つのディスク (件数による確定 / 保留)、未登録 (HTTP 404)・ネットワーク障害 (読み取りをしないこと)、キャンセルと進行状況、ディスクの最初・最後のトラックを ±3000 サンプルで端まで読むこと、保存形式の往復 (壊れた行の無視) と `rip.log` の行を検証します。
 
@@ -795,7 +857,8 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   subchannel  サブチャンネル Q の MCN / ISRC 応答の解析・検証、ディスク全体の読み取り (DiscCodes)、セクタごとの Q フレームの解析
   gaps      プリギャップ (INDEX 00)・INDEX 02 以降・HTOA の検出 (Q の二分探索)
   toc       TOC 解析、CDDB ID
-  cddb      CDDB の問い合わせ・応答解析 (HttpClient 経由)
+  cddb      CDDB の問い合わせ・応答解析 (HttpClient 経由)、CDDB 設定の検証・接続テスト・エラーの案内
+  settings_store  設定ファイル (key=value) の読み書き
   file_naming  メタデータからのファイル名・フォルダ名・アルバム単位のファイル名 (使えない文字の置換)
   accuraterip  AccurateRip ディスク ID・チェックサム v1/v2・データベース応答の解析と照合・オフセットごとのチェックサム (スライド計算)
   offset_detect  読み取りオフセットの自動検出 (トラックの選択・一致の判定)、rip.log の出所の行、ドライブごとの保存形式
@@ -839,7 +902,7 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
 - [ ] Android 版の FLAC・CDDB・AccurateRip 対応 — [#18](https://github.com/noribow/cdreader/issues/18)
   (実装済み・実機での動作確認待ち)
 - [ ] Android 版の改善: 保存先へ直接書き込む (現在は一時ファイル経由でコピー)、リトライ回数の設定、UAS 専用ドライブ対応、
-  CUE シート・シングルファイル出力、CDDB サーバーの設定
+  CUE シート・シングルファイル出力
 - [x] AccurateRip 対応 (照合、オフセット値の自動検出) — [#5](https://github.com/noribow/cdreader/issues/5)
 - [ ] リードイン/リードアウトのオーバーリード
 - [x] CDDB 対応 (ディスク情報の取得) — [#6](https://github.com/noribow/cdreader/issues/6)
@@ -866,6 +929,9 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
   (実装済み・実機での動作確認待ち)
 - [x] 読み取りオフセットの自動検出・自動設定 (複数トラックの一致で確定、ドライブごとに保存、`rip --offset auto`・`offset --save`、
   Android は詳細設定の「オフセットを自動検出」とリッピング前の確認) — [#37](https://github.com/noribow/cdreader/issues/37)
+  (実装済み・実機での動作確認待ち)
+- [x] CDDB 設定 (サーバー URL・連絡先メールアドレス、接続テスト、hello を拒否されたときの案内。`cdreader config` / `cddb-test`、
+  Android は詳細設定の「CDDB」) — [#38](https://github.com/noribow/cdreader/issues/38)
   (実装済み・実機での動作確認待ち)
 - [ ] Windows GUI
 

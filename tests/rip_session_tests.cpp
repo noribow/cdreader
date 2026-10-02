@@ -290,6 +290,57 @@ TEST(cddb_metadata_names_files_and_folder) {
     CHECK_STR(rig.session.trackFileName(1, "flac"), "Track01.flac");
 }
 
+// #38: the server and the contact e-mail address configured by the user
+// (as the app passes them through JNI) are what the requests carry.
+TEST(cddb_uses_configured_server_and_hello) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    cdr::CddbConfig config;
+    config.server = "http://cddb.example.org:8880/~cddb/cddb.cgi";
+    config.email = "listener@example.net";
+    cdr::CddbSettings cddb;
+    cddb.options = cdr::cddbOptionsFromConfig(config, "0.1.0");
+    const cdr::CddbLookupResult& r = rig.session.lookupCddb(&http, cddb);
+    CHECK(r.found);
+    CHECK_EQ(http.urls.size(), size_t(2));
+    for (const std::string& url : http.urls) {
+        CHECK(url.rfind("http://cddb.example.org:8880/~cddb/cddb.cgi?cmd=cddb+", 0) == 0);
+        CHECK(contains(url, "&hello=listener+example.net+cdreader+0.1.0&proto=6"));
+    }
+    rig.session.beginRip(settings("wav"));
+    CHECK(contains(rig.session.ripLog(), "CDDB lookup (http://cddb.example.org:8880/~cddb/cddb.cgi): 1 exact match(es)"));
+
+    // Nothing configured: the anonymous hello on the default server.
+    FakeHttp anonymous;
+    addCddbAlbum(anonymous);
+    cdr::CddbSettings defaults;
+    defaults.options = cdr::cddbOptionsFromConfig({}, "0.1.0");
+    rig.session.lookupCddb(&anonymous, defaults);
+    CHECK(!anonymous.urls.empty() && anonymous.urls[0].rfind(std::string(cdr::kDefaultCddbServer) + "?cmd=", 0) == 0);
+    CHECK(!anonymous.urls.empty() && contains(anonymous.urls[0], "&hello=cdreader+localhost+cdreader+0.1.0&"));
+}
+
+// gnudb's answer to the anonymous hello: the rip goes on with generic names
+// and rip.log says what to do.
+TEST(cddb_hello_refused_puts_hint_in_rip_log) {
+    Rig rig;
+    FakeHttp http;
+    const std::string refusal = "500 Unknown application, developer email for cdreader 0.1.0";
+    http.cddb["cddb query"] = reply(200, refusal + "\r\n");
+    const cdr::CddbLookupResult& r = rig.session.lookupCddb(&http, {});
+    CHECK(!r.found);
+    CHECK(r.hint == cdr::CddbHint::ContactEmail);
+    rig.session.beginRip(settings("wav"));
+    TempDir dir;
+    rig.session.ripTrack(1, dir.path / "t.wav");
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "CDDB lookup (" + std::string(cdr::kDefaultCddbServer) + "): query failed: " + refusal + "\n" +
+                            cdr::cddbHintText(cdr::CddbHint::ContactEmail) + "\n"));
+    CHECK(contains(log, "set a contact e-mail address in the CDDB settings"));
+    CHECK(contains(log, "Track01.wav  CRC32 "));
+}
+
 TEST(cddb_inexact_matches_pick_by_index) {
     Rig rig;
     FakeHttp http;

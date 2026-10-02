@@ -55,6 +55,7 @@ add_library(cdreader_core STATIC
   core/src/resampler.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp
+  core/src/settings_store.cpp
   core/src/subchannel.cpp
   core/src/tags.cpp
   core/src/toc.cpp

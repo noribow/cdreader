@@ -30,9 +30,12 @@ object NativeCd {
         handle: Long,
         enabled: Boolean,
         server: String,
+        email: String,
         matchIndex: Int,
         http: HttpGet?,
     ): Array<String>
+    @JvmStatic external fun nativeCheckCddbSettings(server: String, email: String): IntArray
+    @JvmStatic external fun nativeTestCddb(server: String, email: String, http: HttpGet?): Array<String>
     @JvmStatic external fun nativeAlbumFolderName(handle: Long): String
     @JvmStatic external fun nativeTrackFileName(handle: Long, track: Int, format: String): String
     @JvmStatic external fun nativeBeginRip(
@@ -128,7 +131,55 @@ data class DiscMetadata(
     val matches: List<String>,
     /** Per TOC entry (same order as [DiscToc.tracks]): "Title" or "Artist / Title", "" if unknown. */
     val trackLabels: List<String>,
+    /** Not found because the server refused the greeting (gnudb: no contact e-mail address set, #38). */
+    val needsContactEmail: Boolean = false,
 )
+
+/** Problems of the CDDB settings as typed (cdr::CddbConfigProblem). */
+enum class CddbSettingProblem { NONE, SERVER_SCHEME, SERVER_HOST, SERVER_CHARACTERS, EMAIL_SHAPE, HELLO_CHARACTERS }
+
+data class CddbSettingsCheck(val server: CddbSettingProblem, val email: CddbSettingProblem)
+
+/** Result of [CddbSettings.test]. */
+data class CddbTestResult(
+    /** A 2xx answer of the server. */
+    val ok: Boolean,
+    /** CDDB response code, 0 if none (transport or HTTP error). */
+    val code: Int,
+    /** The server's status line, or the error (English). */
+    val message: String,
+    /** e.g. "4120000 database entries", may be empty. */
+    val detail: String,
+    /** The server refused the greeting: a contact e-mail address is needed. */
+    val needsContactEmail: Boolean,
+    /** Works, but the server is gnudb and no contact address is set (lookups may be refused). */
+    val missingEmail: Boolean,
+)
+
+/**
+ * CDDB server and contact e-mail address (#38), as stored in the app's
+ * settings: "" means the default server / the anonymous greeting.
+ */
+object CddbSettings {
+    /** The default server (cdr::kDefaultCddbServer), shown as the hint of the URL field. */
+    const val DEFAULT_SERVER = "https://gnudb.gnudb.org/~cddb/cddb.cgi"
+
+    /** Validation only, no I/O: may be called on the UI thread. */
+    fun check(server: String, email: String): CddbSettingsCheck {
+        val v = NativeCd.nativeCheckCddbSettings(server, email)
+        val values = CddbSettingProblem.entries
+        return CddbSettingsCheck(
+            values.getOrElse(v[0]) { CddbSettingProblem.SERVER_HOST },
+            values.getOrElse(v[1]) { CddbSettingProblem.EMAIL_SHAPE },
+        )
+    }
+
+    /** Connection test: one "stat" request with the lookups' greeting. Network: never on the UI thread. */
+    fun test(server: String, email: String, http: HttpGet): CddbTestResult {
+        val v = NativeCd.nativeTestCddb(server, email, http)
+        return CddbTestResult(v[0] == "1", v[1].toIntOrNull() ?: 0, v[2], v[3], v[4] == "1", v[5] == "1")
+    }
+}
 
 data class RipResult(
     val sectors: Int,
@@ -251,17 +302,18 @@ class CdSession private constructor(private val handle: Long) : Closeable {
     }
 
     /**
-     * Looks the disc up on CDDB ([server] "" = default) and uses the result
-     * for file names and tags; disabled, it clears the metadata. Network
-     * problems only end up in [DiscMetadata.message].
+     * Looks the disc up on CDDB ([server] "" = default, [email] "" = the
+     * anonymous greeting, otherwise the contact address user@host sent to the
+     * server) and uses the result for file names and tags; disabled, it
+     * clears the metadata. Network problems only end up in [DiscMetadata.message].
      */
-    fun lookupCddb(enabled: Boolean, server: String, matchIndex: Int, http: HttpGet): DiscMetadata {
-        val v = NativeCd.nativeLookupCddb(handle, enabled, server, matchIndex, http)
+    fun lookupCddb(enabled: Boolean, server: String, email: String, matchIndex: Int, http: HttpGet): DiscMetadata {
+        val v = NativeCd.nativeLookupCddb(handle, enabled, server, email, matchIndex, http)
         val matchCount = v[9].toInt()
-        val matches = v.slice(10 until 10 + matchCount)
-        val labels = v.drop(10 + matchCount)
+        val matches = v.slice(11 until 11 + matchCount)
+        val labels = v.drop(11 + matchCount)
         return DiscMetadata(
-            v[0] == "1", v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8].toInt(), matches, labels
+            v[0] == "1", v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8].toInt(), matches, labels, v[10] == "1"
         )
     }
 

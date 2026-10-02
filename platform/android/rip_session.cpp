@@ -361,21 +361,10 @@ std::string RipSession::ripLog() {
     for (const std::string& l : gaps_.logLines()) log << l << "\n";
     log << "\n";
 
-    if (!cddbLookedUp_ || !cddbSettings_.enabled) {
-        log << "CDDB lookup: disabled\n\n";
-    } else if (!cddb_.found) {
-        log << "CDDB lookup (" << cddbSettings_.options.server << "): " << cddb_.error << "\n\n";
-    } else {
-        log << "CDDB lookup (" << cddbSettings_.options.server << "): " << cddb_.matches.size()
-            << (cddb_.exact ? " exact" : " inexact") << " match(es)\n";
-        for (size_t i = 0; i < cddb_.matches.size(); ++i) {
-            const CddbMatch& m = cddb_.matches[i];
-            log << (i == cddb_.chosen ? "  * " : "    ") << i + 1 << ". " << m.category << "/" << m.discId << "  "
-                << m.title << "\n";
-        }
-        log << "Artist: " << album_.artist << "\nAlbum: " << album_.title << "\nYear: " << album_.year
-            << "\nGenre: " << album_.genre << "\n\n";
-    }
+    for (const std::string& l : cddbLookupLogLines(cddbLookedUp_ && cddbSettings_.enabled,
+                                                  cddbSettings_.options.server, cddb_))
+        log << l << "\n";
+    log << "\n";
 
     log << "Folder: " << albumDirectoryName() << "\n";
     for (const RippedTrack& r : ripped_) {
