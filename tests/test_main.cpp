@@ -28,6 +28,7 @@
 #include "cdreader/md5.h"
 #include "cdreader/metadata.h"
 #include "cdreader/ogg.h"
+#include "cdreader/ogg_flac_writer.h"
 #include "cdreader/resampler.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
@@ -420,7 +421,8 @@ TEST(audio_writer_factory) {
     CHECK(std::find(formats.begin(), formats.end(), "wav") != formats.end());
     for (const std::string& f : formats) {
         std::unique_ptr<cdr::AudioWriter> w = cdr::createAudioWriter(f);
-        CHECK(w != nullptr && w->extension() == (f == "vorbis" ? "ogg" : f));
+        const std::string extension = f == "vorbis" ? "ogg" : f == "oggflac" ? "oga" : f;
+        CHECK(w != nullptr && w->extension() == extension);
     }
     CHECK(cdr::createAudioWriter("no-such-format") == nullptr);
 }
@@ -2199,6 +2201,274 @@ TEST(single_file_flac_rip_with_embedded_cuesheet) {
     }
 }
 
+// --- Ogg FLAC (FLAC-to-Ogg mapping 1.0) -----------------------------------------
+
+namespace {
+
+// Number of packets that end on each page.
+size_t packetsEndingOn(const OggPage& p) {
+    size_t n = 0;
+    for (uint8_t l : p.lacing) n += l < 255 ? 1 : 0;
+    return n;
+}
+
+struct OggFlac {
+    std::vector<OggPage> pages;
+    std::vector<std::vector<uint8_t>> packets;
+    size_t headerPackets = 0;     // packets before the audio, the first one included
+    std::vector<uint8_t> native;  // the same stream as a native FLAC file, for decodeFlac()
+};
+
+// Checks the Ogg FLAC structure of `file` (header packets, pages, granule
+// positions, BOS / EOS) and rebuilds the native FLAC stream from its packets.
+OggFlac demuxOggFlac(const std::vector<uint8_t>& file) {
+    OggFlac o;
+    o.pages = parseOgg(file);
+    o.packets = oggPackets(o.pages);
+    CHECK(!o.pages.empty() && o.packets.size() >= 2);
+    if (o.pages.empty() || o.packets.size() < 2) return o;
+
+    // First packet: 0x7F "FLAC" 1.0, header packet count, "fLaC", STREAMINFO;
+    // alone on the BOS page, granule position 0.
+    const std::vector<uint8_t>& first = o.packets[0];
+    CHECK_EQ(first.size(), cdr::oggflac::kFirstPacketBytes);
+    CHECK(first.size() == 51 && first[0] == 0x7F && str(first, 1, 4) == "FLAC" && first[5] == 1 && first[6] == 0);
+    CHECK(str(first, 9, 4) == "fLaC");
+    CHECK_EQ(first[13] & 0x7F, 0);  // STREAMINFO
+    CHECK(first[14] == 0 && first[15] == 0 && first[16] == 34);
+    o.headerPackets = 1 + (size_t(first[7]) << 8 | first[8]);
+    CHECK(o.headerPackets <= o.packets.size());
+    if (o.headerPackets > o.packets.size()) return o;
+    CHECK(o.pages[0].lacing == std::vector<uint8_t>({51}));
+    CHECK_EQ(o.pages[0].granule, 0);
+
+    // The header packets hold one metadata block each; only the last is flagged last.
+    o.native = {'f', 'L', 'a', 'C'};
+    o.native.insert(o.native.end(), first.begin() + 13, first.end());
+    for (size_t i = 0; i < o.headerPackets; ++i) {
+        const std::vector<uint8_t>& p = o.packets[i];
+        const size_t block = i == 0 ? 13 : 0;
+        CHECK(p.size() >= block + 4);
+        if (p.size() < block + 4) return o;
+        CHECK_EQ(p.size() - block - 4, size_t(p[block + 1]) << 16 | size_t(p[block + 2]) << 8 | p[block + 3]);
+        CHECK_EQ(bool(p[block] & 0x80), i + 1 == o.headerPackets);
+        if (i > 0) o.native.insert(o.native.end(), p.begin(), p.end());
+    }
+    for (size_t i = o.headerPackets; i < o.packets.size(); ++i)
+        o.native.insert(o.native.end(), o.packets[i].begin(), o.packets[i].end());
+
+    // Pages: the header pages (granule 0) end with the last header packet, the
+    // audio starts on a new page; BOS first, EOS last; serial and sequence.
+    size_t completed = 0;
+    bool headerEnd = false;
+    for (size_t i = 0; i < o.pages.size(); ++i) {
+        const OggPage& p = o.pages[i];
+        CHECK_EQ(p.serial, o.pages[0].serial);
+        CHECK_EQ(p.sequence, uint32_t(i));
+        CHECK_EQ(bool(p.flags & 0x02), i == 0);
+        CHECK_EQ(bool(p.flags & 0x04), i + 1 == o.pages.size());
+        if (completed < o.headerPackets) {
+            CHECK_EQ(p.granule, 0);
+            completed += packetsEndingOn(p);
+            if (completed >= o.headerPackets) {
+                CHECK_EQ(completed, o.headerPackets);
+                CHECK_EQ(p.lacing.back() < 255, true);
+                headerEnd = true;
+            }
+        } else {
+            completed += packetsEndingOn(p);
+        }
+    }
+    CHECK(headerEnd);
+    CHECK_EQ(completed, o.packets.size());
+    return o;
+}
+
+// Granule positions of the audio pages: the samples of the frames completed
+// so far (-1 on pages where no frame ends).
+void checkOggFlacGranules(const OggFlac& o, uint64_t totalSamples) {
+    const size_t frames = o.packets.size() - o.headerPackets;
+    auto samplesThrough = [&](size_t framesDone) {
+        return std::min<uint64_t>(uint64_t(framesDone) * cdr::flac::kBlockSize, totalSamples);
+    };
+    size_t completed = 0;
+    for (const OggPage& p : o.pages) {
+        const size_t ending = packetsEndingOn(p);
+        const bool header = completed < o.headerPackets;
+        completed += ending;
+        if (header) continue;
+        if (ending == 0) {
+            CHECK_EQ(p.granule, -1);
+        } else {
+            CHECK_EQ(uint64_t(p.granule), samplesThrough(completed - o.headerPackets));
+        }
+    }
+    CHECK_EQ(completed - o.headerPackets, frames);
+    if (frames > 0) CHECK_EQ(uint64_t(o.pages.back().granule), totalSamples);
+}
+
+std::vector<uint8_t> encodeOggFlac(const std::vector<uint8_t>& pcm, const cdr::TrackMetadata& meta,
+                                   const cdr::EmbeddedCueSheet* cue = nullptr, size_t chunk = cdr::kSectorBytes) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.oga";
+    {
+        cdr::OggFlacWriter writer;
+        CHECK(writer.canEmbedCueSheet());
+        if (cue) writer.setEmbeddedCueSheet(*cue);
+        writer.open(path, meta);
+        size_t pos = 0;
+        if (pcm.size() > 7) {  // an odd split to exercise partial samples
+            writer.write(pcm.data(), 7);
+            pos = 7;
+        }
+        for (; pos < pcm.size(); pos += chunk) writer.write(pcm.data() + pos, std::min(chunk, pcm.size() - pos));
+        writer.close();
+        CHECK_EQ(writer.totalSamples(), uint64_t(pcm.size() / 4));
+    }
+    std::vector<uint8_t> file = readFile(path);
+    std::filesystem::remove(path);
+    return file;
+}
+
+}  // namespace
+
+TEST(oggflac_first_packet_layout) {
+    std::vector<uint8_t> info(34);
+    for (size_t i = 0; i < info.size(); ++i) info[i] = uint8_t(0xA0 + i);
+    const std::vector<uint8_t> p = cdr::oggflac::firstPacket(2, info);
+    std::vector<uint8_t> expected = {0x7F, 'F', 'L', 'A', 'C', 0x01, 0x00, 0x00, 0x02,
+                                     'f',  'L', 'a', 'C', 0x00, 0x00, 0x00, 0x22};
+    expected.insert(expected.end(), info.begin(), info.end());
+    CHECK(p == expected);
+    CHECK_EQ(p.size(), cdr::oggflac::kFirstPacketBytes);
+    CHECK_EQ(cdr::oggflac::firstPacket(0, info)[13], 0x80);  // no other block: STREAMINFO is the last
+    CHECK_EQ(cdr::oggflac::firstPacket(258, info)[7], 1);
+    CHECK_EQ(cdr::oggflac::firstPacket(258, info)[8], 2);
+    bool threw = false;
+    try {
+        cdr::oggflac::firstPacket(1, std::vector<uint8_t>(33));
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(oggflac_writer_stream_structure_and_pcm) {
+    cdr::TrackMetadata meta = sampleAlbum().forTrack(2, 3);
+    for (size_t samples : {size_t(0), size_t(1), size_t(4096), size_t(4097), size_t(4096 * 25 + 1000)}) {
+        const testsig::Signal music = testsig::music(samples);
+        const std::vector<uint8_t> file = encodeOggFlac(music.pcm, meta, nullptr, 1000);
+        if (samples == 4096 * 25 + 1000) keepSample("music.oga", file);
+        const OggFlac o = demuxOggFlac(file);
+        CHECK_EQ(o.headerPackets, 2u);  // STREAMINFO, VORBIS_COMMENT
+        if (o.native.empty()) continue;
+        const DecodedFlac d = decodeFlac(o.native);
+        CHECK(d.pcm == music.pcm);
+        CHECK(d.md5 == md5Of(music.pcm));
+        CHECK_EQ(d.totalSamples, uint64_t(samples));
+        CHECK_EQ(d.sampleRate, 44100u);
+        CHECK_EQ(d.channels, 2u);
+        CHECK_EQ(d.bitsPerSample, 16u);
+        const unsigned block = samples > 4096 ? 4096u : unsigned(std::max<size_t>(samples, 16));
+        CHECK(d.minBlockSize == block && d.maxBlockSize == block);
+        CHECK(d.blockTypes == std::vector<int>({0, 4}));  // no SEEKTABLE / PADDING in Ogg
+        CHECK(d.vendor.rfind("cdreader ", 0) == 0);
+        CHECK(std::find(d.comments.begin(), d.comments.end(), "TITLE=Two \"2\"") != d.comments.end());
+        CHECK(std::find(d.comments.begin(), d.comments.end(), "ARTIST=Guest") != d.comments.end());
+
+        // One frame per audio packet, the frame size bounds of STREAMINFO match.
+        const size_t frames = o.packets.size() - o.headerPackets;
+        CHECK_EQ(size_t(d.frames), frames);
+        CHECK_EQ(frames, (samples + 4095) / 4096);
+        uint64_t offset = 0;
+        uint32_t minFrame = UINT32_MAX, maxFrame = 0;
+        for (size_t i = 0; i < frames && i < d.frameOffsets.size(); ++i) {
+            const std::vector<uint8_t>& packet = o.packets[o.headerPackets + i];
+            CHECK_EQ(d.frameOffsets[i], offset);
+            offset += packet.size();
+            minFrame = std::min(minFrame, uint32_t(packet.size()));
+            maxFrame = std::max(maxFrame, uint32_t(packet.size()));
+        }
+        CHECK_EQ(d.minFrameSize, frames ? minFrame : 0u);
+        CHECK_EQ(d.maxFrameSize, maxFrame);
+        checkOggFlacGranules(o, samples);
+        if (samples == 0) CHECK_EQ(o.pages.size(), 2u);  // the header pages, the last one with EOS
+
+        // The frames are exactly those of the native FLAC writer.
+        const std::vector<uint8_t> flac = encodeFlac(music.pcm, meta);
+        const DecodedFlac nd = decodeFlac(flac);
+        CHECK(std::equal(o.native.begin() + ptrdiff_t(d.firstFrame), o.native.end(),
+                         flac.begin() + ptrdiff_t(nd.firstFrame), flac.end()));
+        CHECK(d.md5 == nd.md5 && d.minFrameSize == nd.minFrameSize && d.maxFrameSize == nd.maxFrameSize);
+    }
+}
+
+TEST(oggflac_writer_round_trip_synthetic_signals) {
+    for (const testsig::Signal& s : testsig::all()) {
+        const OggFlac o = demuxOggFlac(encodeOggFlac(s.pcm, {}));
+        if (o.native.empty()) continue;
+        const DecodedFlac d = decodeFlac(o.native);
+        const bool ok = d.pcm == s.pcm && d.md5 == md5Of(s.pcm) && d.totalSamples == s.pcm.size() / 4;
+        if (!ok) std::fprintf(stderr, "  Ogg FLAC round trip failed: %s\n", s.name.c_str());
+        CHECK(ok);
+        checkOggFlacGranules(o, s.pcm.size() / 4);
+    }
+}
+
+TEST(oggflac_writer_embeds_cuesheet) {
+    // As with native FLAC: 100 sectors announced, 99 written; the lead-out follows the real length.
+    const testsig::Signal music = testsig::music(99 * 588);
+    const cdr::EmbeddedCueSheet cue = sampleEmbeddedCue();
+    cdr::TrackMetadata meta;
+    meta.album = "Album";
+    const std::vector<uint8_t> file = encodeOggFlac(music.pcm, meta, &cue);
+    keepSample("image.oga", file);
+    const OggFlac o = demuxOggFlac(file);
+    CHECK_EQ(o.headerPackets, 3u);  // STREAMINFO, VORBIS_COMMENT, CUESHEET
+    if (o.native.empty()) return;
+    const DecodedFlac d = decodeFlac(o.native);
+    CHECK(d.pcm == music.pcm);
+    CHECK(d.blockTypes == std::vector<int>({0, 4, 5}));
+    const std::string tag = "CUESHEET=FILE \"Image.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
+    CHECK(std::find(d.comments.begin(), d.comments.end(), tag) != d.comments.end());
+    const ParsedCueSheet c = parseCueSheet(flacBlock(o.native, 5));
+    CHECK_EQ(c.tracks.size(), 4u);
+    if (c.tracks.size() == 4) {
+        CHECK_EQ(c.tracks[1].offset, uint64_t(30 * 588));
+        CHECK_EQ(c.tracks[2].offset, uint64_t(75 * 588));
+        CHECK_EQ(c.tracks[3].number, 170);
+        CHECK_EQ(c.tracks[3].offset, uint64_t(99 * 588));
+    }
+    // The CUESHEET block is the same as in the native FLAC file.
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_cuesheet_test.flac";
+    {
+        cdr::FlacWriter flac;
+        flac.setEmbeddedCueSheet(cue);
+        flac.open(path, meta);
+        flac.write(music.pcm.data(), music.pcm.size());
+        flac.close();
+    }
+    CHECK(flacBlock(readFile(path), 5) == flacBlock(o.native, 5));
+    std::filesystem::remove(path);
+}
+
+TEST(oggflac_writer_rejects_partial_sample) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_partial.oga";
+    bool threw = false;
+    {
+        cdr::OggFlacWriter writer;
+        writer.open(path, {});
+        const uint8_t pcm[6] = {1, 2, 3, 4, 5, 6};
+        writer.write(pcm, sizeof pcm);
+        try {
+            writer.close();
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+    }
+    std::filesystem::remove(path);
+    CHECK(threw);
+}
+
 namespace {
 
 // --- Resampler (44.1 -> 48 kHz for Opus) --------------------------------------
@@ -2318,13 +2588,6 @@ std::vector<uint8_t> encodeWith(cdr::AudioWriter& writer, const std::filesystem:
     return readFile(path);
 }
 
-// Number of packets that end on each page.
-size_t packetsEndingOn(const OggPage& p) {
-    size_t n = 0;
-    for (uint8_t l : p.lacing) n += l < 255 ? 1 : 0;
-    return n;
-}
-
 cdr::TrackMetadata lossyMetadata() {
     cdr::TrackMetadata m;
     m.trackNumber = 3;
@@ -2362,7 +2625,12 @@ TEST(audio_writer_settings_validation) {
     CHECK(throws("wav", bitrate));
     CHECK(throws("flac", quality));
     CHECK(!throws("flac", {}));
-    CHECK(!cdr::isLossyFormat("flac") && !cdr::isLossyFormat("wav"));
+    CHECK(throws("oggflac", bitrate));
+    CHECK(throws("oggflac", quality));
+    CHECK(!throws("oggflac", {}));
+    CHECK(cdr::createAudioWriter("oggflac")->encoderDescription() == "Ogg FLAC (built-in encoder), lossless");
+    CHECK(cdr::createAudioWriter("oggflac")->canEmbedCueSheet());
+    CHECK(!cdr::isLossyFormat("flac") && !cdr::isLossyFormat("wav") && !cdr::isLossyFormat("oggflac"));
     CHECK(cdr::isLossyFormat("opus") && cdr::isLossyFormat("vorbis"));
 #ifdef CDREADER_HAVE_OPUS
     CHECK(!throws("opus", bitrate));
