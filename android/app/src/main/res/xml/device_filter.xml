@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- USB mass storage (class 8), Bulk-Only Transport (protocol 0x50) with the
+     SCSI transparent (6), MMC-5/ATAPI (2) or SFF-8070i (5) command set:
+     external USB CD/DVD/BD drives. -->
+<resources>
+    <usb-device class="8" subclass="6" protocol="80" />
+    <usb-device class="8" subclass="2" protocol="80" />
+    <usb-device class="8" subclass="5" protocol="80" />
+</resources>

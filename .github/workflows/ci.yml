@@ -35,3 +35,29 @@ jobs:
         run: cmake --build build -j
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          # Use the NDK preinstalled on the runner instead of downloading AGP's default one.
+          ndk_args=()
+          if [ -n "${ANDROID_NDK_LATEST_HOME:-}" ]; then
+            ndk_args+=("-Pcdreader.ndkVersion=$(basename "$ANDROID_NDK_LATEST_HOME")")
+          fi
+          gradle assembleDebug --no-daemon --stacktrace "${ndk_args[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cdreader-android-debug
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
