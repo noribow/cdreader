@@ -592,6 +592,66 @@ TEST(disabled_lookups_send_no_requests) {
     CHECK(contains(log, "Track03.wav  CRC32 "));
 }
 
+TEST(mcn_and_isrc_in_tags_and_log) {
+    Rig rig;
+    rig.fake.mcn = "4988001234567";
+    rig.fake.isrcs[1] = "JPVI09912345";
+    rig.fake.isrcs[3] = "JPVI09912347";
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    CHECK_EQ(rig.fake.subChannelCommands, 0);  // read when the rip starts, not with the TOC
+    rig.session.beginRip(settings("flac"));
+    CHECK_EQ(rig.fake.subChannelCommands, 4);  // MCN + 3 ISRCs, through the BOT
+    CHECK_STR(rig.session.album().mcn, "4988001234567");
+    CHECK_STR(rig.session.trackMetadata(1).isrc, "JPVI09912345");
+    CHECK_STR(rig.session.trackMetadata(2).isrc, "");
+    // A second rip of the same disc does not read them again; a new CDDB
+    // lookup keeps them.
+    rig.session.beginRip(settings("flac"));
+    rig.session.lookupCddb(&http, {});
+    CHECK_EQ(rig.fake.subChannelCommands, 4);
+    CHECK_STR(rig.session.trackMetadata(3).isrc, "JPVI09912347");
+    CHECK_STR(rig.session.album().title, "Album: Live");
+
+    TempDir dir;
+    rig.session.ripTrack(1, dir.path / "1.flac");
+    const DecodedFlac d = decodeFlac(readFile(dir.path / "1.flac"));
+    CHECK(hasComment(d, "ISRC=JPVI09912345"));
+    CHECK(hasComment(d, "BARCODE=4988001234567"));
+    CHECK(hasComment(d, "TITLE=Opening"));
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "MCN: 4988001234567\n"));
+    CHECK(contains(log, "Track  1  ISRC: JPVI09912345\n"));
+    CHECK(contains(log, "Track  2  ISRC: not present\n"));
+
+    // Reading the TOC again (another disc) forgets them.
+    rig.session.readToc();
+    CHECK_STR(rig.session.album().mcn, "");
+    CHECK(contains(rig.session.ripLog(), "MCN / ISRC: not read (disabled)"));
+}
+
+TEST(mcn_and_isrc_disabled_or_unsupported) {
+    Rig rig;
+    rig.fake.mcn = "4988001234567";
+    cdr::RipSettings off = settings("wav");
+    off.readDiscCodes = false;
+    rig.session.beginRip(off);
+    CHECK_EQ(rig.fake.subChannelCommands, 0);
+    CHECK_STR(rig.session.album().mcn, "");
+
+    // A drive that rejects READ SUB-CHANNEL: the rip goes on without codes.
+    Rig old;
+    old.fake.subChannelSupported = false;
+    old.session.beginRip(settings("wav"));
+    CHECK_EQ(old.fake.subChannelCommands, 1);
+    TempDir dir;
+    CHECK(old.session.ripTrack(2, dir.path / "2.wav").result.clean());
+    const std::string log = old.session.ripLog();
+    CHECK(contains(log, "MCN: not supported by the drive\n"));
+    CHECK(contains(log, "Track  2  ISRC: not read (command not supported)\n"));
+}
+
 TEST(cancel_stops_the_rip) {
     Rig rig;
     rig.session.beginRip(settings("flac"));

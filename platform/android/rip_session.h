@@ -22,6 +22,7 @@
 #include "cdreader/http.h"
 #include "cdreader/metadata.h"
 #include "cdreader/ripper.h"
+#include "cdreader/subchannel.h"
 #include "cdreader/toc.h"
 
 namespace cdr {
@@ -42,6 +43,9 @@ struct RipSettings {
     std::string format = "wav";  // a name accepted by createAudioWriter()
     EncoderSettings encoder;     // lossy formats (default: the format's defaults)
     RipOptions options;
+    // Read the MCN and the ISRCs from the Q sub-channel (once per disc) for
+    // the tags and rip.log.
+    bool readDiscCodes = true;
 };
 
 struct RippedTrack {
@@ -91,7 +95,13 @@ public:
     const CddbLookupResult& cddbResult() const { return cddb_; }
     const CddbSettings& cddbSettings() const { return cddbSettings_; }
 
-    // Album metadata from CDDB (empty without a match); discId is always set.
+    // Reads the MCN and the ISRCs of the audio tracks (again). Never throws
+    // for a drive that cannot read them; beginRip() calls it when enabled.
+    const DiscCodes& readDiscCodes();
+    const DiscCodes& discCodes() const { return discCodes_; }
+
+    // Album metadata from CDDB (empty without a match); discId is always set,
+    // and the MCN / ISRCs once read.
     const AlbumMetadata& album() const { return album_; }
     TrackMetadata trackMetadata(int number);
     // "Title" or "Artist / Title" of a track, empty if unknown.
@@ -101,8 +111,9 @@ public:
     // "NN - Title.<ext>" or "TrackNN.<ext>". Throws std::invalid_argument for an unknown format.
     std::string trackFileName(int number, const std::string& format);
 
-    // Starts a rip: validates the settings, forgets earlier rip results and
-    // clears a pending cancel. Throws std::invalid_argument.
+    // Starts a rip: validates the settings, forgets earlier rip results,
+    // clears a pending cancel and reads the MCN / ISRCs if not done yet for
+    // this disc (settings.readDiscCodes). Throws std::invalid_argument.
     void beginRip(const RipSettings& settings);
     const RipSettings& ripSettings() const { return settings_; }
 
@@ -138,6 +149,7 @@ private:
     CddbLookupResult cddb_;
     bool cddbLookedUp_ = false;
     AlbumMetadata album_;
+    DiscCodes discCodes_;
     RipSettings settings_;
     std::vector<RippedTrack> ripped_;
     AccurateRipReport accurateRip_;

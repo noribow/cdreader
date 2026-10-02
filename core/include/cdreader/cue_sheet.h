@@ -18,10 +18,11 @@ struct CueTrack {
     bool copyPermitted = false;    // FLAGS DCP
     std::string title;
     std::string performer;
+    std::string isrc;              // ISRC line (written only when valid, see subchannel.h)
 };
 
 // Tracks of a single-file rip: `tracks` written back to back into `file`.
-// Titles and performers come from `album`. The tracks must be consecutive on
+// Titles, performers and ISRCs come from `album`. The tracks must be consecutive on
 // the disc (each one starting where the previous one ends), otherwise the
 // file would not be an image of the disc: throws std::invalid_argument.
 std::vector<CueTrack> singleFileCueTracks(const std::vector<Track>& tracks, const std::string& file,
@@ -36,7 +37,9 @@ std::vector<CueTrack> perTrackCueTracks(const std::vector<Track>& tracks, const 
 // "WAVE" (used by EAC / foobar2000 for every non-MP3 audio format, FLAC included).
 std::string cueFileType(const std::string& extension);
 
-// CUE sheet text (CRLF line endings, UTF-8). A UTF-8 BOM is added only when
+// CUE sheet text (CRLF line endings, UTF-8). album.mcn becomes the disc's
+// CATALOG line, CueTrack::isrc the track's ISRC line (after FLAGS, before
+// INDEX, as metaflac writes them); codes that do not validate are left out. A UTF-8 BOM is added only when
 // the text contains non-ASCII characters; see cue_sheet.cpp.
 std::string formatCueSheet(const AlbumMetadata& album, const std::vector<CueTrack>& tracks);
 
@@ -44,6 +47,7 @@ std::string formatCueSheet(const AlbumMetadata& album, const std::vector<CueTrac
 // that support it (FLAC: CUESHEET metadata block + CUESHEET tag, #16).
 struct EmbeddedCueSheet {
     std::vector<CueTrack> tracks;  // INDEX 01 positions relative to the start of the file
+    std::string mcn;               // media catalog number (13 digits) or empty
     uint32_t totalSectors = 0;     // length of the image: position of the lead-out
     std::string text;              // the CUE sheet as text, as written to the .cue file
 };

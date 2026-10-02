@@ -1,5 +1,6 @@
 #include "fake_drive.h"
 
+#include <algorithm>
 #include <cstring>
 
 cdr::ScsiResult FakeDrive::checkCondition(uint8_t key, uint8_t asc, uint8_t ascq) {
@@ -49,6 +50,39 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
                 d[6] = uint8_t(lba >> 8);
                 d[7] = uint8_t(lba);
             }
+            return ok;
+        }
+
+        case 0x42: {  // READ SUB-CHANNEL
+            ++subChannelCommands;
+            lastSubChannelCdb.assign(cdb, cdb + 10);
+            if (!subChannelSupported) return checkCondition(0x5, 0x20, 0x00);
+            if (!discPresent) return checkCondition(0x2, 0x3A, 0x00);
+            const uint8_t format = cdb[3];
+            const int track = cdb[6];
+            if (!(cdb[2] & 0x40) || (format != 0x02 && format != 0x03)) return checkCondition(0x5, 0x24, 0x00);
+            if (format == 0x03 && (track < 1 || track > int(tracks_.size()))) return checkCondition(0x5, 0x24, 0x00);
+            uint8_t response[24] = {};
+            response[1] = 0x15;  // audio status: no current audio status
+            response[3] = 20;    // sub-channel data length
+            response[4] = format;
+            const std::string* code = nullptr;
+            if (format == 0x02) {
+                if (!mcn.empty()) code = &mcn;
+            } else {
+                response[5] = 0x30 | (tracks_[size_t(track - 1)].data ? 0x04 : 0x00);  // ADR 3, control
+                response[6] = uint8_t(track);
+                auto it = isrcs.find(track);
+                if (it != isrcs.end()) code = &it->second;
+            }
+            if (code) {
+                response[8] = 0x80;  // MCVal / TCVal
+                std::memcpy(response + 9, code->data(), std::min(code->size(), size_t(format == 0x02 ? 13 : 12)));
+            }
+            const size_t allocation = size_t(cdb[7]) << 8 | cdb[8];
+            const size_t n = std::min({sizeof response, allocation, dataLength, subChannelTransferLimit});
+            std::memcpy(out, response, n);
+            ok.transferred = n;
             return ok;
         }
 
