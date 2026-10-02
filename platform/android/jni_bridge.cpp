@@ -243,7 +243,7 @@ private:
 
 extern "C" {
 
-// Output formats built into the library, comma separated ("wav,flac,oggflac,opus,vorbis,mka,...").
+// Output formats built into the library, comma separated ("wav,flac,oggflac,alac,opus,vorbis,mka,...").
 JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeFormats(JNIEnv* env, jclass) {
     std::string list;
     for (const std::string& f : cdr::audioFormats()) list += (list.empty() ? "" : ",") + f;

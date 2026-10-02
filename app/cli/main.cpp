@@ -63,6 +63,7 @@ void printUsage() {
         "                        A CUE sheet (<album>.cue) is written next to the audio\n"
         "  -f, --format <name>   Output format: %s (default: wav)\n"
         "                        oggflac = FLAC in an Ogg container (.oga, lossless)\n"
+        "                        alac = Apple Lossless in an MP4 container (.m4a)\n"
         "                        opus = Ogg Opus (.opus), vorbis = Ogg Vorbis (.ogg)\n"
         "                        (when built with libopus / libvorbis)\n"
         "                        mka = Matroska (.mka) with FLAC; mka-pcm, mka-opus,\n"

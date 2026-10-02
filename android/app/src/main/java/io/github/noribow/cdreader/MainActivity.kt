@@ -83,6 +83,7 @@ class MainActivity : Activity() {
     private lateinit var radioOpus: RadioButton
     private lateinit var radioVorbis: RadioButton
     private lateinit var radioMka: RadioButton
+    private lateinit var radioAlac: RadioButton
     private lateinit var progress: ProgressBar
 
     // Owned by the worker thread once opened.
@@ -147,6 +148,7 @@ class MainActivity : Activity() {
         radioOpus = findViewById(R.id.radioOpus)
         radioVorbis = findViewById(R.id.radioVorbis)
         radioMka = findViewById(R.id.radioMka)
+        radioAlac = findViewById(R.id.radioAlac)
         progress = findViewById(R.id.progress)
         textResults.movementMethod = ScrollingMovementMethod()
         applySystemBarInsets(findViewById(R.id.root))
@@ -459,8 +461,8 @@ class MainActivity : Activity() {
 
     private fun formatButtons(): List<Pair<String, RadioButton>> =
         listOf(
-            "flac" to radioFlac, "oggflac" to radioOggFlac, "wav" to radioWav, "opus" to radioOpus, "vorbis" to radioVorbis,
-            "mka" to radioMka
+            "flac" to radioFlac, "oggflac" to radioOggFlac, "alac" to radioAlac, "wav" to radioWav, "opus" to radioOpus,
+            "vorbis" to radioVorbis, "mka" to radioMka
         )
 
     private fun selectedFormat(): String = formatButtons().firstOrNull { it.second.isChecked }?.first ?: "flac"
@@ -470,6 +472,7 @@ class MainActivity : Activity() {
     // keeps the name as given.
     private fun mimeType(format: String): String = when (format) {
         "flac" -> "audio/flac"
+        "alac" -> "audio/mp4"  // .m4a
         "vorbis", "oggflac" -> "audio/ogg"
         "opus" -> "application/octet-stream"
         "mka" -> "audio/x-matroska"

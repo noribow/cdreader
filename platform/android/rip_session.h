@@ -1,7 +1,7 @@
 #pragma once
 
 // Ripping workflow of the Android app, kept free of JNI so that it can be
-// unit tested on any platform: CDDB lookup, per-track ripping to WAV / FLAC / Ogg FLAC / Opus / Vorbis
+// unit tested on any platform: CDDB lookup, per-track ripping to WAV / FLAC / Ogg FLAC / ALAC / Opus / Vorbis
 // with tags and CDDB based file names, AccurateRip checksums and lookup, and
 // the rip.log text. jni_bridge.cpp only converts arguments and results.
 //

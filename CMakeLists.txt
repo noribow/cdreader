@@ -31,6 +31,8 @@ endif()
 # --- Platform independent core (shared by Windows and Android) --------------
 add_library(cdreader_core STATIC
   core/src/accuraterip.cpp
+  core/src/alac_encoder.cpp
+  core/src/alac_writer.cpp
   core/src/audio_writer.cpp
   core/src/cddb.cpp
   core/src/cd_drive.cpp
@@ -43,6 +45,7 @@ add_library(cdreader_core STATIC
   core/src/md5.cpp
   core/src/metadata.cpp
   core/src/mka_writer.cpp
+  core/src/mp4.cpp
   core/src/ogg.cpp
   core/src/ogg_flac_writer.cpp
   core/src/resampler.cpp
@@ -113,6 +116,7 @@ endif()
 if(CDREADER_BUILD_TESTS)
   enable_testing()
   add_executable(cdreader_tests
+    tests/alac_decoder.cpp
     tests/fake_drive.cpp
     tests/flac_decoder.cpp
     tests/test_main.cpp
@@ -132,6 +136,7 @@ if(CDREADER_BUILD_TESTS)
 
   # The Android rip workflow over the BOT fake USB device and canned HTTP.
   add_executable(cdreader_rip_session_tests
+    tests/alac_decoder.cpp
     tests/fake_drive.cpp
     tests/fake_usb_device.cpp
     tests/flac_decoder.cpp
@@ -225,4 +230,19 @@ if(CDREADER_BUILD_TESTS)
   endforeach()
   add_test(NAME mka_check COMMAND cdreader_mka_check ${_mka_tools})
   set_tests_properties(mka_check PROPERTIES SKIP_RETURN_CODE 77)
+  # ALAC (.m4a) decoded by FFmpeg (bit-exact PCM, tags via ffprobe); also
+  # compares the size with our FLAC and FFmpeg's ALAC encoder. Skipped without ffmpeg.
+  add_executable(cdreader_alac_ffmpeg_check tests/alac_ffmpeg_check.cpp tests/alac_decoder.cpp)
+  target_include_directories(cdreader_alac_ffmpeg_check PRIVATE tests)
+  target_link_libraries(cdreader_alac_ffmpeg_check PRIVATE cdreader_core)
+  set(_alac_tools)
+  foreach(_tool ffmpeg ffprobe)
+    string(TOUPPER "${_tool}" _var)
+    find_program(${_var}_EXECUTABLE ${_tool})
+    if(${_var}_EXECUTABLE)
+      list(APPEND _alac_tools --${_tool} "${${_var}_EXECUTABLE}")
+    endif()
+  endforeach()
+  add_test(NAME alac_ffmpeg COMMAND cdreader_alac_ffmpeg_check ${_alac_tools})
+  set_tests_properties(alac_ffmpeg PROPERTIES SKIP_RETURN_CODE 77)
 endif()
