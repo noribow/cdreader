@@ -832,6 +832,90 @@ TEST(gaps_in_rip_log) {
     CHECK(contains(off.session.ripLog(), "Gap detection: not run (disabled)\n"));
 }
 
+// C2 error pointers (#33) through the BOT: a supported drive reads with C2
+// bits, re-reads a flagged sector and logs the unresolved one.
+TEST(c2_errors_in_results_and_rip_log) {
+    Rig rig;
+    rig.fake.c2Supported = true;
+    FakeDrive::C2Fault permanent;
+    permanent.firstByte = 1000;
+    rig.fake.c2Faults[320] = permanent;  // track 2, sector 20
+    FakeDrive::C2Fault transient;
+    transient.reads = 1;
+    rig.fake.c2Faults[100] = transient;  // track 1, recovered
+    rig.session.beginRip(settings("wav"));
+    CHECK(rig.session.c2Availability().usable());
+    CHECK(rig.session.ripSettings().options.useC2);
+    TempDir dir;
+    const cdr::RippedTrack t1 = rig.session.ripTrack(1, dir.path / "1.wav");
+    CHECK(t1.result.c2);
+    CHECK_EQ(t1.result.c2ErrorSectors, 1u);
+    CHECK_EQ(t1.result.c2Recovered, 1u);
+    CHECK(t1.result.clean());
+    CHECK_EQ(t1.result.crc32, referenceRip(1).crc32);
+    const cdr::RippedTrack t2 = rig.session.ripTrack(2, dir.path / "2.wav");
+    CHECK_EQ(t2.result.c2Rereads, 2u);  // settings(): 2 retries
+    CHECK_EQ(t2.result.c2Unresolved, 1u);
+    CHECK(t2.result.suspiciousSectors == std::vector<uint32_t>{20});
+    CHECK(rig.fake.c2ReadCommands > 0);
+    CHECK_EQ(rig.session.problemTracks(), 1);
+
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "Drive: FAKE CD-ROM DRIVE (1.00)\nC2 pointers: supported\nMode: burst"));
+    CHECK(contains(log, "Track01.wav  CRC32 "));
+    CHECK(contains(log, "  OK\n  C2 errors: 1 sector(s), 1 re-read(s) (1 recovered, 0 identical re-reads with C2, "
+                        "0 unresolved)\n"));
+    CHECK(contains(log, "retries 0  1 suspicious sector(s)\n  C2 errors: 1 sector(s), 2 re-read(s) (0 recovered, "
+                        "0 identical re-reads with C2, 1 unresolved)\n  Suspicious position 0:00:00 (sector 20)\n"));
+    CHECK(contains(log, "\nFinished with errors\n"));
+}
+
+// Disabled (the app's checkbox) or not supported: plain reads, the same PCM
+// as before C2 existed, and only the drive line in rip.log.
+TEST(c2_disabled_or_unsupported_reads_plainly) {
+    for (int variant = 0; variant < 2; ++variant) {
+        Rig rig;
+        rig.fake.c2Supported = variant == 0;
+        cdr::RipSettings s = settings("wav");
+        s.useC2 = variant != 0;
+        rig.session.beginRip(s);
+        CHECK(!rig.session.ripSettings().options.useC2);
+        TempDir dir;
+        const cdr::RippedTrack t = rig.session.ripTrack(2, dir.path / "2.wav");
+        CHECK(!t.result.c2);
+        CHECK_EQ(t.result.crc32, referenceRip(2).crc32);
+        CHECK_EQ(rig.fake.c2ReadCommands, 0);
+        const std::string log = rig.session.ripLog();
+        CHECK(contains(log, variant == 0 ? "\nC2 pointers: disabled\n" : "\nC2 pointers: not supported\n"));
+        CHECK(!contains(log, "C2 errors"));
+    }
+}
+
+// A drive that reports C2 support but rejects the reads: plain reads for the
+// rest of the rip, noted in rip.log.
+TEST(c2_fallback_lasts_for_the_rest_of_the_rip) {
+    Rig rig;
+    rig.fake.c2Supported = true;
+    rig.fake.c2ReadsSupported = false;
+    rig.session.beginRip(settings("wav"));
+    TempDir dir;
+    const cdr::RippedTrack t1 = rig.session.ripTrack(1, dir.path / "1.wav");
+    CHECK(t1.result.c2);
+    CHECK(!t1.result.c2Fallback.empty());
+    CHECK_EQ(t1.result.crc32, referenceRip(1).crc32);
+    CHECK(!rig.session.c2Fallback().empty());
+    const cdr::RippedTrack t2 = rig.session.ripTrack(2, dir.path / "2.wav");
+    CHECK(!t2.result.c2);
+    CHECK_EQ(rig.fake.c2ReadCommands, 1);
+    CHECK_EQ(rig.session.problemTracks(), 0);
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "\n  C2 reads given up: READ CD with C2 error pointers failed at LBA 0 (SCSI status 0x02, sense ILLEGAL REQUEST"));
+    // A new rip tries again.
+    rig.session.beginRip(settings("wav"));
+    CHECK(rig.session.ripSettings().options.useC2);
+    CHECK(rig.session.c2Fallback().empty());
+}
+
 int main() {
     for (auto& [name, fn] : registry()) {
         const int before = failures;

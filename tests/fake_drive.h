@@ -28,7 +28,26 @@ public:
     // The sector returns different data on every read (simulates a scratched area).
     std::map<uint32_t, bool> unstableSectors;
     bool discPresent = true;
-    int readCommands = 0;
+    int readCommands = 0;  // READ CD of audio without sub-channel data (with or without C2 bits)
+
+    // C2 error pointers (#33). MODE SENSE page 2Ah reports c2Supported; READ
+    // CD with error field 01b (294 bytes) / 10b (296 bytes) returns C2 bits,
+    // one per byte, MSB first.
+    bool modeSenseSupported = true;  // false: ILLEGAL REQUEST
+    bool c2Supported = false;
+    bool c2ReadsSupported = true;    // false: READ CD with an error field fails (ILLEGAL REQUEST)
+    bool c2IgnoresErrorField = false;  // returns audio only (a short transfer)
+    struct C2Fault {
+        int reads = -1;           // reads affected (-1: every read)
+        bool corrupt = true;      // wrong (interpolated) data in the byte range
+        bool flagged = true;      // ... reported with C2 bits (false: silently wrong)
+        bool varying = true;      // different wrong data on every read (false: the same every time)
+        size_t firstByte = 1000;  // affected bytes of the sector
+        size_t byteCount = 16;
+    };
+    std::map<uint32_t, C2Fault> c2Faults;  // by LBA; plain reads get the corrupt data as well
+    int c2ReadCommands = 0;
+    std::vector<uint8_t> lastAudioCdb;  // last READ CD without sub-channel data
 
     // READ SUB-CHANNEL (42h), formats 02h / 03h. A code that is set is
     // returned with MCVal / TCVal = 1 as is (up to 13 / 12 bytes, so that
@@ -76,6 +95,7 @@ private:
     std::vector<FakeTrack> tracks_;
     uint32_t leadOut_;
     uint32_t unstableCounter_ = 0;
+    uint32_t c2Counter_ = 0;
     uint32_t lastReadLba_ = 0;
 
     int trackAt(uint32_t lba) const;  // index into tracks_

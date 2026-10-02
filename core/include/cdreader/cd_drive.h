@@ -13,6 +13,23 @@ namespace cdr {
 // 26 * 2352 = 61,152 bytes: stays below the common 64 KiB transfer limit.
 constexpr uint32_t kMaxSectorsPerRead = 26;
 
+// C2 error pointers (#33): READ CD error field 01b returns one bit per byte
+// of the 2352 audio bytes (294 bytes, MSB first) after each sector.
+constexpr size_t kC2BytesPerSector = 294;
+constexpr size_t kSectorWithC2Bytes = kSectorBytes + kC2BytesPerSector;  // 2646
+// 24 * 2646 = 63,504 bytes: also below 64 KiB (SPTI bounce buffer, USB bridges).
+constexpr uint32_t kMaxSectorsPerC2Read = 24;
+
+// What MODE SENSE page 2Ah (CD/DVD capabilities and mechanical status) says.
+struct DriveCapabilities {
+    bool valid = false;       // the page was read and parsed
+    bool c2Pointers = false;  // "C2 Pointers are supported" (page byte 5, bit 4)
+    std::string error;        // why the page could not be read (valid == false)
+
+    // Parses a MODE SENSE(10) response (8-byte header, block descriptors, page).
+    static DriveCapabilities parse(const uint8_t* data, size_t length);
+};
+
 struct DriveInfo {
     std::string vendor;
     std::string product;
@@ -43,6 +60,16 @@ public:
     // Reads `count` CD-DA sectors (count * kSectorBytes bytes) with READ CD.
     // Does not throw: the caller decides how to retry.
     ScsiResult readAudio(uint32_t lba, uint32_t count, uint8_t* out);
+
+    // READ CD of `count` CD-DA sectors with C2 error pointers (error field
+    // 01b): each sector is 2352 bytes of audio followed by kC2BytesPerSector
+    // bytes of C2 bits. Does not throw; a drive without C2 support answers
+    // ILLEGAL REQUEST or transfers less (shortRead).
+    ScsiResult readAudioWithC2(uint32_t lba, uint32_t count, uint8_t* out);
+
+    // MODE SENSE(10), page 2Ah. Never throws: a failure means "unknown"
+    // (valid false), which callers treat as "no C2 pointers".
+    DriveCapabilities readCapabilities();
 
     // READ CD of `count` CD-DA sectors with sub-channel data (#25): each sector
     // is 2352 bytes of audio followed by subChannelBytesPerSector(selection)
