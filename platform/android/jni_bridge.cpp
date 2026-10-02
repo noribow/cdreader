@@ -2,28 +2,31 @@
 //
 // The Kotlin side finds the USB mass storage interface, obtains permission
 // and passes the file descriptor of its UsbDeviceConnection; everything from
-// the Bulk-Only Transport up to WAV writing runs here on the shared core.
+// the Bulk-Only Transport up to the audio files runs here on the shared core
+// through RipSession (rip_session.h), which holds the actual logic. Online
+// lookups call back into Kotlin (HttpGet) for HTTP.
 // All calls for one handle must come from one thread at a time, except
 // nativeCancel().
 
 #include <jni.h>
 
-#include <atomic>
 #include <cstdint>
-#include <cstdio>
+#include <filesystem>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "bot_transport.h"
-#include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
-#include "cdreader/metadata.h"
-#include "cdreader/ripper.h"
-#include "cdreader/toc.h"
+#include "cdreader/cddb.h"
+#include "cdreader/http.h"
+#include "rip_session.h"
 #include "usbdevfs_endpoints.h"
+
+#ifndef CDREADER_VERSION
+#define CDREADER_VERSION "0.1.0"
+#endif
 
 namespace {
 
@@ -31,17 +34,16 @@ struct Session {
     Session(int fd, int interfaceNumber, uint8_t endpointIn, uint8_t endpointOut)
         : endpoints(fd, interfaceNumber, endpointIn, endpointOut),
           transport(endpoints, uint8_t(interfaceNumber)),
-          drive(transport) {}
+          drive(transport),
+          rip(drive) {}
 
     cdr::usb::UsbDevfsEndpoints endpoints;
     cdr::usb::BulkOnlyTransport transport;
     cdr::CdDrive drive;
-    std::optional<cdr::Toc> toc;
-    std::atomic<bool> cancelled{false};
+    cdr::RipSession rip;
 };
 
-// Unwinds the rip when the user cancels or the Java listener throws.
-struct Cancelled {};
+// Unwinds the rip when a Java callback throws.
 struct JavaExceptionPending {};
 
 Session* session(jlong handle) { return reinterpret_cast<Session*>(static_cast<intptr_t>(handle)); }
@@ -54,10 +56,187 @@ void throwJava(JNIEnv* env, const char* className, const std::string& message) {
 
 void throwIo(JNIEnv* env, const std::string& message) { throwJava(env, "java/io/IOException", message); }
 
-const cdr::Toc& tocOf(Session& s) {
-    if (!s.toc) s.toc = s.drive.readToc();
-    return *s.toc;
+// NewStringUTF() takes "modified UTF-8", which differs from real UTF-8 for
+// characters outside the BMP (e.g. emoji in CDDB titles), so strings go
+// through UTF-16. Invalid sequences become U+FFFD.
+jstring toJava(JNIEnv* env, const std::string& s) {
+    std::u16string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        uint32_t cp = 0xFFFD;
+        size_t len = 1;
+        if (c < 0x80) {
+            cp = c;
+        } else if (c >= 0xC2 && c <= 0xF4) {
+            const size_t need = c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+            if (i + need <= s.size()) {
+                uint32_t v = c & (0xFFu >> (need + 1));
+                bool ok = true;
+                for (size_t k = 1; k < need; ++k) {
+                    const unsigned char cc = static_cast<unsigned char>(s[i + k]);
+                    if ((cc & 0xC0) != 0x80) {
+                        ok = false;
+                        break;
+                    }
+                    v = (v << 6) | (cc & 0x3Fu);
+                }
+                const uint32_t min = need == 2 ? 0x80 : need == 3 ? 0x800 : 0x10000;
+                if (ok && v >= min && v <= 0x10FFFF && !(v >= 0xD800 && v <= 0xDFFF)) {
+                    cp = v;
+                    len = need;
+                }
+            }
+        }
+        if (cp >= 0x10000) {
+            cp -= 0x10000;
+            out.push_back(char16_t(0xD800 + (cp >> 10)));
+            out.push_back(char16_t(0xDC00 + (cp & 0x3FF)));
+        } else {
+            out.push_back(char16_t(cp));
+        }
+        i += len;
+    }
+    return env->NewString(reinterpret_cast<const jchar*>(out.data()), jsize(out.size()));
 }
+
+// Java String -> UTF-8 (via UTF-16, see toJava()). Returns false with an
+// exception pending on failure.
+bool fromJava(JNIEnv* env, jstring s, std::string& out) {
+    out.clear();
+    if (s == nullptr) return true;
+    const jsize length = env->GetStringLength(s);
+    const jchar* chars = env->GetStringChars(s, nullptr);
+    if (chars == nullptr) return false;
+    for (jsize i = 0; i < length; ++i) {
+        uint32_t cp = chars[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < length && chars[i + 1] >= 0xDC00 && chars[i + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (uint32_t(chars[i + 1]) - 0xDC00);
+            ++i;
+        } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+            cp = 0xFFFD;
+        }
+        if (cp < 0x80) {
+            out.push_back(char(cp));
+        } else if (cp < 0x800) {
+            out.push_back(char(0xC0 | (cp >> 6)));
+            out.push_back(char(0x80 | (cp & 0x3F)));
+        } else if (cp < 0x10000) {
+            out.push_back(char(0xE0 | (cp >> 12)));
+            out.push_back(char(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(char(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(char(0xF0 | (cp >> 18)));
+            out.push_back(char(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(char(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(char(0x80 | (cp & 0x3F)));
+        }
+    }
+    env->ReleaseStringChars(s, chars);
+    return true;
+}
+
+jobjectArray toJavaArray(JNIEnv* env, const std::vector<std::string>& values) {
+    jclass stringClass = env->FindClass("java/lang/String");
+    if (stringClass == nullptr) return nullptr;
+    jobjectArray array = env->NewObjectArray(jsize(values.size()), stringClass, nullptr);
+    if (array == nullptr) return nullptr;
+    for (size_t i = 0; i < values.size(); ++i) {
+        jstring s = toJava(env, values[i]);
+        if (s == nullptr) return nullptr;
+        env->SetObjectArrayElement(array, jsize(i), s);
+        env->DeleteLocalRef(s);
+    }
+    return array;
+}
+
+jintArray toJavaArray(JNIEnv* env, const std::vector<jint>& values) {
+    jintArray array = env->NewIntArray(jsize(values.size()));
+    if (array != nullptr) env->SetIntArrayRegion(array, 0, jsize(values.size()), values.data());
+    return array;
+}
+
+// Describes and clears the pending Java exception.
+std::string takeJavaException(JNIEnv* env) {
+    jthrowable t = env->ExceptionOccurred();
+    env->ExceptionClear();
+    if (t == nullptr) return "Java exception";
+    std::string text = "Java exception";
+    jclass cls = env->GetObjectClass(t);
+    jmethodID toString = env->GetMethodID(cls, "toString", "()Ljava/lang/String;");
+    if (toString != nullptr) {
+        auto s = static_cast<jstring>(env->CallObjectMethod(t, toString));
+        if (!env->ExceptionCheck() && s != nullptr) fromJava(env, s, text);
+    }
+    env->ExceptionClear();
+    return text;
+}
+
+// cdr::HttpClient on top of the Kotlin HttpGet object:
+//   fun get(url: String): HttpResult   (fields status: Int, body: ByteArray?, error: String?)
+// Runs on the thread that called into native code (the app's worker thread,
+// never the UI thread).
+class JavaHttpClient : public cdr::HttpClient {
+public:
+    JavaHttpClient(JNIEnv* env, jobject httpGet) : env_(env), httpGet_(httpGet) {}
+
+    cdr::HttpResponse get(const std::string& url) override {
+        cdr::HttpResponse response;
+        JNIEnv* env = env_;
+        if (httpGet_ == nullptr) {
+            response.error = "no HTTP client";
+            return response;
+        }
+        if (env->PushLocalFrame(16) != 0) {
+            response.error = takeJavaException(env);
+            return response;
+        }
+        jobject result = nullptr;
+        jclass cls = env->GetObjectClass(httpGet_);
+        jmethodID get = env->GetMethodID(cls, "get", "(Ljava/lang/String;)Lio/github/noribow/cdreader/HttpResult;");
+        jstring jurl = get != nullptr ? toJava(env, url) : nullptr;
+        if (jurl != nullptr) result = env->CallObjectMethod(httpGet_, get, jurl);
+        if (env->ExceptionCheck()) {
+            response.error = takeJavaException(env);
+        } else if (result == nullptr) {
+            response.error = "no HTTP result";
+        } else {
+            readResult(env, result, response);
+        }
+        env->PopLocalFrame(nullptr);
+        return response;
+    }
+
+private:
+    static void readResult(JNIEnv* env, jobject result, cdr::HttpResponse& response) {
+        jclass cls = env->GetObjectClass(result);
+        jfieldID statusField = env->GetFieldID(cls, "status", "I");
+        jfieldID bodyField = statusField ? env->GetFieldID(cls, "body", "[B") : nullptr;
+        jfieldID errorField = bodyField ? env->GetFieldID(cls, "error", "Ljava/lang/String;") : nullptr;
+        if (errorField == nullptr) {
+            response.error = takeJavaException(env);
+            return;
+        }
+        auto error = static_cast<jstring>(env->GetObjectField(result, errorField));
+        if (error != nullptr) {
+            if (!fromJava(env, error, response.error)) response.error = takeJavaException(env);
+            if (response.error.empty()) response.error = "request failed";
+            return;
+        }
+        response.status = env->GetIntField(result, statusField);
+        auto body = static_cast<jbyteArray>(env->GetObjectField(result, bodyField));
+        if (body != nullptr) {
+            const jsize length = env->GetArrayLength(body);
+            response.body.resize(size_t(length));
+            if (length > 0) env->GetByteArrayRegion(body, 0, length, reinterpret_cast<jbyte*>(&response.body[0]));
+        }
+        response.ok = true;
+    }
+
+    JNIEnv* env_;
+    jobject httpGet_;
+};
 
 }  // namespace
 
@@ -84,13 +263,13 @@ JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeClose(JNIE
 }
 
 JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeCancel(JNIEnv*, jclass, jlong handle) {
-    if (handle != 0) session(handle)->cancelled = true;
+    if (handle != 0) session(handle)->rip.cancel();
 }
 
 JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeInquiry(JNIEnv* env, jclass,
                                                                                  jlong handle) {
     try {
-        return env->NewStringUTF(session(handle)->drive.inquiry().displayName().c_str());
+        return toJava(env, session(handle)->rip.driveName());
     } catch (const std::exception& e) {
         throwIo(env, e.what());
         return nullptr;
@@ -104,12 +283,11 @@ JNIEXPORT jboolean JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeIsRead
 
 // Returns [firstTrack, lastTrack, leadOutLba, cddbId, then per track:
 // number, startLba, lengthSectors, flags (1 = audio, 2 = pre-emphasis)].
+// Forgets the metadata and rip results of the previous disc.
 JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeReadToc(JNIEnv* env, jclass,
                                                                                    jlong handle) {
     try {
-        Session& s = *session(handle);
-        s.toc.reset();  // the disc may have changed
-        const cdr::Toc& toc = tocOf(s);
+        const cdr::Toc& toc = session(handle)->rip.readToc();
         std::vector<jint> v = {toc.firstTrack, toc.lastTrack, jint(toc.leadOutLba), jint(toc.cddbId())};
         for (const cdr::Track& t : toc.tracks) {
             v.push_back(t.number);
@@ -117,30 +295,108 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeReadT
             v.push_back(jint(t.lengthSectors));
             v.push_back((t.isAudio ? 1 : 0) | (t.preEmphasis ? 2 : 0));
         }
-        jintArray array = env->NewIntArray(jsize(v.size()));
-        if (array != nullptr) env->SetIntArrayRegion(array, 0, jsize(v.size()), v.data());
-        return array;
+        return toJavaArray(env, v);
     } catch (const std::exception& e) {
         throwIo(env, e.what());
         return nullptr;
     }
 }
 
-// Rips one track to a WAV file at `path`, calling listener.onProgress(done,
-// total) in sectors. Returns [sectors, unreadableSectors, retries,
-// paddedSamples, crc32]. Throws java.util.concurrent.CancellationException
-// after nativeCancel() and IOException on errors; the partial file is left
-// for the caller to delete.
-JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTrack(
-    JNIEnv* env, jclass, jlong handle, jint trackNumber, jstring path, jint readOffset, jint maxRetries,
-    jboolean verify, jobject listener) {
-    Session& s = *session(handle);
-    s.cancelled = false;
+// Looks the disc up on CDDB (or clears the metadata when !enabled); an empty
+// `server` means the default server. Never fails for network problems.
+// Returns [found ("1"/"0"), message (error, or "exact"/"inexact"), artist,
+// album, year, genre, folder name, AccurateRip disc id, chosen match index,
+// match count N, N x "category/discid  Artist / Album", then one label per
+// TOC track ("Title" or "Artist / Title", "" if unknown)].
+JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeLookupCddb(
+    JNIEnv* env, jclass, jlong handle, jboolean enabled, jstring server, jint matchIndex, jobject httpGet) {
+    try {
+        cdr::RipSession& rip = session(handle)->rip;
+        cdr::CddbSettings settings;
+        settings.enabled = enabled == JNI_TRUE && httpGet != nullptr;
+        std::string url;
+        if (!fromJava(env, server, url)) return nullptr;
+        if (!url.empty()) settings.options.server = url;
+        settings.options.matchIndex = matchIndex > 0 ? size_t(matchIndex) : 0;
+        settings.options.client.version = CDREADER_VERSION;
 
-    const char* chars = env->GetStringUTFChars(path, nullptr);
-    if (chars == nullptr) return nullptr;
-    const std::string outputPath(chars);
-    env->ReleaseStringUTFChars(path, chars);
+        JavaHttpClient http(env, httpGet);
+        const cdr::CddbLookupResult& r = rip.lookupCddb(settings.enabled ? &http : nullptr, settings);
+        const cdr::AlbumMetadata& album = rip.album();
+        std::vector<std::string> v = {r.found ? "1" : "0",
+                                      r.found ? (r.exact ? "exact" : "inexact") : r.error,
+                                      album.artist,
+                                      album.title,
+                                      album.year,
+                                      album.genre,
+                                      rip.albumDirectoryName(),
+                                      cdr::AccurateRipDiscId::fromToc(rip.toc()).toString(),
+                                      std::to_string(r.chosen),
+                                      std::to_string(r.matches.size())};
+        for (const cdr::CddbMatch& m : r.matches) v.push_back(m.category + "/" + m.discId + "  " + m.title);
+        for (const cdr::Track& t : rip.toc().tracks) v.push_back(rip.trackLabel(t.number));
+        return toJavaArray(env, v);
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+        return nullptr;
+    }
+}
+
+// Output folder name: "Artist - Album" from CDDB, otherwise "cd_<CDDB id>".
+JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeAlbumFolderName(JNIEnv* env, jclass,
+                                                                                         jlong handle) {
+    try {
+        cdr::RipSession& rip = session(handle)->rip;
+        rip.toc();  // the disc id names the folder without metadata
+        return toJava(env, rip.albumDirectoryName());
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+        return nullptr;
+    }
+}
+
+// File name of a track for `format` ("wav" / "flac"), from the CDDB metadata.
+JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTrackFileName(JNIEnv* env, jclass,
+                                                                                       jlong handle, jint track,
+                                                                                       jstring format) {
+    try {
+        std::string f;
+        if (!fromJava(env, format, f)) return nullptr;
+        return toJava(env, session(handle)->rip.trackFileName(track, f));
+    } catch (const std::exception& e) {
+        throwJava(env, "java/lang/IllegalArgumentException", e.what());
+        return nullptr;
+    }
+}
+
+// Starts a rip with these settings: forgets earlier results, clears a cancel.
+JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(JNIEnv* env, jclass, jlong handle,
+                                                                               jstring format, jint readOffset,
+                                                                               jint maxRetries, jboolean verify) {
+    try {
+        cdr::RipSettings settings;
+        if (!fromJava(env, format, settings.format)) return;
+        settings.options.readOffsetSamples = readOffset;
+        settings.options.maxRetries = maxRetries;
+        settings.options.verify = verify == JNI_TRUE;
+        session(handle)->rip.beginRip(settings);
+    } catch (const std::exception& e) {
+        throwJava(env, "java/lang/IllegalArgumentException", e.what());
+    }
+}
+
+// Rips one track to a local file at `path` (in the format given to
+// nativeBeginRip), calling listener.onProgress(done, total) in sectors.
+// Returns [sectors, unreadableSectors, retries, paddedSamples, crc32,
+// accurateRipV1, accurateRipV2]. Throws
+// java.util.concurrent.CancellationException after nativeCancel() and
+// IOException on errors; the partial file is left for the caller to delete.
+JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTrack(JNIEnv* env, jclass,
+                                                                                    jlong handle, jint trackNumber,
+                                                                                    jstring path, jobject listener) {
+    Session& s = *session(handle);
+    std::string outputPath;
+    if (!fromJava(env, path, outputPath)) return nullptr;
 
     jmethodID onProgress = nullptr;
     if (listener != nullptr) {
@@ -150,45 +406,16 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTr
     }
 
     try {
-        const cdr::Toc& toc = tocOf(s);
-        const cdr::Track* track = toc.findTrack(trackNumber);
-        if (track == nullptr || !track->isAudio) throw std::runtime_error("not an audio track");
-
-        cdr::RipOptions options;
-        options.readOffsetSamples = readOffset;
-        options.maxRetries = maxRetries;
-        options.verify = verify == JNI_TRUE;
-
-        cdr::AlbumMetadata album;
-        char discId[9];
-        std::snprintf(discId, sizeof discId, "%08x", toc.cddbId());
-        album.discId = discId;
-
-        std::unique_ptr<cdr::AudioWriter> writer = cdr::createAudioWriter("wav");
-        writer->open(std::filesystem::u8path(outputPath),
-                     album.forTrack(track->number, int(toc.audioTrackCount())));
-
-        cdr::Ripper ripper(s.drive, toc, options);
-        const cdr::TrackRipResult r = ripper.ripTrack(
-            *track,
-            [&](const uint8_t* pcm, size_t bytes) {
-                if (s.cancelled) throw Cancelled{};
-                writer->write(pcm, bytes);
-            },
-            [&](uint32_t done, uint32_t total) {
-                if (s.cancelled) throw Cancelled{};
+        const cdr::RippedTrack& r =
+            s.rip.ripTrack(trackNumber, std::filesystem::u8path(outputPath), [&](uint32_t done, uint32_t total) {
                 if (onProgress == nullptr) return;
                 env->CallVoidMethod(listener, onProgress, jint(done), jint(total));
                 if (env->ExceptionCheck()) throw JavaExceptionPending{};
             });
-        writer->close();
-
-        const jint v[5] = {jint(r.sectors), jint(r.unreadableSectors), jint(r.retries), jint(r.paddedSamples),
-                           jint(r.crc32)};
-        jintArray array = env->NewIntArray(5);
-        if (array != nullptr) env->SetIntArrayRegion(array, 0, 5, v);
-        return array;
-    } catch (const Cancelled&) {
+        return toJavaArray(env, std::vector<jint>{jint(r.result.sectors), jint(r.result.unreadableSectors),
+                                                  jint(r.result.retries), jint(r.result.paddedSamples),
+                                                  jint(r.result.crc32), jint(r.accurateRipV1), jint(r.accurateRipV2)});
+    } catch (const cdr::RipCancelled&) {
         throwJava(env, "java/util/concurrent/CancellationException", "rip cancelled");
     } catch (const JavaExceptionPending&) {
         // propagate the listener's exception
@@ -196,6 +423,58 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTr
         throwIo(env, e.what());
     }
     return nullptr;
+}
+
+// Looks the tracks ripped since nativeBeginRip up in the AccurateRip database
+// (httpGet null or !enabled: disabled). Never fails for network problems.
+// Returns [status (0 found, 1 not in database, 2 error, 3 disabled),
+// pressings, accurate tracks, tracks in database, then per ripped track:
+// number, matched versions (bit 0: v1, bit 1: v2), v1 confidence,
+// v2 confidence, total confidence, matching pressings, pressings with an
+// entry for the track]. See nativeAccurateRipError() for the error text.
+JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeCheckAccurateRip(JNIEnv* env, jclass,
+                                                                                            jlong handle,
+                                                                                            jboolean enabled,
+                                                                                            jobject httpGet) {
+    try {
+        JavaHttpClient http(env, httpGet);
+        const bool on = enabled == JNI_TRUE && httpGet != nullptr;
+        const cdr::AccurateRipReport& report = session(handle)->rip.checkAccurateRip(on ? &http : nullptr);
+        using Status = cdr::AccurateRipReport::Status;
+        const jint status = report.status == Status::Found      ? 0
+                            : report.status == Status::NotFound ? 1
+                            : report.status == Status::Error    ? 2
+                                                                : 3;
+        std::vector<jint> v = {status, jint(report.pressings), report.accurateTracks(), report.tracksInDatabase()};
+        for (const cdr::AccurateRipTrackResult& t : report.tracks) {
+            v.push_back(t.track);
+            v.push_back((t.v1Confidence > 0 ? 1 : 0) | (t.v2Confidence > 0 ? 2 : 0));
+            v.push_back(t.v1Confidence);
+            v.push_back(t.v2Confidence);
+            v.push_back(t.totalConfidence);
+            v.push_back(t.matchingPressings());
+            v.push_back(jint(t.pressings.size()));
+        }
+        return toJavaArray(env, v);
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+        return nullptr;
+    }
+}
+
+JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeAccurateRipError(JNIEnv* env, jclass,
+                                                                                          jlong handle) {
+    return toJava(env, session(handle)->rip.accurateRipReport().error);
+}
+
+// rip.log text for the current rip.
+JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipLog(JNIEnv* env, jclass, jlong handle) {
+    try {
+        return toJava(env, session(handle)->rip.ripLog());
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+        return nullptr;
+    }
 }
 
 }  // extern "C"

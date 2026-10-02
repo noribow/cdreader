@@ -8,6 +8,11 @@
     <string name="cancel">キャンセル</string>
     <string name="read_offset">読み取りオフセット (サンプル)</string>
     <string name="verify">2 回読みして比較 (低速)</string>
+    <string name="format">形式</string>
+    <string name="format_flac">FLAC</string>
+    <string name="format_wav">WAV</string>
+    <string name="use_cddb">CDDB で曲名を取得</string>
+    <string name="use_accuraterip">AccurateRip で照合</string>
     <string name="no_drive">USB CD ドライブが見つかりません。OTG ケーブルとドライブの電源を確認してください。</string>
     <string name="no_folder">保存先が未選択です</string>
     <string name="permission_denied">USB へのアクセスが許可されませんでした</string>

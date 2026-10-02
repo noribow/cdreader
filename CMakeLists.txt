@@ -75,9 +75,17 @@ if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
   target_sources(cdreader_usb PRIVATE platform/android/usbdevfs_endpoints.cpp)
 endif()
 
+# The app's ripping workflow (CDDB, WAV / FLAC, AccurateRip, rip.log) without
+# JNI types, so that it is unit tested on the host as well.
+add_library(cdreader_rip_session STATIC platform/android/rip_session.cpp)
+target_include_directories(cdreader_rip_session PUBLIC platform/android)
+target_link_libraries(cdreader_rip_session PUBLIC cdreader_core)
+target_compile_definitions(cdreader_rip_session PRIVATE CDREADER_VERSION="${PROJECT_VERSION}")
+
 if(CDREADER_BUILD_JNI)
   add_library(cdreader_jni SHARED platform/android/jni_bridge.cpp)
-  target_link_libraries(cdreader_jni PRIVATE cdreader_usb)
+  target_link_libraries(cdreader_jni PRIVATE cdreader_rip_session cdreader_usb)
+  target_compile_definitions(cdreader_jni PRIVATE CDREADER_VERSION="${PROJECT_VERSION}")
   if(NOT ANDROID)
     # Host build (Linux), only to check that the bridge compiles.
     find_package(JNI REQUIRED)
@@ -104,6 +112,17 @@ if(CDREADER_BUILD_TESTS)
   target_include_directories(cdreader_usb_tests PRIVATE tests)
   target_link_libraries(cdreader_usb_tests PRIVATE cdreader_usb)
   add_test(NAME cdreader_usb_tests COMMAND cdreader_usb_tests)
+
+  # The Android rip workflow over the BOT fake USB device and canned HTTP.
+  add_executable(cdreader_rip_session_tests
+    tests/fake_drive.cpp
+    tests/fake_usb_device.cpp
+    tests/flac_decoder.cpp
+    tests/rip_session_tests.cpp
+  )
+  target_include_directories(cdreader_rip_session_tests PRIVATE tests)
+  target_link_libraries(cdreader_rip_session_tests PRIVATE cdreader_rip_session cdreader_usb)
+  add_test(NAME cdreader_rip_session_tests COMMAND cdreader_rip_session_tests)
 
   # Round trip through the reference FLAC tool (skipped when `flac` is not installed).
   add_executable(cdreader_flac_roundtrip tests/flac_roundtrip.cpp)
