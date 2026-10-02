@@ -343,6 +343,43 @@ TEST(flac_rip_carries_cddb_tags_and_exact_audio) {
     CHECK_EQ(rig.session.problemTracks(), 0);
 }
 
+#if defined(CDREADER_HAVE_OPUS) || defined(CDREADER_HAVE_VORBIS)
+TEST(lossy_rips_carry_tags_and_log_the_encoder) {
+    std::vector<std::string> formats;
+#ifdef CDREADER_HAVE_OPUS
+    formats.push_back("opus");
+#endif
+#ifdef CDREADER_HAVE_VORBIS
+    formats.push_back("vorbis");
+#endif
+    for (const std::string& format : formats) {
+        Rig rig;
+        FakeHttp http;
+        addCddbAlbum(http);
+        rig.session.lookupCddb(&http, {});
+        rig.session.beginRip(settings(format));
+        TempDir dir;
+        const fs::path path = dir.path / "track";
+        const cdr::RippedTrack& r = rig.session.ripTrack(2, path);
+        const Reference ref = referenceRip(2);
+        CHECK_EQ(r.result.crc32, ref.crc32);  // checksums are of the PCM read, whatever the format
+        CHECK_EQ(r.accurateRipV2, ref.v2);
+        const std::string ext = format == "opus" ? ".opus" : ".ogg";
+        CHECK_STR(r.fileName, "02 - \xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91" + ext);
+        CHECK_STR(r.fileName, rig.session.trackFileName(2, format));
+        const std::vector<uint8_t> file = readFile(path);
+        const std::string text(file.begin(), file.end());
+        CHECK(text.compare(0, 4, "OggS") == 0);
+        CHECK(text.find(format == "opus" ? "OpusHead" : "\x01vorbis") != std::string::npos);
+        CHECK(text.find("TITLE=\xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91") != std::string::npos);
+        CHECK(text.find("ARTIST=Guest") != std::string::npos);
+        CHECK(text.find("TRACKNUMBER=2") != std::string::npos);
+        const std::string log = rig.session.ripLog();
+        CHECK(contains(log, "Format: " + format + "\nEncoder: " + (format == "opus" ? "Opus (libopus" : "Vorbis (")));
+    }
+}
+#endif
+
 TEST(wav_rip_with_read_offset) {
     Rig rig;
     rig.session.beginRip(settings("wav", 6));
@@ -389,6 +426,16 @@ TEST(rip_settings_are_validated) {
     negative.options.maxRetries = -1;
     CHECK(rejects(negative));
     CHECK(!rejects(settings("flac", -100 * 588)));
+    cdr::RipSettings lossless = settings("flac");
+    lossless.encoder.bitrateKbps = 128;
+    CHECK(rejects(lossless));  // no bitrate for lossless formats
+#ifdef CDREADER_HAVE_OPUS
+    cdr::RipSettings opus = settings("opus");
+    opus.encoder.bitrateKbps = 1000;
+    CHECK(rejects(opus));
+    opus.encoder.bitrateKbps = 96;
+    CHECK(!rejects(opus));
+#endif
 
     TempDir dir;
     bool threw = false;

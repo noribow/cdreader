@@ -26,6 +26,7 @@ public:
     FlacWriter& operator=(const FlacWriter&) = delete;
 
     std::string extension() const override { return "flac"; }
+    std::string encoderDescription() const override { return "FLAC (built-in encoder), lossless"; }
 
     // A disc image carries its CUE sheet twice: as the native CUESHEET block
     // (read by libFLAC-based software, `metaflac --export-cuesheet-to`) and as

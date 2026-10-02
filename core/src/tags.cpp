@@ -85,4 +85,31 @@ std::vector<uint8_t> id3v2Tag(const TrackMetadata& m) {
     return tag;
 }
 
+std::vector<uint8_t> vorbisComment(const TrackMetadata& m, const std::string& vendor, const std::string& cueSheet) {
+    std::vector<std::string> fields;
+    auto add = [&](const char* name, const std::string& value) {
+        if (!value.empty()) fields.push_back(std::string(name) + "=" + value);
+    };
+    add("TITLE", m.title);
+    add("ARTIST", m.artist);
+    add("ALBUM", m.album);
+    add("ALBUMARTIST", m.albumArtist);
+    if (m.trackNumber > 0) add("TRACKNUMBER", std::to_string(m.trackNumber));
+    if (m.trackTotal > 0) add("TRACKTOTAL", std::to_string(m.trackTotal));
+    add("DATE", m.year);
+    add("GENRE", m.genre);
+    add("CDDB", m.discId);
+    add("CUESHEET", cueSheet);
+
+    std::vector<uint8_t> v;
+    appendLe32(v, uint32_t(vendor.size()));
+    appendText(v, vendor);
+    appendLe32(v, uint32_t(fields.size()));
+    for (const std::string& f : fields) {
+        appendLe32(v, uint32_t(f.size()));
+        appendText(v, f);
+    }
+    return v;
+}
+
 }  // namespace cdr

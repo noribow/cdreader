@@ -290,10 +290,6 @@ unsigned blockSizeCode(unsigned n) {
     return n <= 256 ? 6 : 7;
 }
 
-void put32le(std::vector<uint8_t>& v, uint32_t x) {
-    for (int i = 0; i < 4; ++i) v.push_back(uint8_t(x >> (8 * i)));
-}
-
 }  // namespace
 
 uint8_t crc8(const uint8_t* data, size_t length) {
@@ -553,33 +549,6 @@ std::vector<uint8_t> FrameEncoder::encode(const int32_t* left, const int32_t* ri
 }
 
 // --- Metadata -----------------------------------------------------------------
-
-std::vector<uint8_t> vorbisComment(const TrackMetadata& m, const std::string& vendor, const std::string& cueSheet) {
-    std::vector<std::string> fields;
-    auto add = [&](const char* name, const std::string& value) {
-        if (!value.empty()) fields.push_back(std::string(name) + "=" + value);
-    };
-    add("TITLE", m.title);
-    add("ARTIST", m.artist);
-    add("ALBUM", m.album);
-    add("ALBUMARTIST", m.albumArtist);
-    if (m.trackNumber > 0) add("TRACKNUMBER", std::to_string(m.trackNumber));
-    if (m.trackTotal > 0) add("TRACKTOTAL", std::to_string(m.trackTotal));
-    add("DATE", m.year);
-    add("GENRE", m.genre);
-    add("CDDB", m.discId);
-    add("CUESHEET", cueSheet);
-
-    std::vector<uint8_t> v;
-    put32le(v, uint32_t(vendor.size()));
-    v.insert(v.end(), vendor.begin(), vendor.end());
-    put32le(v, uint32_t(fields.size()));
-    for (const std::string& f : fields) {
-        put32le(v, uint32_t(f.size()));
-        v.insert(v.end(), f.begin(), f.end());
-    }
-    return v;
-}
 
 namespace {
 

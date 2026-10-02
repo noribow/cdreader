@@ -1,6 +1,6 @@
 # cdreader
 
-音楽 CD (CD-DA) をリッピングして WAV / FLAC ファイルに保存するツールです。
+音楽 CD (CD-DA) をリッピングして WAV / FLAC / Opus / Ogg Vorbis ファイルに保存するツールです。
 対象環境は **Windows** (コマンドライン) と **Android** (USB 接続の外付け CD ドライブ) です。
 
 > **このプロジェクトは [Claude Code](https://claude.com/claude-code) (Anthropic の AI コーディングエージェント) を利用して開発しています。**
@@ -11,6 +11,7 @@
 - SCSI/MMC コマンド (`READ TOC`, `READ CD`) でドライブから直接オーディオセクタを読み取り
 - 44.1 kHz / 16 bit / ステレオの WAV、または可逆圧縮の FLAC で保存 (トラックごとに `NN - 曲名.wav` / `NN - 曲名.flac`、曲名が不明なら `TrackNN.wav`)
 - FLAC エンコーダは外部ライブラリを使わない自前実装 (Android でもそのままビルド可能)。MD5 署名・タグ・シークテーブル付き
+- 非可逆圧縮の **Opus** (Ogg Opus、`.opus`) と **Vorbis** (Ogg Vorbis、`.ogg`) でも保存可能 (libopus / libvorbis を使用。ビットレート・品質を指定可能)
 - `--single-file` で全トラックを 1 ファイルのイメージとして保存
 - WAV へのタグ書き込み (RIFF `LIST`/`INFO` と ID3v2.4 の `id3 ` チャンク、UTF-8)
 - CUE シートの出力 (シングルファイル / トラックごとのどちらでも)
@@ -35,6 +36,9 @@ cdreader rip D: --verify -r 10      2 回読み比較、リトライ 10 回
 cdreader rip D: --offset 6          読み取りオフセット +6 サンプルで補正
 cdreader rip D: --single-file       全トラックを 1 つの WAV と CUE シートに保存
 cdreader rip D: -f flac             FLAC で保存
+cdreader rip D: -f opus             Opus で保存 (VBR 160 kbit/s)
+cdreader rip D: -f opus -b 128      Opus 128 kbit/s で保存
+cdreader rip D: -f vorbis -q 6      Ogg Vorbis 品質 6 で保存
 cdreader rip D: --cddb-match 2      CDDB の候補が複数あるとき 2 番目を使う
 cdreader rip D: --no-cddb           CDDB に問い合わせない (cd_<CDDB ID>\TrackNN.wav)
 cdreader rip D: --no-accuraterip    AccurateRip の照合 (ネットワークアクセス) をしない
@@ -44,7 +48,9 @@ cdreader offset D:                  読み取りオフセットを AccurateRip �
 | オプション | 説明 |
 | --- | --- |
 | `-o, --output <dir>` | 出力先ディレクトリ (既定: `アーティスト - アルバム`。CDDB で見つからなければ `cd_<CDDB ID>`) |
-| `-f, --format <name>` | 出力フォーマット: `wav` / `flac` (既定: `wav`) |
+| `-f, --format <name>` | 出力フォーマット: `wav` / `flac` / `opus` / `vorbis` (既定: `wav`。`opus` / `vorbis` はビルド時に有効にした場合のみ) |
+| `-b, --bitrate <kbps>` | 非可逆フォーマットの目標ビットレート (kbit/s、VBR)。`opus`: 6〜510 (既定 160)、`vorbis`: 45〜500 (平均ビットレート、`--quality` の代わり) |
+| `-q, --quality <q>` | `vorbis` の VBR 品質 (oggenc と同じ -1〜10、小数可。既定 5 ≒ 160 kbit/s)。`opus` には指定できません |
 | `-t, --tracks <list>` | リッピングするトラック (例: `1,3-5`)。既定は全オーディオトラック |
 | `-r, --retries <n>` | 読み取り失敗時のリトライ回数 (既定: 5) |
 | `--verify` | 全ブロックを 2 回読みして比較 (低速) |
@@ -122,6 +128,43 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - MCN (カタログ番号) と ISRC は現状読み取っていないため空です。プリギャップ (`INDEX 00`) も含みません。
 - トラックごとのリッピング (`--single-file` なし) では埋め込みません (1 ファイル 1 トラックのため)。
 
+### 非可逆圧縮 (Opus / Vorbis)
+
+`--format opus` / `--format vorbis` で、非可逆圧縮のファイルを作ります。
+携帯プレーヤーやスマートフォン向けの「聴く用」のファイルを想定しています (保存用には FLAC を推奨)。
+`--bitrate` / `--quality` を `wav` / `flac` に指定するとエラーになります。使ったコーデックと設定は `rip.log` の `Encoder:` 行に記録されます。
+
+| 形式 | ファイル | エンコーダ | 既定 | 指定 |
+| --- | --- | --- | --- | --- |
+| `opus` | `.opus` (Ogg Opus、[RFC 7845](https://www.rfc-editor.org/rfc/rfc7845)) | libopus 1.5.2 | VBR 160 kbit/s | `--bitrate 6〜510` |
+| `vorbis` | `.ogg` (Ogg Vorbis) | libvorbis 1.3.7 | VBR 品質 5 (約 160 kbit/s) | `--quality -1〜10` または `--bitrate 45〜500` |
+
+- **Opus**: Opus は 48 kHz で動作するため、44.1 kHz の CD 音声を `core/` 内の自前のサンプリングレート変換
+  (`resampler`: 160/147 倍のポリフェーズ FIR、カイザー窓付き sinc、通過域 0〜20 kHz、22.05 kHz 以上を 100 dB 以上減衰) で 48 kHz に変換してから
+  20 ms 単位でエンコードします (libopus の `AUDIO` モード、VBR、complexity 10)。
+  外部ライブラリ (speexdsp など) を使わずに済み、周波数特性・エイリアシング・長さをテストで直接検証できるため自前実装にしています。
+  - `OpusHead` には pre-skip (エンコーダの先読み、通常 312 サンプル) と元のサンプリングレート (44100) を書きます。
+    再生ソフトは元のレートに戻すことも、48 kHz のまま再生することもできます。
+  - グラニュール位置は pre-skip を含む 48 kHz のサンプル数で、最後のページ (EOS) には「pre-skip + 変換後の正確な長さ」
+    (= ⌈元のサンプル数 × 48000 / 44100⌉、opusenc と同じ) を書きます。デコーダは最後のパケットの余分な部分を捨てるため、
+    `opusdec` で 48 kHz にデコードすると変換後の長さ、44.1 kHz にデコードすると元のサンプル数ちょうどに戻ります (テストで確認)。
+- **Vorbis**: 44.1 kHz のまま libvorbisenc でエンコードします。`--quality` は oggenc と同じ目盛り (内部では 1/10)、
+  `--bitrate` は `oggenc -b` と同じく、ビットレート管理を使わずに平均がそのビットレートになる VBR です。
+  グラニュール位置と最後のパケット (EOS) は libvorbis が決め、デコード結果は元のサンプル数ちょうどになります。
+- Ogg のページは FLAC と同じくコア内の `OggStreamWriter` で書きます (ヘッダーパケットはそれぞれ専用のページ、音声は新しいページから)。
+- タグは FLAC と同じ Vorbis コメント (`TITLE`, `ARTIST`, `ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`, `TRACKTOTAL`, `DATE`, `GENRE`, `CDDB`) を
+  `OpusTags` / Vorbis のコメントヘッダーに書きます。
+- `--single-file` も使えます (CUE シートの `FILE` の種類は `WAVE`)。CUE シートのファイル内への埋め込みは FLAC のみです。
+
+#### MP3 / AAC に対応しない理由
+
+- **MP3**: 実用的なエンコーダは LAME (LGPL) だけで、本プロジェクト (BSD 2-Clause) の単体実行ファイル・Android アプリに静的リンクすると
+  LGPL の再リンク可能性の要件を満たすのが難しいため、組み込みません。
+- **AAC**: 高品質なフリーのエンコーダは Fraunhofer FDK AAC だけですが、そのライセンスは FSF / OSI のフリーソフトウェアライセンスとして
+  認められておらず (特許の扱いを含む)、再配布に問題があります。FFmpeg 内蔵のエンコーダなどは品質が劣ります。
+- 同程度以上の音質・互換性は Opus (多くの環境で再生可能) や Vorbis で得られます。MP3 / AAC が必要な場合は、FLAC で保存してから
+  外部のエンコーダで変換してください。
+
 ### AccurateRip による照合
 
 リッピングが終わると、AccurateRip データベース (`http://www.accuraterip.com/accuraterip/.../dBAR-<トラック数>-<ID1>-<ID2>-<CDDB ID>.bin`)
@@ -183,7 +226,7 @@ Read offset: +6  (matched v1+v2, confidence 25; use: cdreader rip D: --offset 6)
 
 トラックのメタデータ (タイトル・アーティスト・アルバム・トラック番号・年・ジャンル・CDDB ディスク ID) を WAV に書き込みます。
 タイトルなどは CDDB ([#6](https://github.com/noribow/cdreader/issues/6)) で取得できた場合に入ります (取得できなければトラック番号とディスク ID のみ)。
-FLAC のタグは `VORBIS_COMMENT` に書きます (FLAC 出力の節を参照)。
+FLAC のタグは `VORBIS_COMMENT` に、Opus / Vorbis のタグは同じ形式の Vorbis コメントに書きます (FLAC 出力・非可逆圧縮の節を参照)。
 
 - RIFF `LIST`/`INFO` チャンク: `INAM` タイトル、`IART` アーティスト、`IPRD` アルバム、`ITRK` トラック番号、`ICRD` 年、`IGNR` ジャンル、`ICMT` CDDB ディスク ID。
 - `id3 ` チャンク (ID3v2.4、UTF-8): `TIT2` `TPE1` `TALB` `TPE2` `TRCK` (`番号/総数`) `TDRC` `TCON` `TXXX:DISCID`。
@@ -219,7 +262,7 @@ FLAC のタグは `VORBIS_COMMENT` に書きます (FLAC 出力の節を参照)�
 
 ## 使い方 (Android)
 
-Android 端末に USB の外付け CD/DVD ドライブを接続し、アプリから直接オーディオトラックを読み取って FLAC または WAV で保存します。
+Android 端末に USB の外付け CD/DVD ドライブを接続し、アプリから直接オーディオトラックを読み取って FLAC・WAV・Opus・Vorbis で保存します。
 Windows 版と同じコアを使うため、CDDB による曲名の取得 (タグ・ファイル名)、AccurateRip による照合、`rip.log` も同じ内容です。
 root 化は不要です (Android の USB ホスト API で得たファイルディスクリプタ経由で、USB Mass Storage Bulk-Only Transport の
 SCSI/MMC コマンドを送ります)。
@@ -243,13 +286,13 @@ SCSI/MMC コマンドを送ります)。
    アーティスト・アルバム名・曲名を表示します。候補が複数あるときは一覧の上の選択欄で切り替えられます。
    ディスクを入れ替えたら「TOC を再読込」を押します。
 3. 「保存先フォルダ」で保存先を選びます (Storage Access Framework。選んだフォルダは次回以降も使われます)。
-4. 形式 (FLAC / WAV)、必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値)、「2 回読みして比較」、
+4. 形式 (FLAC (既定) / WAV / Opus / Vorbis。Opus は VBR 160 kbit/s、Vorbis は品質 5 の固定設定)、必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値)、「2 回読みして比較」、
    「AccurateRip で照合」(既定でオン) を設定し、保存するトラックにチェックを付けて「リッピング」を押します。
 5. リッピング後、AccurateRip の結果がトラックごとに表示されます
    (例: `Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2` — 一致したチェックサムの版、v2 / v1 それぞれの一致件数、
    登録件数の合計、一致したプレス数 / そのトラックの登録があるプレス数)。1 トラックも一致しない場合は読み取りオフセットを確認してください。
 
-保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`) と `rip.log` が作られます。
+保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`。Opus は `.opus`、Vorbis は `.ogg`) と `rip.log` が作られます。
 ファイルにはタグ (曲名・アーティスト・アルバム・年・ジャンル・トラック番号・CDDB ID) が書き込まれます。
 `rip.log` には Windows 版と同じく、ドライブ・設定・TOC・CDDB の結果・トラックごとの CRC32 / リトライ回数 / 読めなかったセクタ数・
 AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
@@ -260,7 +303,26 @@ AccurateRip のデータベースは HTTP でしか提供されていないた�
 
 ## ビルド
 
-CMake 3.16 以上と C++17 コンパイラが必要です。
+CMake 3.18 以上と C++17 / C コンパイラが必要です。
+
+### 依存ライブラリ (Opus / Vorbis)
+
+Opus / Vorbis 出力用のライブラリは、CMake の構成時に `FetchContent` で GitHub から取得してビルドし、静的リンクします
+(`cmake/Codecs.cmake`。git とネットワーク接続が必要です)。取得したソースはビルドディレクトリ (`_deps/`) に置かれ、リポジトリには含めません。
+
+| CMake オプション (既定) | ライブラリ | ライセンス | 形式 |
+| --- | --- | --- | --- |
+| `CDREADER_WITH_OPUS` (`ON`) | [xiph/opus](https://github.com/xiph/opus) `v1.5.2` | BSD 3-Clause | `opus` |
+| `CDREADER_WITH_VORBIS` (`ON`) | [xiph/ogg](https://github.com/xiph/ogg) `v1.3.5` + [xiph/vorbis](https://github.com/xiph/vorbis) `v1.3.7` | BSD 3-Clause | `vorbis` |
+
+- オフラインでビルドする場合や不要な場合は `-DCDREADER_WITH_OPUS=OFF -DCDREADER_WITH_VORBIS=OFF` を指定します。
+  その形式は `--help` の一覧に出なくなり、指定するとエラーになります (WAV / FLAC は常に使えます)。
+- libopus はそれ自身の CMake でビルドします (CPU に応じた SIMD 最適化を含む)。libogg / libvorbis は CMake 対応が古いため、
+  `cmake/Codecs.cmake` でソースから直接ライブラリを定義しています。
+- ライブラリのコードには本プロジェクトの警告オプション (`/W4`, `-Wall -Wextra -Wpedantic`) を適用せず、警告も表示しません。
+  GCC / Clang の Debug ビルドでもライブラリは `-O2` でビルドします (テストの高速化のため)。
+- 配布するバイナリ (`cdreader.exe`、Android アプリ) には上記ライブラリが含まれます。BSD 3-Clause の条件に従い、
+  それぞれの著作権表示 (取得したソースの `COPYING`) を添えてください。
 
 ### Visual Studio (MSVC)
 
@@ -275,7 +337,7 @@ ctest --test-dir build -C Release
 ### MinGW-w64 (Linux からのクロスビルドも可)
 
 ```
-cmake -S . -B build-win -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++-posix
+cmake -S . -B build-win -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++-posix -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc-posix
 cmake --build build-win
 ```
 
@@ -294,10 +356,18 @@ FLAC は MD5 / CRC / ビット書き込み / Rice 符号の単体テストと、
 元の PCM と一致することを確認するテスト (`flac_roundtrip`) と、埋め込み CUE シートを `metaflac` で読み出し・再取り込みして確認するテスト (`flac_cuesheet`) も実行されます (無い場合はスキップ)。
 CDDB は偽の `HttpClient` を使い (ネットワークには接続しません)、問い合わせコマンドの生成・応答コード・xmcd エントリの解析・ファイル名の変換を検証します。
 AccurateRip はネットワークに接続せず (偽の `HttpClient` を使用)、実在のディスクの ID・データベース応答と、独立した参照実装で求めたチェックサムで検証します。
+Opus / Vorbis は、ヘッダー (`OpusHead` / `OpusTags`、Vorbis の 3 つのヘッダー) のバイト列とページ構成、
+グラニュール位置 (pre-skip、最後のページでの長さの切り詰め)、EOS フラグを検証し、libopus / libvorbis のデコーダでデコードして
+長さが一致すること・元の信号に近いこと (48 kHz の理論値に対する SNR。前後 1 サンプルずらすと悪化することで位置合わせも確認) を確かめます。
+サンプリングレート変換は 100 Hz〜19.5 kHz の正弦波を 48 kHz の理論値と比べ (SNR 109〜125 dB)、出力の長さ・分割入力での同一性・
+DC ゲイン・阻止域 (折り返し成分 -100 dB 以下) を確認します。
+さらに `opus-tools` / `vorbis-tools` がインストールされていれば (`apt-get install opus-tools vorbis-tools` など)、
+`opusinfo` / `ogginfo` で警告が出ないこと、`opusdec` (48 kHz / 44.1 kHz) / `oggdec` でデコードした長さが入力とちょうど一致し、
+元の信号との SNR が十分であることを確認するテスト (`lossy_decode`) が実行されます。`ffprobe` があればタグ (日本語を含む) が読めることも確認します (無い場合はスキップ)。
 `cdreader_usb_tests` は仮想 USB デバイス (`tests/fake_usb_device.*`) を使って Android 版の USB Bulk-Only Transport
 (CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング) を検証します。
 `cdreader_rip_session_tests` は Android 版のリッピング処理 (`platform/android/rip_session.*`) を仮想 USB デバイスと偽の `HttpClient` で検証します
-(FLAC / WAV 出力とデコード結果の一致、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`)。
+(FLAC / WAV 出力とデコード結果の一致、Opus / Vorbis 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`)。
 
 ### Android アプリ
 
@@ -333,19 +403,22 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   file_naming  メタデータからのファイル名・フォルダ名・アルバム単位のファイル名 (使えない文字の置換)
   accuraterip  AccurateRip ディスク ID・チェックサム v1/v2・データベース応答の解析と照合・オフセット検出
   ripper    リトライ・セクタ分割・verify を含むトラック読み取り
-  audio_writer  出力フォーマットの共通インターフェース (WAV など。コーデック・コンテナはここに追加)
+  audio_writer  出力フォーマットの共通インターフェース (WAV など。コーデック・コンテナはここに追加)、エンコーダ設定
   metadata  アルバム / トラック情報 (タグ付け・ファイル名用)
-  tags      RIFF INFO / ID3v2.4 タグの生成
+  tags      RIFF INFO / ID3v2.4 / Vorbis コメントの生成
   cue_sheet CUE シートの生成
   ogg       Ogg コンテナ (ページ分割・CRC。Ogg Opus / Ogg FLAC 用、コーデック非依存)
   http      オンライン照会用 HTTP インターフェース (実装はプラットフォーム側)
   wav_writer, crc32
   flac_writer, flac_encoder, md5  FLAC エンコーダ (外部ライブラリなし)
+  resampler サンプリングレート変換 (44.1 → 48 kHz、Opus 用)
+  opus_writer, vorbis_writer  Ogg Opus / Ogg Vorbis (libopus / libvorbis、CMake オプションで有効時のみ)
 platform/windows/   SPTI による ScsiTransport 実装、ドライブ列挙、WinHTTP クライアント
 platform/android/   USB Mass Storage Bulk-Only Transport による ScsiTransport 実装 (プロトコル部分は
                     プラットフォーム非依存)、usbdevfs によるエンドポイント I/O、リッピング処理
-                    (rip_session: CDDB・FLAC/WAV・AccurateRip・rip.log。JNI 非依存でテスト可能)、JNI ブリッジ
+                    (rip_session: CDDB・FLAC/WAV/Opus/Vorbis・AccurateRip・rip.log。JNI 非依存でテスト可能)、JNI ブリッジ
 app/cli/            Windows 用コマンドラインツール
+cmake/Codecs.cmake  Opus / Vorbis ライブラリの取得とビルド
 android/            Android アプリ (Kotlin、Gradle)
 tests/              仮想ドライブ・仮想 USB デバイスを使ったユニットテスト
 ```
@@ -368,13 +441,16 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
 - [x] CDDB 対応 (ディスク情報の取得) — [#6](https://github.com/noribow/cdreader/issues/6)
 - [ ] MusicBrainz 対応、CD-TEXT の読み取り (CDDB に無いディスクの情報取得)
 - [x] オーディオコーデック対応: FLAC — [#7](https://github.com/noribow/cdreader/issues/7)
-- [ ] 非可逆コーデック (MP3 / AAC / Opus / Vorbis) — [#13](https://github.com/noribow/cdreader/issues/13)
+- [x] 非可逆コーデック: Opus / Vorbis — [#13](https://github.com/noribow/cdreader/issues/13)
+  (MP3 / AAC はライセンス上の理由で対応しません。非可逆圧縮の節を参照)
+- [ ] Android 版での Opus のビットレート / Vorbis の品質の設定 (現在は既定値固定)
 - [ ] FLAC の圧縮レベル指定 (`--compression` など。現状は `flac -5` 相当の固定設定)
 - [ ] コンテナフォーマット対応・タグ付け — [#8](https://github.com/noribow/cdreader/issues/8)
   - [x] WAV のタグ (INFO / ID3)、シングルファイル + CUE シート、Ogg ページ書き出し (コア)
   - [x] FLAC への CUE シート埋め込み (CUESHEET ブロック + タグ) — [#16](https://github.com/noribow/cdreader/issues/16)
   - [ ] MCN / ISRC の読み取り (CUE シート・FLAC の CUESHEET への記録)
-  - [ ] Ogg Opus (Opus エンコーダ待ち)、Ogg FLAC
+  - [x] Ogg Opus、Ogg Vorbis — [#13](https://github.com/noribow/cdreader/issues/13)
+  - [ ] Ogg FLAC
   - [ ] M4A (AAC / ALAC)、MKA (Matroska)
   - [ ] プリギャップ (`INDEX 00`) と HTOA の検出 (サブチャンネル Q の読み取り)
 - [ ] セキュアモードでのドライブキャッシュ回避 (現状の `--verify` はキャッシュされたデータを再読込する可能性があります)

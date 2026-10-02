@@ -1,7 +1,7 @@
 #pragma once
 
 // Ripping workflow of the Android app, kept free of JNI so that it can be
-// unit tested on any platform: CDDB lookup, per-track ripping to WAV / FLAC
+// unit tested on any platform: CDDB lookup, per-track ripping to WAV / FLAC / Opus / Vorbis
 // with tags and CDDB based file names, AccurateRip checksums and lookup, and
 // the rip.log text. jni_bridge.cpp only converts arguments and results.
 //
@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "cdreader/accuraterip.h"
+#include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
 #include "cdreader/http.h"
@@ -39,6 +40,7 @@ struct CddbSettings {
 // Settings shared by all tracks of one rip (see RipSession::beginRip()).
 struct RipSettings {
     std::string format = "wav";  // a name accepted by createAudioWriter()
+    EncoderSettings encoder;     // lossy formats (default: the format's defaults)
     RipOptions options;
 };
 
