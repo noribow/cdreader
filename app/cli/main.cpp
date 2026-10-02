@@ -9,6 +9,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -202,9 +203,11 @@ void reportAccurateRip(const cdr::Toc& toc, const std::vector<ArTrack>& tracks, 
     }
     const bool found = result.status == cdr::AccurateRipLookup::Status::Found;
 
-    line("AccurateRip (disc id " + id.toString() + ")");
+    line("AccurateRip (disc id " + id.toString() + ")" +
+         (found ? ", " + std::to_string(result.pressings.size()) + " pressing(s) in database" : std::string()));
     int accurate = 0;
     int inDatabase = 0;
+    std::map<std::string, int> byVersion;  // accurate tracks per matched checksum version
     for (const ArTrack& t : tracks) {
         const cdr::AccurateRipTrackResult r =
             cdr::matchAccurateRip(result.pressings, cdr::accurateRipEntryIndex(toc, t.track), t.track.number, t.v1, t.v2);
@@ -212,8 +215,17 @@ void reportAccurateRip(const cdr::Toc& toc, const std::vector<ArTrack>& tracks, 
         std::snprintf(buf, sizeof buf, "Track %02d  v1 %s  v2 %s  ", t.track.number, hex32(t.v1).c_str(),
                       hex32(t.v2).c_str());
         line(buf + (found ? r.describe() : std::string()));
+        // Per pressing: its checksum, how many submissions stand behind it and
+        // which of our checksums (if any) it equals.
+        for (const cdr::AccurateRipPressingMatch& p : r.pressings) {
+            std::snprintf(buf, sizeof buf, "          pressing %d: %s  confidence %3d  %s", p.pressing,
+                          hex32(p.checksum).c_str(), p.confidence,
+                          p.version == 2 ? "v2 match" : p.version == 1 ? "v1 match" : "no match");
+            line(buf);
+        }
         accurate += r.accurate() ? 1 : 0;
         inDatabase += r.inDatabase() ? 1 : 0;
+        if (r.accurate()) ++byVersion[r.matchedVersion()];
     }
 
     if (!lookup) {
@@ -223,8 +235,12 @@ void reportAccurateRip(const cdr::Toc& toc, const std::vector<ArTrack>& tracks, 
     } else if (!found) {
         line("AccurateRip: lookup failed: " + result.error);
     } else {
+        std::string versions;
+        for (const auto& [version, count] : byVersion)
+            versions += (versions.empty() ? "" : ", ") + version + ": " + std::to_string(count);
         line("AccurateRip: " + std::to_string(accurate) + " of " + std::to_string(tracks.size()) +
-             " track(s) accurately ripped (" + std::to_string(result.pressings.size()) + " pressing(s) in database)");
+             " track(s) accurately ripped" + (versions.empty() ? "" : " (" + versions + ")") + ", " +
+             std::to_string(inDatabase) + " track(s) in database");
         if (accurate == 0 && inDatabase > 0)
             line(std::string("Hint: no track matched. Check the read offset (--offset), e.g. with 'cdreader offset ") +
                  letter + ":'.");
@@ -434,10 +450,13 @@ int cmdOffset(const std::vector<std::string>& args) {
                     range, range);
         return 1;
     }
+    std::printf("Matching offsets (submissions whose checksum matches at that offset):\n");
     for (const cdr::AccurateRipOffsetMatch& m : matches)
-        std::printf("  offset %+5d  matches %d submission(s)\n", m.offset, m.confidence);
-    std::printf("\nRead offset: %+d  (use: cdreader rip %c: --offset %d)\n", matches.front().offset, letter,
-                matches.front().offset);
+        std::printf("  offset %+5d  %-5s  v2 %3d  v1 %3d  (%d of %d pressing(s))\n", m.offset,
+                    m.matchedVersion().c_str(), m.v2Confidence, m.v1Confidence, m.pressings, int(lookup.pressings.size()));
+    const cdr::AccurateRipOffsetMatch& best = matches.front();
+    std::printf("\nRead offset: %+d  (matched %s, confidence %d; use: cdreader rip %c: --offset %d)\n", best.offset,
+                best.matchedVersion().c_str(), best.confidence(), letter, best.offset);
     if (matches.size() > 1)
         std::printf("Several offsets match (different pressings); confirm the result with another disc.\n");
     return 0;

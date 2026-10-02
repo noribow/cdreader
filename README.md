@@ -61,18 +61,27 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 を取得し、各トラックのチェックサムを世界中のほかのユーザーのリッピング結果と照合します。結果はコンソールと `rip.log` に出力されます。
 
 ```
-AccurateRip (disc id 011-0010e21a-00b8b1b7-950bd70b)
-Track 01  v1 1A2B3C4D  v2 5E6F7081  Accurately ripped (confidence 12/15, v2)
-Track 02  v1 ...       v2 ...       Not accurate (confidence 0/14)
+AccurateRip (disc id 011-0010e21a-00b8b1b7-950bd70b), 2 pressing(s) in database
+Track 01  v1 1A2B3C4D  v2 5E6F7081  Accurately ripped with v2 (v2 12, v1 0 of 15 submissions; 1 of 2 pressings)
+          pressing 1: 5E6F7081  confidence  12  v2 match
+          pressing 2: 9C8B7A69  confidence   3  no match
+Track 02  v1 ...       v2 ...       Not accurate (v2 0, v1 0 of 14 submissions; 0 of 2 pressings)
+          pressing 1: ...
 Track 03  v1 ...       v2 ...       Not in database
-AccurateRip: 1 of 3 track(s) accurately ripped (2 pressing(s) in database)
+AccurateRip: 1 of 3 track(s) accurately ripped (v2: 1), 2 track(s) in database
 ```
 
 | 表示 | 意味 |
 | --- | --- |
-| `Accurately ripped (confidence N/M, v1/v2)` | データベースのチェックサムと一致。N はこの結果と一致した登録数、M はこのトラックの登録数の合計。一致したチェックサムの種類 (v1 / v2) も表示 |
-| `Not accurate (confidence 0/M)` | 登録はあるが一致しない。読み取りエラー、読み取りオフセットの誤り、別プレス (別の盤) の可能性 |
+| `Accurately ripped with v1 / v2 / v1+v2` | データベースのチェックサムと一致。どの種類のチェックサム (v1 / v2) と一致したかを表示 (別々のプレスがそれぞれ v1・v2 で一致した場合は `v1+v2`) |
+| `v2 N, v1 N of M submissions` | v2 / v1 それぞれで一致した登録数 (confidence) と、このトラックの登録数の合計 M |
+| `X of Y pressings` | データベースにあるプレス (盤の種類) Y 件のうち、一致したプレスの数 X |
+| `pressing n: <チェックサム> confidence <件数> <結果>` | プレスごとの内訳 (参考情報): 登録されているチェックサム、その登録数、`v2 match` / `v1 match` / `no match` |
+| `Not accurate` | 登録はあるが一致しない。読み取りエラー、読み取りオフセットの誤り、別プレス (別の盤) の可能性 |
 | `Not in database` | このトラックの登録がない |
+
+最後の行には、一致したトラック数を v1 / v2 別に表示します。
+AccurateRip v2 は v1 の計算上の弱点 (サンプル値と位置の積の上位 32 ビットを捨てていた) を直したチェックサムで、データベースの登録には v1 / v2 の区別がないため、両方を計算して照合しています。
 
 - ディスクの識別にはオーディオトラックの開始位置とリードアウト位置から計算した AccurateRip ディスク ID を使います。
   CD-Extra (エンハンスド CD) ではデータトラックを除いたオーディオトラックと、ディスク全体 (データセッション込み) のリードアウトを使います (dBpoweramp / EAC と同じ)。
@@ -84,18 +93,24 @@ AccurateRip: 1 of 3 track(s) accurately ripped (2 pressing(s) in database)
 ### 読み取りオフセットの自動検出
 
 `cdreader offset D:` は、AccurateRip に登録されているディスク (よく売れた CD ほど登録が多い) を入れて実行すると、
-1 トラックを前後に広めに読み取り、-3000〜+3000 サンプルの各オフセットでチェックサムを計算してデータベースと照合し、一致したオフセットを表示します。
+1 トラックを前後に広めに読み取り、-3000〜+3000 サンプルの各オフセットで v1 / v2 チェックサムを計算してデータベースと照合し、一致したオフセットを表示します。
 
 ```
 Checking track 3 (confidence 25) at offsets -3000..+3000
-  offset    +6  matches 25 submission(s)
+Matching offsets (submissions whose checksum matches at that offset):
+  offset    +6  v1+v2  v2  18  v1   7  (2 of 3 pressing(s))
+  offset  +667  v2     v2   2  v1   0  (1 of 3 pressing(s))
 
-Read offset: +6  (use: cdreader rip D: --offset 6)
+Read offset: +6  (matched v1+v2, confidence 25; use: cdreader rip D: --offset 6)
 ```
 
 - `-t <n>` で照合に使うトラックを、`--range <n>` で探索範囲を指定できます (既定はデータベースの登録が多い中間のトラック、±3000 サンプル)。
 - 複数のオフセットが一致した場合は別プレスの登録が混在しています。confidence の高いものを採用し、別のディスクでも確認してください。
-- 照合は v1 チェックサムで行います (v2 のみが登録されているディスクでは検出できないことがあります)。
+- v1 / v2 の両方で照合し、オフセットごとに v1 / v2 それぞれの一致数と一致したプレスの数を表示します。
+- v1 は全オフセット分を 1 回のスライド計算で求めます。v2 はサンプル値と位置の積の上位 32 ビットを含むためスライド計算できませんが、
+  2^32 ≡ 1 (mod 2^32 − 1) を使った剰余のスライド計算で一致の可能性がないオフセットを除外し、残った少数のオフセットだけ厳密に計算します
+  (5 分のトラック・±3000 サンプル・3 プレスで約 1 秒)。
+- 検出中は読み取ったトラックをメモリに保持します (1 サンプル 4 バイト、5 分のトラックで約 50 MB)。
 
 ドライブへのアクセスは SCSI パススルー (`IOCTL_SCSI_PASS_THROUGH_DIRECT`) を使います。
 "Access is denied" になる環境では管理者として実行してください。

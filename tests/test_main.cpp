@@ -718,19 +718,34 @@ TEST(accuraterip_matching) {
     CHECK_EQ(r.v1Confidence, 7);
     CHECK_EQ(r.v2Confidence, 0);
     CHECK_EQ(r.totalConfidence, 13);
-    CHECK(r.describe() == "Accurately ripped (confidence 7/13, v1)");
+    CHECK(r.matchedVersion() == "v1");
+    CHECK(r.describe() == "Accurately ripped with v1 (v2 0, v1 7 of 13 submissions; 1 of 2 pressings)");
+    CHECK_EQ(r.pressings.size(), 2u);
+    if (r.pressings.size() == 2) {
+        CHECK_EQ(r.pressings[0].pressing, 1);
+        CHECK_EQ(r.pressings[0].confidence, 7);
+        CHECK_EQ(r.pressings[0].checksum, 655774750u);
+        CHECK_EQ(r.pressings[0].version, 1);
+        CHECK_EQ(r.pressings[1].pressing, 2);
+        CHECK_EQ(r.pressings[1].confidence, 6);
+        CHECK_EQ(r.pressings[1].version, 0);
+    }
 
     r = cdr::matchAccurateRip(p, 0, 1, 1u, 2150913158u);
     CHECK_EQ(r.v2Confidence, 6);
-    CHECK(r.describe() == "Accurately ripped (confidence 6/13, v2)");
+    CHECK(r.matchedVersion() == "v2");
+    CHECK(r.describe() == "Accurately ripped with v2 (v2 6, v1 0 of 13 submissions; 1 of 2 pressings)");
+    CHECK(r.pressings.size() == 2 && r.pressings[1].version == 2 && r.pressings[0].version == 0);
 
     r = cdr::matchAccurateRip(p, 0, 1, 655774750u, 2150913158u);
     CHECK_EQ(r.confidence(), 13);
-    CHECK(r.describe() == "Accurately ripped (confidence 13/13, v1+v2)");
+    CHECK_EQ(r.matchingPressings(), 2);
+    CHECK(r.describe() == "Accurately ripped with v1+v2 (v2 6, v1 7 of 13 submissions; 2 of 2 pressings)");
 
     r = cdr::matchAccurateRip(p, 0, 1, 1u, 2u);
     CHECK(!r.accurate() && r.inDatabase());
-    CHECK(r.describe() == "Not accurate (confidence 0/13)");
+    CHECK(r.matchedVersion().empty());
+    CHECK(r.describe() == "Not accurate (v2 0, v1 0 of 13 submissions; 0 of 2 pressings)");
 
     r = cdr::matchAccurateRip(p, 1, 2, 1u, 2u);  // no entry (e.g. last track of a Mixed Mode CD)
     CHECK(!r.inDatabase());
@@ -825,11 +840,93 @@ TEST(accuraterip_offset_detection) {
     CHECK_EQ(found.size(), 2u);
     if (found.size() == 2) {
         CHECK_EQ(found[0].offset, 48);
-        CHECK_EQ(found[0].confidence, 5);
+        CHECK_EQ(found[0].confidence(), 5);
+        CHECK_EQ(found[0].v1Confidence, 5);
+        CHECK(found[0].matchedVersion() == "v1");
         CHECK_EQ(found[1].offset, -472);
-        CHECK_EQ(found[1].confidence, 2);
+        CHECK_EQ(found[1].confidence(), 2);
     }
     CHECK(cdr::findAccurateRipOffsets(scan, pressings, 0).empty());
+}
+
+// Track checksums ripped separately at `offset` (reference for the scan).
+static cdr::AccurateRipChecksum checksumAtOffset(const cdr::Toc& toc, int number, int offset) {
+    FakeDrive fake = makeAudioDisc();
+    OffsetRip rip = ripWithOffset(fake, number, offset);
+    cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, *toc.findTrack(number));
+    ar.update(rip.bytes.data(), rip.bytes.size());
+    return ar;
+}
+
+TEST(accuraterip_offset_scan_v2_matches_direct_checksums) {
+    const uint32_t maxOffset = 700;
+    for (int number = 1; number <= 3; ++number) {
+        FakeDrive fake = makeAudioDisc();
+        cdr::CdDrive drive(fake);
+        cdr::Toc toc = drive.readToc();
+        const cdr::AccurateRipOffsetScan scan =
+            cdr::scanReadOffsets(drive, toc, *toc.findTrack(number), maxOffset, {});
+        const std::vector<uint32_t> residues = scan.v2Residues();
+        CHECK_EQ(residues.size(), size_t(2 * maxOffset + 1));
+        for (int offset : {-700, -699, -588, -1, 0, 1, 6, 667, 699, 700}) {
+            const uint32_t v2 = checksumAtOffset(toc, number, offset).v2();
+            CHECK_EQ(scan.v2Checksum(offset), v2);
+            // The residue filter must never reject the true checksum.
+            CHECK(scan.mayMatchV2(residues[size_t(offset + int(maxOffset))], v2));
+        }
+    }
+}
+
+TEST(accuraterip_v2_residue_filter_is_exact_and_selective) {
+    // Every offset: the residue equals the exact sum mod 2^32 - 1, the true v2
+    // always passes, and unrelated checksums are almost always rejected.
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    const uint32_t maxOffset = 300;
+    const cdr::AccurateRipOffsetScan scan = cdr::scanReadOffsets(drive, toc, *toc.findTrack(2), maxOffset, {});
+    const std::vector<uint32_t> residues = scan.v2Residues();
+    int falsePositives = 0;
+    for (size_t i = 0; i < residues.size(); ++i) {
+        const int offset = int(i) - int(maxOffset);
+        const uint32_t v2 = scan.v2Checksum(offset);
+        CHECK(scan.mayMatchV2(residues[i], v2));
+        falsePositives += scan.mayMatchV2(residues[i], v2 ^ 0x5A5A5A5Au) ? 1 : 0;
+    }
+    CHECK(falsePositives < 5);
+}
+
+TEST(accuraterip_offset_detection_with_v2) {
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    // Pressing 1 only has v2 rips made at +48, pressing 2 v1 rips at +48,
+    // pressing 3 v2 rips at -472.
+    std::vector<cdr::AccurateRipPressing> pressings(3);
+    for (cdr::AccurateRipPressing& p : pressings) p.tracks.resize(3);
+    pressings[0].tracks[1] = {9, checksumAtOffset(toc, 2, 48).v2(), 0};
+    pressings[1].tracks[1] = {4, checksumAtOffset(toc, 2, 48).v1(), 0};
+    pressings[2].tracks[1] = {3, checksumAtOffset(toc, 2, -472).v2(), 0};
+
+    const cdr::AccurateRipOffsetScan scan = cdr::scanReadOffsets(drive, toc, *toc.findTrack(2), 1000, {});
+    const std::vector<cdr::AccurateRipOffsetMatch> found = cdr::findAccurateRipOffsets(scan, pressings, 1);
+    CHECK_EQ(found.size(), 2u);
+    if (found.size() == 2) {
+        CHECK_EQ(found[0].offset, 48);
+        CHECK_EQ(found[0].v2Confidence, 9);
+        CHECK_EQ(found[0].v1Confidence, 4);
+        CHECK_EQ(found[0].pressings, 2);
+        CHECK(found[0].matchedVersion() == "v1+v2");
+        CHECK_EQ(found[1].offset, -472);
+        CHECK_EQ(found[1].v2Confidence, 3);
+        CHECK_EQ(found[1].v1Confidence, 0);
+        CHECK(found[1].matchedVersion() == "v2");
+    }
+
+    // A disc with v2 entries only (the case v1-only detection missed).
+    pressings.erase(pressings.begin() + 1);
+    const std::vector<cdr::AccurateRipOffsetMatch> v2Only = cdr::findAccurateRipOffsets(scan, pressings, 1);
+    CHECK(!v2Only.empty() && v2Only[0].offset == 48 && v2Only[0].v1Confidence == 0);
 }
 
 int main() {

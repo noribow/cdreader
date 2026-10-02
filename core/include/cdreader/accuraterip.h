@@ -104,6 +104,14 @@ struct AccurateRipLookup {
 // Downloads and parses the database record for `id`. Never throws.
 AccurateRipLookup lookupAccurateRip(HttpClient& http, const AccurateRipDiscId& id);
 
+// How one database record's entry for a track compares with a rip.
+struct AccurateRipPressingMatch {
+    int pressing = 0;        // 1-based record number in the dBAR file
+    uint32_t checksum = 0;   // the record's checksum for the track
+    int confidence = 0;      // submissions behind it
+    int version = 0;         // 2: equals our v2, 1: equals our v1, 0: no match
+};
+
 struct AccurateRipTrackResult {
     int track = 0;
     uint32_t v1 = 0;
@@ -111,13 +119,18 @@ struct AccurateRipTrackResult {
     int v1Confidence = 0;     // submissions whose checksum equals v1
     int v2Confidence = 0;     // submissions whose checksum equals v2
     int totalConfidence = 0;  // all submissions for this track
+    std::vector<AccurateRipPressingMatch> pressings;  // records with an entry for the track
 
     bool inDatabase() const { return totalConfidence > 0; }
     bool accurate() const { return v1Confidence > 0 || v2Confidence > 0; }
     int confidence() const { return v1Confidence + v2Confidence; }
+    int matchingPressings() const;
 
-    // e.g. "Accurately ripped (confidence 12/15, v2)", "Not accurate (0/15)",
-    // "Not in database".
+    // "v1", "v2", "v1+v2", or "" when nothing matched.
+    std::string matchedVersion() const;
+
+    // e.g. "Accurately ripped with v2 (v2 12, v1 0 of 15 submissions; 1 of 2 pressings)",
+    // "Not accurate (v2 0, v1 0 of 15 submissions; 0 of 2 pressings)", "Not in database".
     std::string describe() const;
 };
 
@@ -130,11 +143,18 @@ AccurateRipTrackResult matchAccurateRip(const std::vector<AccurateRipPressing>& 
 size_t accurateRipEntryIndex(const Toc& toc, const Track& track);
 
 // --- Read offset detection --------------------------------------------------
-// Computes the v1 checksum of a track for every read offset in
-// [-maxOffset, +maxOffset] in one pass. Feed it the track read with offset
-// correction -maxOffset and extended by 2 * maxOffset samples (missing data
-// counts as silence). A database entry that matches the checksum for offset
-// X means that "--offset X" reproduces the submitted rips.
+// Checksums of a track for every read offset in [-maxOffset, +maxOffset].
+// Feed it the track read with offset correction -maxOffset and extended by
+// 2 * maxOffset samples (missing data counts as silence). A database entry
+// that matches the v1 or v2 checksum for offset X means that "--offset X"
+// reproduces the submitted rips.
+//
+// v1 is linear in the samples, so all offsets come from one sliding sum.
+// v2 (sum of the low and high halves of each 64-bit product) is not, but
+// because 2^32 == 1 (mod 2^32 - 1) the same sliding sum taken modulo
+// 2^32 - 1 rules out almost every offset; v2 is then computed exactly only
+// for the few offsets that remain (see mayMatchV2()). The scan keeps the
+// samples in memory (4 bytes per sample, about 50 MB for 5 minutes).
 class AccurateRipOffsetScan {
 public:
     AccurateRipOffsetScan(uint32_t trackSamples, bool firstTrack, bool lastTrack, uint32_t maxOffset);
@@ -145,21 +165,27 @@ public:
     // v1 checksums; element i belongs to offset i - maxOffset.
     std::vector<uint32_t> checksums() const;
 
+    // Sum of (sample * position) modulo 2^32 - 1 for every offset (same
+    // indexing): congruent to the full v2 sum before its reduction mod 2^32.
+    std::vector<uint32_t> v2Residues() const;
+
+    // False only if no offset with this residue can have v2 == checksum.
+    bool mayMatchV2(uint32_t residue, uint32_t checksum) const;
+
+    // Exact v2 checksum for one offset (cost: one pass over the track).
+    uint32_t v2Checksum(int offset) const;
+
     uint32_t maxOffset() const { return maxOffset_; }
     uint32_t samplesNeeded() const { return trackSamples_ + 2 * maxOffset_; }
 
 private:
-    void add(uint32_t sample);
+    uint32_t sampleAt(uint64_t index) const { return index < samples_.size() ? samples_[size_t(index)] : 0; }
 
     uint32_t trackSamples_;
     uint32_t maxOffset_;
     uint32_t first_;  // 1-based window of the checksum, as in AccurateRipChecksum
     uint32_t last_;
-    uint64_t index_ = 0;  // samples received
-    uint32_t v1_ = 0;     // checksum and plain sum of the window at offset -maxOffset
-    uint32_t sum_ = 0;
-    std::vector<uint32_t> leaving_;   // samples that leave the window as the offset grows
-    std::vector<uint32_t> entering_;  // samples that enter it
+    std::vector<uint32_t> samples_;  // the stream as received
     uint8_t partial_[4] = {};
     size_t partialBytes_ = 0;
 };
@@ -171,10 +197,15 @@ AccurateRipOffsetScan scanReadOffsets(CdDrive& drive, const Toc& toc, const Trac
 
 struct AccurateRipOffsetMatch {
     int offset = 0;
-    int confidence = 0;  // submissions whose checksum matches at this offset
+    int v1Confidence = 0;  // submissions whose checksum equals v1 at this offset
+    int v2Confidence = 0;  // ... equals v2
+    int pressings = 0;     // database records that match at this offset
+
+    int confidence() const { return v1Confidence + v2Confidence; }
+    std::string matchedVersion() const;  // "v1", "v2" or "v1+v2"
 };
 
-// Offsets whose checksum matches a database entry of the track at
+// Offsets whose v1 or v2 checksum matches a database entry of the track at
 // `entryIndex`, highest confidence first.
 std::vector<AccurateRipOffsetMatch> findAccurateRipOffsets(const AccurateRipOffsetScan& scan,
                                                            const std::vector<AccurateRipPressing>& pressings,

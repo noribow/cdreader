@@ -197,13 +197,24 @@ AccurateRipTrackResult matchAccurateRip(const std::vector<AccurateRipPressing>& 
     r.track = trackNumber;
     r.v1 = v1;
     r.v2 = v2;
-    for (const AccurateRipPressing& p : pressings) {
+    for (size_t i = 0; i < pressings.size(); ++i) {
+        const AccurateRipPressing& p = pressings[i];
         if (entryIndex >= p.tracks.size()) continue;
         const AccurateRipEntry& e = p.tracks[entryIndex];
         if (e.confidence == 0) continue;
+        AccurateRipPressingMatch m;
+        m.pressing = int(i) + 1;
+        m.checksum = e.checksum;
+        m.confidence = e.confidence;
         r.totalConfidence += e.confidence;
-        if (e.checksum == v2) r.v2Confidence += e.confidence;
-        else if (e.checksum == v1) r.v1Confidence += e.confidence;
+        if (e.checksum == v2) {
+            m.version = 2;
+            r.v2Confidence += e.confidence;
+        } else if (e.checksum == v1) {
+            m.version = 1;
+            r.v1Confidence += e.confidence;
+        }
+        r.pressings.push_back(m);
     }
     return r;
 }
@@ -219,47 +230,99 @@ AccurateRipOffsetScan::AccurateRipOffsetScan(uint32_t trackSamples, bool firstTr
     : trackSamples_(trackSamples),
       maxOffset_(maxOffset),
       first_(windowFirst(firstTrack)),
-      last_(windowLast(trackSamples, lastTrack)),
-      leaving_(size_t(2) * maxOffset),
-      entering_(size_t(2) * maxOffset) {}
+      last_(windowLast(trackSamples, lastTrack)) {
+    samples_.reserve(size_t(samplesNeeded()));
+}
 
 AccurateRipOffsetScan AccurateRipOffsetScan::forTrack(const Toc& toc, const Track& track, uint32_t maxOffset) {
     const DiscEdges e = discEdges(toc, track);
     return AccurateRipOffsetScan(track.lengthSectors * kSamplesPerSector, e.first, e.last, maxOffset);
 }
 
-// At offset -maxOffset, track sample k (1-based) is stream sample k - 1; the
-// checksum for that offset is accumulated directly. Each step to the next
-// offset shifts the summed window [first, last] by one stream sample:
-//   v1' = v1 - sum - (first - 1) * leaving + last * entering
-// so only the samples leaving and entering the window need to be kept.
-void AccurateRipOffsetScan::add(uint32_t sample) {
-    const uint64_t i = index_++;
-    const uint64_t k = i + 1;
-    if (k >= first_ && k <= last_) {
-        v1_ += uint32_t(k) * sample;
-        sum_ += sample;
-    }
-    if (i + 1 >= first_ && i + 1 - first_ < leaving_.size()) leaving_[size_t(i + 1 - first_)] = sample;
-    if (i >= last_ && i - last_ < entering_.size()) entering_[size_t(i - last_)] = sample;
+void AccurateRipOffsetScan::update(const uint8_t* pcm, size_t bytes) {
+    forEachSample(partial_, partialBytes_, pcm, bytes, [this](uint32_t sample) {
+        if (samples_.size() < samplesNeeded()) samples_.push_back(sample);
+    });
 }
 
-void AccurateRipOffsetScan::update(const uint8_t* pcm, size_t bytes) {
-    forEachSample(partial_, partialBytes_, pcm, bytes, [this](uint32_t sample) { add(sample); });
+namespace {
+
+constexpr uint64_t kResidueModulus = 0xFFFFFFFFu;  // 2^32 - 1
+
+// Arithmetic for the sliding sums, either wrapping at 2^32 (v1) or modulo
+// 2^32 - 1 (v2 residue).
+struct Mod2_32 {
+    static uint32_t add(uint32_t a, uint32_t b) { return a + b; }
+    static uint32_t sub(uint32_t a, uint32_t b) { return a - b; }
+    static uint32_t mul(uint32_t a, uint32_t b) { return a * b; }
+};
+
+struct ModResidue {
+    static uint32_t add(uint32_t a, uint32_t b) { return uint32_t((uint64_t(a) + b) % kResidueModulus); }
+    static uint32_t sub(uint32_t a, uint32_t b) {
+        return uint32_t((uint64_t(a) + kResidueModulus - b % kResidueModulus) % kResidueModulus);
+    }
+    static uint32_t mul(uint32_t a, uint32_t b) { return uint32_t(uint64_t(a) * b % kResidueModulus); }
+};
+
+}  // namespace
+
+// sum(position * sample) over the window [first, last] for every offset.
+// With e = the stream and X_j / S_j the weighted / plain window sums at
+// offset index j (position k reads stream sample k - 1 + j):
+//   S_{j+1} = S_j - e[first - 1 + j] + e[last + j]
+//   X_{j+1} = X_j - first * e[first - 1 + j] + (last + 1) * e[last + j] - S_{j+1}
+template <typename Ring, typename At>
+static std::vector<uint32_t> slidingSums(uint32_t first, uint32_t last, uint32_t offsets, At at) {
+    std::vector<uint32_t> out(offsets, 0);
+    if (last < first || offsets == 0) return out;  // track too short: nothing is summed
+    uint32_t x = 0;
+    uint32_t sum = 0;
+    for (uint64_t k = first; k <= last; ++k) {
+        x = Ring::add(x, Ring::mul(uint32_t(k), at(k - 1)));
+        sum = Ring::add(sum, at(k - 1));
+    }
+    out[0] = x;
+    for (uint32_t j = 0; j + 1 < offsets; ++j) {
+        const uint32_t leaving = at(uint64_t(first) - 1 + j);
+        const uint32_t entering = at(uint64_t(last) + j);
+        sum = Ring::add(Ring::sub(sum, leaving), entering);
+        x = Ring::sub(Ring::add(Ring::sub(x, Ring::mul(first, leaving)), Ring::mul(last + 1, entering)), sum);
+        out[j + 1] = x;
+    }
+    return out;
 }
 
 std::vector<uint32_t> AccurateRipOffsetScan::checksums() const {
-    std::vector<uint32_t> out(size_t(2) * maxOffset_ + 1, 0);
-    if (last_ < first_) return out;  // track too short: nothing is summed
-    uint32_t v1 = v1_;
-    uint32_t sum = sum_;
-    out[0] = v1;
-    for (size_t j = 0; j < leaving_.size(); ++j) {
-        v1 = v1 - sum - (first_ - 1) * leaving_[j] + last_ * entering_[j];
-        sum = sum - leaving_[j] + entering_[j];
-        out[j + 1] = v1;
+    return slidingSums<Mod2_32>(first_, last_, 2 * maxOffset_ + 1, [this](uint64_t i) { return sampleAt(i); });
+}
+
+std::vector<uint32_t> AccurateRipOffsetScan::v2Residues() const {
+    return slidingSums<ModResidue>(first_, last_, 2 * maxOffset_ + 1,
+                                   [this](uint64_t i) { return uint32_t(sampleAt(i) % kResidueModulus); });
+}
+
+// v2 = T mod 2^32 with T = sum(lo + hi) over the window. T == C + q * 2^32
+// for C = v2, and since 2^32 == 1 (mod 2^32 - 1): residue == C + q. q is
+// bounded because lo < 2^32 and hi = floor(sample * k / 2^32) < k, so a
+// match needs (residue - C) mod (2^32 - 1) <= n + n * last / 2^32.
+bool AccurateRipOffsetScan::mayMatchV2(uint32_t residue, uint32_t checksum) const {
+    if (last_ < first_) return checksum == 0;
+    const uint64_t n = uint64_t(last_) - first_ + 1;
+    const uint64_t bound = n + (n * last_ >> 32) + 1;
+    const uint64_t q = (uint64_t(residue) + kResidueModulus - checksum % kResidueModulus) % kResidueModulus;
+    return q <= bound;
+}
+
+uint32_t AccurateRipOffsetScan::v2Checksum(int offset) const {
+    if (last_ < first_) return 0;
+    const uint64_t shift = uint64_t(int64_t(offset) + maxOffset_);
+    uint32_t v2 = 0;
+    for (uint64_t k = first_; k <= last_; ++k) {
+        const uint64_t product = uint64_t(sampleAt(k - 1 + shift)) * k;
+        v2 += uint32_t(product) + uint32_t(product >> 32);
     }
-    return out;
+    return v2;
 }
 
 // The track is read starting maxOffset samples early and extended by
@@ -281,31 +344,72 @@ AccurateRipOffsetScan scanReadOffsets(CdDrive& drive, const Toc& toc, const Trac
 std::vector<AccurateRipOffsetMatch> findAccurateRipOffsets(const AccurateRipOffsetScan& scan,
                                                            const std::vector<AccurateRipPressing>& pressings,
                                                            size_t entryIndex) {
-    const std::vector<uint32_t> sums = scan.checksums();
+    std::vector<const AccurateRipEntry*> entries;
+    for (const AccurateRipPressing& p : pressings)
+        if (entryIndex < p.tracks.size() && p.tracks[entryIndex].confidence != 0)
+            entries.push_back(&p.tracks[entryIndex]);
     std::vector<AccurateRipOffsetMatch> matches;
-    for (size_t i = 0; i < sums.size(); ++i) {
+    if (entries.empty()) return matches;
+
+    const std::vector<uint32_t> v1 = scan.checksums();
+    const std::vector<uint32_t> residues = scan.v2Residues();
+    for (size_t i = 0; i < v1.size(); ++i) {
         AccurateRipOffsetMatch m;
         m.offset = int(i) - int(scan.maxOffset());
-        for (const AccurateRipPressing& p : pressings) {
-            if (entryIndex >= p.tracks.size()) continue;
-            const AccurateRipEntry& e = p.tracks[entryIndex];
-            if (e.confidence != 0 && e.checksum == sums[i]) m.confidence += e.confidence;
+        bool haveV2 = false;
+        uint32_t v2 = 0;
+        for (const AccurateRipEntry* e : entries) {
+            // As in matchAccurateRip(): an entry equal to both counts as v2.
+            if (scan.mayMatchV2(residues[i], e->checksum)) {
+                if (!haveV2) {
+                    v2 = scan.v2Checksum(m.offset);
+                    haveV2 = true;
+                }
+                if (v2 == e->checksum) {
+                    m.v2Confidence += e->confidence;
+                    ++m.pressings;
+                    continue;
+                }
+            }
+            if (v1[i] == e->checksum) {
+                m.v1Confidence += e->confidence;
+                ++m.pressings;
+            }
         }
-        if (m.confidence > 0) matches.push_back(m);
+        if (m.confidence() > 0) matches.push_back(m);
     }
     std::stable_sort(matches.begin(), matches.end(),
                      [](const AccurateRipOffsetMatch& a, const AccurateRipOffsetMatch& b) {
-                         return a.confidence > b.confidence;
+                         return a.confidence() > b.confidence();
                      });
     return matches;
 }
 
+static std::string versionName(int v1Confidence, int v2Confidence) {
+    if (v1Confidence && v2Confidence) return "v1+v2";
+    if (v2Confidence) return "v2";
+    if (v1Confidence) return "v1";
+    return "";
+}
+
+std::string AccurateRipOffsetMatch::matchedVersion() const { return versionName(v1Confidence, v2Confidence); }
+
+std::string AccurateRipTrackResult::matchedVersion() const { return versionName(v1Confidence, v2Confidence); }
+
+int AccurateRipTrackResult::matchingPressings() const {
+    int n = 0;
+    for (const AccurateRipPressingMatch& p : pressings) n += p.version != 0 ? 1 : 0;
+    return n;
+}
+
 std::string AccurateRipTrackResult::describe() const {
     if (!inDatabase()) return "Not in database";
-    const std::string counts = std::to_string(confidence()) + "/" + std::to_string(totalConfidence);
-    if (!accurate()) return "Not accurate (confidence " + counts + ")";
-    const char* version = v1Confidence && v2Confidence ? "v1+v2" : v2Confidence ? "v2" : "v1";
-    return "Accurately ripped (confidence " + counts + ", " + version + ")";
+    const std::string counts = "v2 " + std::to_string(v2Confidence) + ", v1 " + std::to_string(v1Confidence) +
+                               " of " + std::to_string(totalConfidence) + " submissions; " +
+                               std::to_string(matchingPressings()) + " of " + std::to_string(pressings.size()) +
+                               " pressings";
+    if (!accurate()) return "Not accurate (" + counts + ")";
+    return "Accurately ripped with " + matchedVersion() + " (" + counts + ")";
 }
 
 }  // namespace cdr
