@@ -49,7 +49,8 @@ cdreader offset D:                  読み取りオフセットを AccurateRip �
 | `-r, --retries <n>` | 読み取り失敗時のリトライ回数 (既定: 5) |
 | `--verify` | 全ブロックを 2 回読みして比較 (低速) |
 | `--offset <n>` | 読み取りオフセット補正 (サンプル単位、負の値も可。既定: 0) |
-| `--single-file` | 選択したトラックを 1 つのファイルにつなげて保存 (ディスクイメージ + CUE シート) |
+| `--single-file` | 選択したトラックを 1 つのファイルにつなげて保存 (ディスクイメージ + CUE シート。FLAC ではファイル内にも CUE シートを埋め込み) |
+| `--no-cue-file` | 外部の `.cue` ファイルを書かない |
 | `--no-accuraterip` | リッピング後に AccurateRip データベースを照会しない (チェックサムは `rip.log` に記録されます) |
 
 CDDB のオプション (`rip` と `toc` の両方で使えます):
@@ -107,6 +108,19 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - タグ (`VORBIS_COMMENT`): `TITLE`, `ARTIST`, `ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`, `TRACKTOTAL`, `DATE`, `GENRE`, `CDDB` (ディスク ID)。
   曲名・アーティストなどは CDDB ([#6](https://github.com/noribow/cdreader/issues/6)) で取得できた場合に入ります。
 - `flac -t ファイル名` で CRC と MD5 を検証できます。
+
+#### FLAC への CUE シート埋め込み (internal cue)
+
+`--single-file --format flac` では、外部の `.cue` に加えて CUE シートを FLAC ファイル内に埋め込みます
+(1 つの `.flac` だけで各トラックの位置が分かるので、foobar2000 などでトラックごとに再生・分割できます)。
+
+- **`CUESHEET` メタデータブロック** (FLAC ネイティブ): 各トラックの開始位置 (`INDEX 01`、サンプル単位)、リードアウト (トラック 170)、
+  CD-DA フラグ、リードイン (88200 サンプル = 2 秒)、プリエンファシスフラグ。libFLAC を使うソフトや `metaflac --export-cuesheet-to=- ファイル名` で読めます。
+  リードアウトは実際に書いた音声の長さに合わせて、ファイルを閉じるときに確定します。
+- **`CUESHEET` タグ** (Vorbis コメント): 外部 `.cue` と同じテキスト (BOM なし) で、曲名・アーティストなども含みます。foobar2000 などが読みます。
+- `--no-cue-file` を付けると外部の `.cue` を書きません (埋め込みのみ)。
+- MCN (カタログ番号) と ISRC は現状読み取っていないため空です。プリギャップ (`INDEX 00`) も含みません。
+- トラックごとのリッピング (`--single-file` なし) では埋め込みません (1 ファイル 1 トラックのため)。
 
 ### AccurateRip による照合
 
@@ -236,7 +250,7 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build
 ffprobe / MediaInfo / ExifTool / ogginfo などの外部ツールで確認できます。
 FLAC は MD5 / CRC / ビット書き込み / Rice 符号の単体テストと、テスト用の簡易デコーダ (`tests/flac_decoder.*`) による往復テストに加え、
 公式 `flac` コマンドがインストールされていれば (`apt-get install flac` など)、さまざまな合成信号を `flac -t` で検証・`flac -d` でデコードして
-元の PCM と一致することを確認するテスト (`flac_roundtrip`) も実行されます (無い場合はスキップ)。
+元の PCM と一致することを確認するテスト (`flac_roundtrip`) と、埋め込み CUE シートを `metaflac` で読み出し・再取り込みして確認するテスト (`flac_cuesheet`) も実行されます (無い場合はスキップ)。
 CDDB は偽の `HttpClient` を使い (ネットワークには接続しません)、問い合わせコマンドの生成・応答コード・xmcd エントリの解析・ファイル名の変換を検証します。
 AccurateRip はネットワークに接続せず (偽の `HttpClient` を使用)、実在のディスクの ID・データベース応答と、独立した参照実装で求めたチェックサムで検証します。
 
@@ -280,6 +294,8 @@ Android 版では USB ホスト API 経由の USB Mass Storage (Bulk-Only Transp
 - [ ] FLAC の圧縮レベル指定 (`--compression` など。現状は `flac -5` 相当の固定設定)
 - [ ] コンテナフォーマット対応・タグ付け — [#8](https://github.com/noribow/cdreader/issues/8)
   - [x] WAV のタグ (INFO / ID3)、シングルファイル + CUE シート、Ogg ページ書き出し (コア)
+  - [x] FLAC への CUE シート埋め込み (CUESHEET ブロック + タグ) — [#16](https://github.com/noribow/cdreader/issues/16)
+  - [ ] MCN / ISRC の読み取り (CUE シート・FLAC の CUESHEET への記録)
   - [ ] Ogg Opus (Opus エンコーダ待ち)、Ogg FLAC
   - [ ] M4A (AAC / ALAC)、MKA (Matroska)
   - [ ] プリギャップ (`INDEX 00`) と HTOA の検出 (サブチャンネル Q の読み取り)

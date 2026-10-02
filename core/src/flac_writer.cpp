@@ -22,7 +22,12 @@ constexpr uint32_t kReservedBytes = 8192;
 constexpr uint32_t kMaxSeekPoints = 100;
 constexpr uint64_t kSeekInterval = 10 * kSampleRate;  // a seek point every 10 s
 
-enum BlockType : uint8_t { kStreamInfo = 0, kPadding = 1, kSeekTable = 3, kVorbisComment = 4 };
+enum BlockType : uint8_t { kStreamInfo = 0, kPadding = 1, kSeekTable = 3, kVorbisComment = 4, kCueSheet = 5 };
+
+// The CUESHEET tag holds plain UTF-8 text; the .cue file's BOM does not belong there.
+std::string withoutBom(const std::string& text) {
+    return text.compare(0, 3, "\xEF\xBB\xBF") == 0 ? text.substr(3) : text;
+}
 
 void putBlockHeader(std::vector<uint8_t>& v, BlockType type, bool last, uint32_t length) {
     v.push_back(uint8_t((last ? 0x80 : 0) | type));
@@ -58,10 +63,19 @@ void FlacWriter::open(const std::filesystem::path& path, const TrackMetadata& me
     std::vector<uint8_t> head = {'f', 'L', 'a', 'C'};
     putBlockHeader(head, kStreamInfo, false, 34);
     head.resize(head.size() + 34);  // written in close()
-    const std::vector<uint8_t> tags = flac::vorbisComment(metadata, "cdreader " CDREADER_VERSION);
+    const std::vector<uint8_t> tags =
+        flac::vorbisComment(metadata, "cdreader " CDREADER_VERSION, cue_ ? withoutBom(cue_->text) : std::string());
     if (tags.size() >= (1u << 24)) throw std::runtime_error("FLAC tags too large");
     putBlockHeader(head, kVorbisComment, false, uint32_t(tags.size()));
     head.insert(head.end(), tags.begin(), tags.end());
+    leadOutOffsetPos_ = 0;
+    if (cue_) {
+        const std::vector<uint8_t> sheet =
+            flac::cueSheet(*cue_, uint64_t(cue_->totalSectors) * kSamplesPerSector);
+        putBlockHeader(head, kCueSheet, false, uint32_t(sheet.size()));
+        leadOutOffsetPos_ = head.size() + flac::cueSheetLeadOutOffsetPosition(cue_->tracks.size());
+        head.insert(head.end(), sheet.begin(), sheet.end());
+    }
     reservedOffset_ = head.size();
     putBlockHeader(head, kPadding, true, kReservedBytes - 4);
     head.resize(head.size() + kReservedBytes - 4);
@@ -159,6 +173,12 @@ void FlacWriter::close() {
     writeBytes(info.data(), info.size());
     out_.seekp(std::streamoff(reservedOffset_));
     writeBytes(tail.data(), tail.size());
+    if (leadOutOffsetPos_) {  // the lead-out is where the audio actually ends
+        std::vector<uint8_t> leadOut;
+        putBigEndian(leadOut, totalSamples_, 8);
+        out_.seekp(std::streamoff(leadOutOffsetPos_));
+        writeBytes(leadOut.data(), leadOut.size());
+    }
     out_.close();
     if (out_.fail()) throw std::runtime_error("failed to finalize FLAC file");
 }
