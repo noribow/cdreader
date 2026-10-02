@@ -1,0 +1,296 @@
+// Minimal self-contained test runner (no external dependencies).
+
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iterator>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "cdreader/cd_drive.h"
+#include "cdreader/crc32.h"
+#include "cdreader/ripper.h"
+#include "cdreader/scsi.h"
+#include "cdreader/toc.h"
+#include "cdreader/wav_writer.h"
+#include "fake_drive.h"
+
+namespace {
+
+int failures = 0;
+std::vector<std::pair<const char*, std::function<void()>>>& registry() {
+    static std::vector<std::pair<const char*, std::function<void()>>> r;
+    return r;
+}
+
+struct Register {
+    Register(const char* name, std::function<void()> fn) { registry().emplace_back(name, std::move(fn)); }
+};
+
+#define TEST(name)                                  \
+    static void name();                             \
+    static Register reg_##name(#name, name);        \
+    static void name()
+
+#define CHECK(cond)                                                                   \
+    do {                                                                              \
+        if (!(cond)) {                                                                \
+            std::fprintf(stderr, "  %s:%d: CHECK(%s) failed\n", __FILE__, __LINE__, #cond); \
+            ++failures;                                                               \
+        }                                                                             \
+    } while (0)
+
+#define CHECK_EQ(a, b)                                                                          \
+    do {                                                                                        \
+        auto va = (a);                                                                          \
+        auto vb = (b);                                                                          \
+        if (!(va == vb)) {                                                                      \
+            std::fprintf(stderr, "  %s:%d: CHECK_EQ(%s, %s) failed: %lld != %lld\n", __FILE__, \
+                         __LINE__, #a, #b, (long long)va, (long long)vb);                       \
+            ++failures;                                                                         \
+        }                                                                                       \
+    } while (0)
+
+// Three audio tracks; lead-out at 10 seconds.
+FakeDrive makeAudioDisc() { return FakeDrive({{0, false}, {300, false}, {450, false}}, 750); }
+
+std::vector<uint8_t> expectedTrackData(uint32_t start, uint32_t length) {
+    std::vector<uint8_t> v(size_t(length) * cdr::kSectorBytes);
+    for (uint32_t s = 0; s < length; ++s)
+        for (size_t b = 0; b < cdr::kSectorBytes; ++b)
+            v[size_t(s) * cdr::kSectorBytes + b] = FakeDrive::sampleByte(start + s, b);
+    return v;
+}
+
+struct Collected {
+    std::vector<uint8_t> bytes;
+    cdr::Ripper::SampleSink sink() {
+        return [this](const uint8_t* p, size_t n) { bytes.insert(bytes.end(), p, p + n); };
+    }
+};
+
+}  // namespace
+
+TEST(inquiry_reads_vendor_and_product) {
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    cdr::DriveInfo info = drive.inquiry();
+    CHECK(info.vendor == "FAKE");
+    CHECK(info.product == "CD-ROM DRIVE");
+    CHECK(info.revision == "1.00");
+    CHECK(info.displayName() == "FAKE CD-ROM DRIVE (1.00)");
+}
+
+TEST(toc_parses_track_lengths) {
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    CHECK_EQ(toc.firstTrack, 1);
+    CHECK_EQ(toc.lastTrack, 3);
+    CHECK_EQ(toc.tracks.size(), 3u);
+    CHECK_EQ(toc.leadOutLba, 750u);
+    CHECK_EQ(toc.tracks[0].lengthSectors, 300u);
+    CHECK_EQ(toc.tracks[1].lengthSectors, 150u);
+    CHECK_EQ(toc.tracks[2].lengthSectors, 300u);
+    CHECK_EQ(toc.audioTrackCount(), 3u);
+    CHECK(toc.findTrack(2) != nullptr && toc.findTrack(2)->startLba == 300);
+    CHECK(toc.findTrack(4) == nullptr);
+}
+
+TEST(toc_enhanced_cd_excludes_session_gap) {
+    // Audio tracks followed by a data track in a second session.
+    FakeDrive fake({{0, false}, {20000, false}, {50000, true}}, 60000);
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    CHECK(toc.tracks[1].isAudio);
+    CHECK(!toc.tracks[2].isAudio);
+    CHECK_EQ(toc.tracks[1].lengthSectors, 50000u - 20000u - cdr::kSessionGapSectors);
+    CHECK_EQ(toc.audioTrackCount(), 2u);
+}
+
+TEST(toc_rejects_garbage) {
+    uint8_t tooShort[2] = {0, 0};
+    bool threw = false;
+    try {
+        cdr::Toc::parse(tooShort, sizeof tooShort);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(cddb_id_matches_reference) {
+    // Worked example of the freedb algorithm.
+    cdr::Toc toc;
+    toc.tracks = {{1, 0}, {2, 15000}, {3, 30000}};
+    toc.leadOutLba = 45000;
+    // seconds: 2, 202, 402 -> digit sums 2, 4, 6 = 12; length 600 s
+    CHECK_EQ(toc.cddbId(), (12u << 24) | (600u << 8) | 3u);
+}
+
+TEST(msf_formatting) {
+    CHECK(cdr::formatMsf(0) == "00:00.00");
+    CHECK(cdr::formatMsf(75 * 61 + 3) == "01:01.03");
+}
+
+TEST(sense_parsing_fixed_and_descriptor) {
+    uint8_t fixed[18] = {0x70, 0, 0x03, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0x05};
+    cdr::SenseInfo s = cdr::parseSense(fixed, sizeof fixed);
+    CHECK_EQ(s.key, 0x3);
+    CHECK_EQ(s.asc, 0x11);
+    CHECK_EQ(s.ascq, 0x05);
+    uint8_t desc[8] = {0x72, 0x02, 0x3A, 0x01};
+    s = cdr::parseSense(desc, sizeof desc);
+    CHECK_EQ(s.key, 0x2);
+    CHECK_EQ(s.asc, 0x3A);
+    CHECK_EQ(s.ascq, 0x01);
+}
+
+TEST(crc32_known_vector) {
+    cdr::Crc32 crc;
+    const char* text = "123456789";
+    crc.update(reinterpret_cast<const uint8_t*>(text), 4);
+    crc.update(reinterpret_cast<const uint8_t*>(text) + 4, 5);
+    CHECK_EQ(crc.value(), 0xCBF43926u);
+}
+
+TEST(rip_clean_track_returns_exact_audio) {
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    cdr::Ripper ripper(drive, {});
+    Collected out;
+    uint32_t lastDone = 0, lastTotal = 0;
+    cdr::TrackRipResult r = ripper.ripTrack(*toc.findTrack(2), out.sink(), [&](uint32_t d, uint32_t t) {
+        lastDone = d;
+        lastTotal = t;
+    });
+    CHECK(r.clean());
+    CHECK_EQ(r.retries, 0u);
+    CHECK_EQ(r.sectors, 150u);
+    CHECK_EQ(lastDone, 150u);
+    CHECK_EQ(lastTotal, 150u);
+    const std::vector<uint8_t> expected = expectedTrackData(300, 150);
+    CHECK(out.bytes == expected);
+    cdr::Crc32 crc;
+    crc.update(expected.data(), expected.size());
+    CHECK_EQ(r.crc32, crc.value());
+}
+
+TEST(rip_retries_transient_errors) {
+    FakeDrive fake = makeAudioDisc();
+    fake.failuresBySector[310] = 2;
+    cdr::CdDrive drive(fake);
+    cdr::Ripper ripper(drive, {});
+    Collected out;
+    cdr::TrackRipResult r = ripper.ripTrack(*drive.readToc().findTrack(2), out.sink());
+    CHECK(r.clean());
+    CHECK_EQ(r.retries, 2u);
+    CHECK(out.bytes == expectedTrackData(300, 150));
+}
+
+TEST(rip_isolates_unreadable_sector) {
+    FakeDrive fake = makeAudioDisc();
+    fake.failuresBySector[320] = -1;
+    cdr::CdDrive drive(fake);
+    cdr::Ripper ripper(drive, {2, false});
+    Collected out;
+    cdr::TrackRipResult r = ripper.ripTrack(*drive.readToc().findTrack(2), out.sink());
+    CHECK_EQ(r.unreadableSectors, 1u);
+    CHECK(!r.clean());
+    std::vector<uint8_t> expected = expectedTrackData(300, 150);
+    std::memset(expected.data() + size_t(20) * cdr::kSectorBytes, 0, cdr::kSectorBytes);
+    CHECK_EQ(out.bytes.size(), expected.size());
+    CHECK(out.bytes == expected);  // neighbours of the bad sector are intact
+}
+
+TEST(rip_verify_detects_unstable_data) {
+    FakeDrive fake = makeAudioDisc();
+    fake.unstableSectors[5] = true;
+    cdr::CdDrive drive(fake);
+    cdr::Ripper ripper(drive, {1, true});
+    Collected out;
+    cdr::TrackRipResult r = ripper.ripTrack(*drive.readToc().findTrack(1), out.sink());
+    CHECK_EQ(r.unreadableSectors, 1u);
+    CHECK(r.retries > 0);
+}
+
+TEST(rip_verify_clean_disc_reads_twice) {
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    cdr::Toc toc = drive.readToc();
+    cdr::Ripper ripper(drive, {0, true});
+    Collected out;
+    cdr::TrackRipResult r = ripper.ripTrack(*toc.findTrack(1), out.sink());
+    CHECK(r.clean());
+    const int blocks = int((300 + cdr::kMaxSectorsPerRead - 1) / cdr::kMaxSectorsPerRead);
+    CHECK_EQ(fake.readCommands, 2 * blocks);
+}
+
+TEST(not_ready_without_disc) {
+    FakeDrive fake = makeAudioDisc();
+    fake.discPresent = false;
+    cdr::CdDrive drive(fake);
+    CHECK(!drive.isReady());
+    bool threw = false;
+    try {
+        drive.readToc();
+    } catch (const cdr::ScsiError& e) {
+        threw = true;
+        CHECK_EQ(e.result().sense.asc, 0x3A);
+    }
+    CHECK(threw);
+}
+
+TEST(wav_writer_produces_valid_header) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.wav";
+    const std::vector<uint8_t> pcm = expectedTrackData(0, 2);
+    {
+        cdr::WavWriter wav;
+        wav.open(path);
+        wav.write(pcm.data(), 1000);
+        wav.write(pcm.data() + 1000, pcm.size() - 1000);
+        wav.close();
+        CHECK_EQ(wav.dataBytes(), uint64_t(pcm.size()));
+    }
+    std::ifstream in(path, std::ios::binary);
+    std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    std::filesystem::remove(path);
+
+    auto le32 = [&](size_t o) {
+        return uint32_t(file[o]) | uint32_t(file[o + 1]) << 8 | uint32_t(file[o + 2]) << 16 | uint32_t(file[o + 3]) << 24;
+    };
+    auto le16 = [&](size_t o) { return uint32_t(file[o]) | uint32_t(file[o + 1]) << 8; };
+    CHECK_EQ(file.size(), 44u + pcm.size());
+    CHECK(std::memcmp(file.data(), "RIFF", 4) == 0);
+    CHECK(std::memcmp(file.data() + 8, "WAVEfmt ", 8) == 0);
+    CHECK_EQ(le32(4), uint32_t(36 + pcm.size()));
+    CHECK_EQ(le16(20), 1u);      // PCM
+    CHECK_EQ(le16(22), 2u);      // stereo
+    CHECK_EQ(le32(24), 44100u);  // sample rate
+    CHECK_EQ(le32(28), 176400u); // byte rate
+    CHECK_EQ(le16(32), 4u);      // block align
+    CHECK_EQ(le16(34), 16u);     // bits per sample
+    CHECK(std::memcmp(file.data() + 36, "data", 4) == 0);
+    CHECK_EQ(le32(40), uint32_t(pcm.size()));
+    CHECK(std::equal(pcm.begin(), pcm.end(), file.begin() + 44));
+}
+
+int main() {
+    for (auto& [name, fn] : registry()) {
+        const int before = failures;
+        try {
+            fn();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "  unexpected exception: %s\n", e.what());
+            ++failures;
+        }
+        std::printf("%s %s\n", failures == before ? "[ OK ]" : "[FAIL]", name);
+    }
+    std::printf("\n%s (%zu tests)\n", failures ? "FAILED" : "PASSED", registry().size());
+    return failures ? 1 : 0;
+}
