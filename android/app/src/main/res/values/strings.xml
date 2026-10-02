@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">cdreader</string>
+    <string name="connect">ドライブに接続</string>
+    <string name="reload">TOC を再読込</string>
+    <string name="choose_folder">保存先フォルダ</string>
+    <string name="rip">リッピング</string>
+    <string name="cancel">キャンセル</string>
+    <string name="read_offset">読み取りオフセット (サンプル)</string>
+    <string name="verify">2 回読みして比較 (低速)</string>
+    <string name="no_drive">USB CD ドライブが見つかりません。OTG ケーブルとドライブの電源を確認してください。</string>
+    <string name="no_folder">保存先が未選択です</string>
+    <string name="permission_denied">USB へのアクセスが許可されませんでした</string>
+    <string name="disconnected">ドライブが切断されました</string>
+</resources>
