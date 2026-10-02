@@ -38,7 +38,8 @@ std::vector<uint8_t> audioSampleEntry(const std::string& format, unsigned channe
 // iTunes-style tags as a "udta" box (udta/meta/hdlr "mdir" + ilst): ©nam
 // title, ©ART artist, ©alb album, aART album artist, trkn track number /
 // total, ©day year, ©gen genre, ©too encoder, and freeform
-// "----:com.apple.iTunes:CDDB" with the CDDB disc id. Text is UTF-8; empty
+// "----:com.apple.iTunes:CDDB" with the CDDB disc id, ":ISRC" and
+// ":BARCODE" (the MCN) from the sub-channel. Text is UTF-8; empty
 // fields are omitted.
 std::vector<uint8_t> itunesMetadata(const TrackMetadata& metadata, const std::string& encoder);
 

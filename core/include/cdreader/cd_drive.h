@@ -5,6 +5,7 @@
 #include <string>
 
 #include "cdreader/scsi.h"
+#include "cdreader/subchannel.h"
 #include "cdreader/toc.h"
 
 namespace cdr {
@@ -42,6 +43,18 @@ public:
     // Reads `count` CD-DA sectors (count * kSectorBytes bytes) with READ CD.
     // Does not throw: the caller decides how to retry.
     ScsiResult readAudio(uint32_t lba, uint32_t count, uint8_t* out);
+
+    // READ SUB-CHANNEL (42h) with SubQ = 1: `length` bytes (at most 65535) of
+    // Q sub-channel data in `format` into `out`; `track` selects the track
+    // for the ISRC format (0 otherwise), `msf` the address format of the
+    // current-position format. Does not throw. A response shorter than
+    // requested is not an error here: `transferred` tells the caller.
+    ScsiResult readSubChannel(SubChannelFormat format, int track, uint8_t* out, size_t length, bool msf = false);
+
+    // The media catalog number / the ISRC of an audio track (1..99). Never
+    // throw: the status says why there is no code (see subchannel.h).
+    SubChannelCode readMcn();
+    SubChannelCode readIsrc(int track);
 
 private:
     ScsiTransport& transport_;

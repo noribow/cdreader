@@ -36,7 +36,9 @@ std::string commentVendor(const ogg_packet& packet) {
 
 }  // namespace
 
-struct VorbisWriter::State {
+namespace vorbis {
+
+struct PacketEncoder::State {
     vorbis_info info;
     vorbis_comment comment;
     vorbis_dsp_state dsp;
@@ -57,6 +59,131 @@ struct VorbisWriter::State {
     State(const State&) = delete;
     State& operator=(const State&) = delete;
 };
+
+PacketEncoder::PacketEncoder(double quality, std::optional<int> bitrateKbps)
+    : quality_(quality), bitrateKbps_(bitrateKbps) {}
+
+PacketEncoder::~PacketEncoder() = default;
+
+void PacketEncoder::release() { state_.reset(); }
+
+PacketEncoder::Headers PacketEncoder::start(const TrackMetadata& metadata) {
+    state_ = std::make_unique<State>();
+    vorbis_info* vi = &state_->info;
+    int result;
+    if (bitrateKbps_) {
+        // Like oggenc -b: a nominal bitrate with the bitrate management
+        // engine off, i.e. VBR whose quality is chosen to average the bitrate.
+        result = vorbis_encode_setup_managed(vi, kChannels, kSampleRate, -1, long(*bitrateKbps_) * 1000, -1);
+        if (result == 0) result = vorbis_encode_ctl(vi, OV_ECTL_RATEMANAGE2_SET, nullptr);
+        if (result == 0) result = vorbis_encode_setup_init(vi);
+    } else {
+        result = vorbis_encode_init_vbr(vi, kChannels, kSampleRate, float(quality_ / 10));
+    }
+    if (result != 0) {
+        state_.reset();
+        throw std::runtime_error("cannot set up the Vorbis encoder (error " + std::to_string(result) + ")");
+    }
+    if (vorbis_analysis_init(&state_->dsp, vi) != 0) {
+        state_.reset();
+        throw std::runtime_error("cannot start the Vorbis encoder");
+    }
+    state_->dspReady = true;
+    vorbis_block_init(&state_->dsp, &state_->block);
+    state_->blockReady = true;
+
+    ogg_packet header, comment, codebooks;
+    if (vorbis_analysis_headerout(&state_->dsp, &state_->comment, &header, &comment, &codebooks) != 0) {
+        state_.reset();
+        throw std::runtime_error("cannot create the Vorbis headers");
+    }
+    Headers h;
+    h.identification.assign(header.packet, header.packet + header.bytes);
+    // The comment header with our tags; the vendor string stays libvorbis'.
+    h.comment = {3, 'v', 'o', 'r', 'b', 'i', 's'};
+    const std::vector<uint8_t> body = vorbisComment(metadata, commentVendor(comment));
+    h.comment.insert(h.comment.end(), body.begin(), body.end());
+    h.comment.push_back(1);  // framing bit
+    h.setup.assign(codebooks.packet, codebooks.packet + codebooks.bytes);
+
+    partial_.clear();
+    samples_ = 0;
+    lastGranule_ = 0;
+    lastBlockSize_ = 0;
+    return h;
+}
+
+void PacketEncoder::write(const uint8_t* pcm, size_t bytes, const PacketSink& sink) {
+    if (!state_) throw std::runtime_error("the Vorbis encoder is not started");
+    auto sample = [](const uint8_t* p) { return float(int16_t(uint16_t(p[0] | p[1] << 8))) / 32768.0f; };
+    if (!partial_.empty()) {
+        const size_t used = std::min(bytes, kBytesPerFrame - partial_.size());
+        for (size_t i = 0; i < used; ++i) partial_.push_back(pcm[i]);  // (insert() trips -Wstringop-overflow)
+        pcm += used;
+        bytes -= used;
+        if (partial_.size() < kBytesPerFrame) return;
+        float** buffer = vorbis_analysis_buffer(&state_->dsp, 1);
+        buffer[0][0] = sample(partial_.data());
+        buffer[1][0] = sample(partial_.data() + 2);
+        vorbis_analysis_wrote(&state_->dsp, 1);
+        ++samples_;
+        partial_.clear();
+    }
+    while (bytes >= kBytesPerFrame) {
+        const size_t frames = std::min(bytes / kBytesPerFrame, kChunkFrames);
+        float** buffer = vorbis_analysis_buffer(&state_->dsp, int(frames));
+        for (size_t i = 0; i < frames; ++i) {
+            buffer[0][i] = sample(pcm + i * kBytesPerFrame);
+            buffer[1][i] = sample(pcm + i * kBytesPerFrame + 2);
+        }
+        vorbis_analysis_wrote(&state_->dsp, int(frames));
+        samples_ += frames;
+        pcm += frames * kBytesPerFrame;
+        bytes -= frames * kBytesPerFrame;
+        drain(sink);
+    }
+    partial_.assign(pcm, pcm + bytes);
+}
+
+// Emits the packets libvorbis has ready; the last one carries e_o_s.
+void PacketEncoder::drain(const PacketSink& sink) {
+    ogg_packet packet;
+    while (vorbis_analysis_blockout(&state_->dsp, &state_->block) == 1) {
+        if (vorbis_analysis(&state_->block, nullptr) != 0 || vorbis_bitrate_addblock(&state_->block) != 0)
+            throw std::runtime_error("Vorbis encoder error");
+        while (vorbis_bitrate_flushpacket(&state_->dsp, &packet) == 1) {
+            // A decoder returns nothing for the first packet, then a quarter
+            // of the previous plus a quarter of the current block size.
+            const long blockSize = vorbis_packet_blocksize(&state_->info, &packet);
+            if (blockSize <= 0) throw std::runtime_error("Vorbis encoder produced an invalid packet");
+            Packet p;
+            p.data = packet.packet;
+            p.size = size_t(packet.bytes);
+            p.granule = packet.granulepos;
+            p.last = packet.e_o_s != 0;
+            p.start = lastGranule_;
+            p.naturalEnd = p.start + (lastBlockSize_ ? uint64_t(lastBlockSize_ / 4 + blockSize / 4) : 0);
+            lastBlockSize_ = blockSize;
+            if (packet.granulepos > 0) lastGranule_ = uint64_t(packet.granulepos);
+            sink(p);
+        }
+    }
+}
+
+void PacketEncoder::finish(const PacketSink& sink) {
+    if (!state_) throw std::runtime_error("the Vorbis encoder is not started");
+    try {
+        if (!partial_.empty()) throw std::runtime_error("Vorbis input ends in the middle of a sample");
+        vorbis_analysis_wrote(&state_->dsp, 0);  // end of input
+        drain(sink);
+    } catch (...) {
+        state_.reset();
+        throw;
+    }
+    state_.reset();
+}
+
+}  // namespace vorbis
 
 VorbisWriter::VorbisWriter(std::optional<double> quality, std::optional<int> bitrateKbps)
     : bitrateKbps_(bitrateKbps) {
@@ -91,48 +218,14 @@ std::string VorbisWriter::encoderDescription() const {
 }
 
 void VorbisWriter::open(const std::filesystem::path& path, const TrackMetadata& metadata) {
-    state_ = std::make_unique<State>();
-    vorbis_info* vi = &state_->info;
-    int result;
-    if (bitrateKbps_) {
-        // Like oggenc -b: a nominal bitrate with the bitrate management
-        // engine off, i.e. VBR whose quality is chosen to average the bitrate.
-        result = vorbis_encode_setup_managed(vi, kChannels, kSampleRate, -1, long(*bitrateKbps_) * 1000, -1);
-        if (result == 0) result = vorbis_encode_ctl(vi, OV_ECTL_RATEMANAGE2_SET, nullptr);
-        if (result == 0) result = vorbis_encode_setup_init(vi);
-    } else {
-        result = vorbis_encode_init_vbr(vi, kChannels, kSampleRate, float(quality_ / 10));
-    }
-    if (result != 0) {
-        state_.reset();
-        throw std::runtime_error("cannot set up the Vorbis encoder (error " + std::to_string(result) + ")");
-    }
-    if (vorbis_analysis_init(&state_->dsp, vi) != 0) {
-        state_.reset();
-        throw std::runtime_error("cannot start the Vorbis encoder");
-    }
-    state_->dspReady = true;
-    vorbis_block_init(&state_->dsp, &state_->block);
-    state_->blockReady = true;
-
-    ogg_packet header, comment, codebooks;
-    if (vorbis_analysis_headerout(&state_->dsp, &state_->comment, &header, &comment, &codebooks) != 0) {
-        state_.reset();
-        throw std::runtime_error("cannot create the Vorbis headers");
-    }
-    // The comment header with our tags; the vendor string stays libvorbis'.
-    std::vector<uint8_t> tags = {3, 'v', 'o', 'r', 'b', 'i', 's'};
-    const std::vector<uint8_t> body = vorbisComment(metadata, commentVendor(comment));
-    tags.insert(tags.end(), body.begin(), body.end());
-    tags.push_back(1);  // framing bit
+    encoder_ = std::make_unique<vorbis::PacketEncoder>(quality_, bitrateKbps_);
+    const vorbis::PacketEncoder::Headers headers = encoder_->start(metadata);
 
     out_.open(path, std::ios::binary | std::ios::trunc);
     if (!out_) {
-        state_.reset();
+        encoder_.reset();
         throw std::runtime_error("cannot create " + path.u8string());
     }
-    partial_.clear();
-    samples_ = 0;
     uint32_t serial = 0x56524231u;  // "VRB1"
     for (char c : metadata.title + metadata.album) serial = serial * 31 + uint8_t(c);
     serial ^= uint32_t(metadata.trackNumber) << 24;
@@ -140,54 +233,20 @@ void VorbisWriter::open(const std::filesystem::path& path, const TrackMetadata& 
 
     // The identification header alone on the first page; the comment and
     // setup headers follow, and the audio starts on a fresh page.
-    ogg_->writePacket(header.packet, size_t(header.bytes), 0);
+    ogg_->writePacket(headers.identification, 0);
     ogg_->flush();
-    ogg_->writePacket(tags, 0);
-    ogg_->writePacket(codebooks.packet, size_t(codebooks.bytes), 0);
+    ogg_->writePacket(headers.comment, 0);
+    ogg_->writePacket(headers.setup, 0);
     ogg_->flush();
 }
 
 void VorbisWriter::write(const uint8_t* pcm, size_t bytes) {
-    if (!out_.is_open() || !state_) throw std::runtime_error("Vorbis file is not open");
-    auto sample = [](const uint8_t* p) { return float(int16_t(uint16_t(p[0] | p[1] << 8))) / 32768.0f; };
-    if (!partial_.empty()) {
-        const size_t used = std::min(bytes, kBytesPerFrame - partial_.size());
-        partial_.insert(partial_.end(), pcm, pcm + used);
-        pcm += used;
-        bytes -= used;
-        if (partial_.size() < kBytesPerFrame) return;
-        float** buffer = vorbis_analysis_buffer(&state_->dsp, 1);
-        buffer[0][0] = sample(partial_.data());
-        buffer[1][0] = sample(partial_.data() + 2);
-        vorbis_analysis_wrote(&state_->dsp, 1);
-        ++samples_;
-        partial_.clear();
-    }
-    while (bytes >= kBytesPerFrame) {
-        const size_t frames = std::min(bytes / kBytesPerFrame, kChunkFrames);
-        float** buffer = vorbis_analysis_buffer(&state_->dsp, int(frames));
-        for (size_t i = 0; i < frames; ++i) {
-            buffer[0][i] = sample(pcm + i * kBytesPerFrame);
-            buffer[1][i] = sample(pcm + i * kBytesPerFrame + 2);
-        }
-        vorbis_analysis_wrote(&state_->dsp, int(frames));
-        samples_ += frames;
-        pcm += frames * kBytesPerFrame;
-        bytes -= frames * kBytesPerFrame;
-        drain();
-    }
-    partial_.assign(pcm, pcm + bytes);
+    if (!out_.is_open() || !encoder_ || !encoder_->started()) throw std::runtime_error("Vorbis file is not open");
+    encoder_->write(pcm, bytes, [this](const vorbis::PacketEncoder::Packet& p) { writePacket(p); });
 }
 
-// Writes the packets libvorbis has ready; the last one carries e_o_s.
-void VorbisWriter::drain() {
-    ogg_packet packet;
-    while (vorbis_analysis_blockout(&state_->dsp, &state_->block) == 1) {
-        if (vorbis_analysis(&state_->block, nullptr) != 0 || vorbis_bitrate_addblock(&state_->block) != 0)
-            throw std::runtime_error("Vorbis encoder error");
-        while (vorbis_bitrate_flushpacket(&state_->dsp, &packet) == 1)
-            ogg_->writePacket(packet.packet, size_t(packet.bytes), packet.granulepos, packet.e_o_s != 0);
-    }
+void VorbisWriter::writePacket(const vorbis::PacketEncoder::Packet& p) {
+    ogg_->writePacket(p.data, p.size, p.granule, p.last);
 }
 
 void VorbisWriter::writeBytes(const uint8_t* data, size_t size) {
@@ -198,16 +257,12 @@ void VorbisWriter::writeBytes(const uint8_t* data, size_t size) {
 void VorbisWriter::close() {
     if (!out_.is_open()) return;
     try {
-        if (!partial_.empty()) throw std::runtime_error("Vorbis input ends in the middle of a sample");
-        vorbis_analysis_wrote(&state_->dsp, 0);  // end of input
-        drain();
+        encoder_->finish([this](const vorbis::PacketEncoder::Packet& p) { writePacket(p); });
         if (!ogg_->finished()) throw std::runtime_error("Vorbis encoder did not end the stream");
     } catch (...) {
         out_.close();
-        state_.reset();
         throw;
     }
-    state_.reset();
     out_.close();
     if (out_.fail()) throw std::runtime_error("failed to finalize Vorbis file");
 }

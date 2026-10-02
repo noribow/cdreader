@@ -344,6 +344,74 @@ TEST(flac_rip_carries_cddb_tags_and_exact_audio) {
     CHECK_EQ(rig.session.problemTracks(), 0);
 }
 
+// Packets of an Ogg FLAC file put back together as a native FLAC stream:
+// "fLaC" + the metadata blocks (the first packet's from offset 13) + the frames.
+std::vector<uint8_t> oggFlacAsNative(const std::vector<uint8_t>& ogg) {
+    std::vector<std::vector<uint8_t>> packets(1);
+    for (size_t pos = 0; pos + 27 <= ogg.size();) {
+        if (std::memcmp(&ogg[pos], "OggS", 4) != 0) throw std::runtime_error("bad Ogg page");
+        const size_t segments = ogg[pos + 26];
+        size_t body = pos + 27 + segments;
+        for (size_t i = 0; i < segments; ++i) {
+            const size_t length = ogg[pos + 27 + i];
+            packets.back().insert(packets.back().end(), ogg.begin() + long(body), ogg.begin() + long(body + length));
+            body += length;
+            if (length < 255) packets.emplace_back();
+        }
+        pos = body;
+    }
+    packets.pop_back();
+    if (packets.empty() || packets[0].size() != 51 || packets[0][0] != 0x7F) throw std::runtime_error("not Ogg FLAC");
+    std::vector<uint8_t> native(packets[0].begin() + 9, packets[0].end());
+    for (size_t i = 1; i < packets.size(); ++i) native.insert(native.end(), packets[i].begin(), packets[i].end());
+    return native;
+}
+
+TEST(oggflac_rip_carries_tags_and_exact_audio) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    rig.session.beginRip(settings("oggflac"));
+    TempDir dir;
+    const fs::path path = dir.path / "track";
+    const cdr::RippedTrack& r = rig.session.ripTrack(2, path);
+    const Reference ref = referenceRip(2);
+    CHECK_EQ(r.result.crc32, ref.crc32);
+    CHECK_EQ(r.accurateRipV2, ref.v2);
+    CHECK_STR(r.fileName, "02 - \xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91.oga");
+    CHECK_STR(r.fileName, rig.session.trackFileName(2, "oggflac"));
+    // STREAMINFO is patched at close (the first page rewritten): the total is right.
+    const DecodedFlac d = decodeFlac(oggFlacAsNative(readFile(path)));
+    CHECK_EQ(d.totalSamples, uint64_t(ref.pcm.size() / 4));
+    CHECK(d.pcm == ref.pcm);
+    CHECK(hasComment(d, "TITLE=\xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91"));
+    CHECK(hasComment(d, "ARTIST=Guest"));
+    CHECK(hasComment(d, "TRACKNUMBER=2"));
+    CHECK(contains(rig.session.ripLog(), "Format: oggflac\nEncoder: Ogg FLAC (built-in encoder), lossless"));
+}
+
+TEST(mka_rip_writes_matroska_with_tags) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    rig.session.beginRip(settings("mka"));
+    TempDir dir;
+    const fs::path path = dir.path / "track1.mka";
+    const cdr::RippedTrack& r = rig.session.ripTrack(1, path);
+    CHECK(r.result.clean());
+    CHECK_STR(r.fileName, "01 - Opening.mka");
+    const std::vector<uint8_t> bytes = readFile(path);
+    const std::string text(bytes.begin(), bytes.end());
+    CHECK(text.compare(0, 4, "\x1A\x45\xDF\xA3") == 0);  // EBML header
+    CHECK(contains(text, "matroska"));
+    CHECK(contains(text, "A_FLAC"));
+    CHECK(contains(text, "Album: Live"));
+    CHECK(contains(text, "Opening"));
+    CHECK(contains(rig.session.ripLog(), "Format: mka\nEncoder: FLAC (built-in encoder) in Matroska"));
+}
+
 TEST(alac_rip_carries_cddb_tags_and_exact_audio) {
     Rig rig;
     FakeHttp http;
@@ -622,6 +690,66 @@ TEST(disabled_lookups_send_no_requests) {
     CHECK(contains(log, "CDDB lookup: disabled"));
     CHECK(contains(log, "AccurateRip: lookup disabled"));
     CHECK(contains(log, "Track03.wav  CRC32 "));
+}
+
+TEST(mcn_and_isrc_in_tags_and_log) {
+    Rig rig;
+    rig.fake.mcn = "4988001234567";
+    rig.fake.isrcs[1] = "JPVI09912345";
+    rig.fake.isrcs[3] = "JPVI09912347";
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    CHECK_EQ(rig.fake.subChannelCommands, 0);  // read when the rip starts, not with the TOC
+    rig.session.beginRip(settings("flac"));
+    CHECK_EQ(rig.fake.subChannelCommands, 4);  // MCN + 3 ISRCs, through the BOT
+    CHECK_STR(rig.session.album().mcn, "4988001234567");
+    CHECK_STR(rig.session.trackMetadata(1).isrc, "JPVI09912345");
+    CHECK_STR(rig.session.trackMetadata(2).isrc, "");
+    // A second rip of the same disc does not read them again; a new CDDB
+    // lookup keeps them.
+    rig.session.beginRip(settings("flac"));
+    rig.session.lookupCddb(&http, {});
+    CHECK_EQ(rig.fake.subChannelCommands, 4);
+    CHECK_STR(rig.session.trackMetadata(3).isrc, "JPVI09912347");
+    CHECK_STR(rig.session.album().title, "Album: Live");
+
+    TempDir dir;
+    rig.session.ripTrack(1, dir.path / "1.flac");
+    const DecodedFlac d = decodeFlac(readFile(dir.path / "1.flac"));
+    CHECK(hasComment(d, "ISRC=JPVI09912345"));
+    CHECK(hasComment(d, "BARCODE=4988001234567"));
+    CHECK(hasComment(d, "TITLE=Opening"));
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "MCN: 4988001234567\n"));
+    CHECK(contains(log, "Track  1  ISRC: JPVI09912345\n"));
+    CHECK(contains(log, "Track  2  ISRC: not present\n"));
+
+    // Reading the TOC again (another disc) forgets them.
+    rig.session.readToc();
+    CHECK_STR(rig.session.album().mcn, "");
+    CHECK(contains(rig.session.ripLog(), "MCN / ISRC: not read (disabled)"));
+}
+
+TEST(mcn_and_isrc_disabled_or_unsupported) {
+    Rig rig;
+    rig.fake.mcn = "4988001234567";
+    cdr::RipSettings off = settings("wav");
+    off.readDiscCodes = false;
+    rig.session.beginRip(off);
+    CHECK_EQ(rig.fake.subChannelCommands, 0);
+    CHECK_STR(rig.session.album().mcn, "");
+
+    // A drive that rejects READ SUB-CHANNEL: the rip goes on without codes.
+    Rig old;
+    old.fake.subChannelSupported = false;
+    old.session.beginRip(settings("wav"));
+    CHECK_EQ(old.fake.subChannelCommands, 1);
+    TempDir dir;
+    CHECK(old.session.ripTrack(2, dir.path / "2.wav").result.clean());
+    const std::string log = old.session.ripLog();
+    CHECK(contains(log, "MCN: not supported by the drive\n"));
+    CHECK(contains(log, "Track  2  ISRC: not read (command not supported)\n"));
 }
 
 TEST(cancel_stops_the_rip) {

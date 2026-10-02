@@ -243,7 +243,7 @@ private:
 
 extern "C" {
 
-// Output formats built into the library, comma separated ("wav,flac,alac,opus,vorbis").
+// Output formats built into the library, comma separated ("wav,flac,oggflac,alac,opus,vorbis,mka,...").
 JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeFormats(JNIEnv* env, jclass) {
     std::string list;
     for (const std::string& f : cdr::audioFormats()) list += (list.empty() ? "" : ",") + f;
@@ -363,7 +363,7 @@ JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeAlbumFo
     }
 }
 
-// File name of a track for `format` ("wav" / "flac" / "opus" / "vorbis"), from the CDDB metadata.
+// File name of a track for `format` ("wav" / "flac" / "oggflac" / "opus" / "vorbis" / "mka"), from the CDDB metadata.
 JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTrackFileName(JNIEnv* env, jclass,
                                                                                        jlong handle, jint track,
                                                                                        jstring format) {

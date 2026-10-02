@@ -78,6 +78,8 @@ cdr::TrackMetadata metadata() {
     m.year = "1999";
     m.genre = "Rock";
     m.discId = "0A0B0C03";
+    m.isrc = "JPVI09912345";
+    m.mcn = "4988001234567";
     return m;
 }
 
@@ -124,7 +126,8 @@ struct Checker {
         // FFmpeg reports ALBUMARTIST as album_artist and TRACKNUMBER as track.
         const std::map<std::string, std::string> want = {
             {"title", m.title}, {"artist", m.artist}, {"album", m.album}, {"album_artist", m.albumArtist},
-            {"track", "3"}, {"tracktotal", "12"}, {"date", "1999"}, {"genre", "rock"}, {"cddb", "0a0b0c03"}};
+            {"track", "3"}, {"tracktotal", "12"}, {"date", "1999"}, {"genre", "rock"}, {"cddb", "0a0b0c03"},
+            {"isrc", "jpvi09912345"}, {"barcode", "4988001234567"}};
         bool ok = status == 0;
         for (const auto& [key, value] : want) {
             const bool found = text.find("tag:" + key + "=" + lower(value) + "\n") != std::string::npos;

@@ -37,7 +37,7 @@ import java.util.concurrent.Executors
 
 /**
  * Single screen: connect to a USB CD drive, show its TOC (with titles from
- * CDDB), rip the selected tracks to FLAC, WAV, Opus or Vorbis files in a folder chosen with
+ * CDDB), rip the selected tracks to FLAC, Ogg FLAC, WAV, Opus or Vorbis files in a folder chosen with
  * the Storage Access Framework and check them against AccurateRip.
  * USB I/O, network lookups and ripping run on one worker thread ([worker]);
  * the native session is only touched from there (except cancel()).
@@ -78,9 +78,11 @@ class MainActivity : Activity() {
     private lateinit var checkAccurateRip: CheckBox
     private lateinit var groupFormat: RadioGroup
     private lateinit var radioFlac: RadioButton
+    private lateinit var radioOggFlac: RadioButton
     private lateinit var radioWav: RadioButton
     private lateinit var radioOpus: RadioButton
     private lateinit var radioVorbis: RadioButton
+    private lateinit var radioMka: RadioButton
     private lateinit var radioAlac: RadioButton
     private lateinit var progress: ProgressBar
 
@@ -141,9 +143,11 @@ class MainActivity : Activity() {
         checkAccurateRip = findViewById(R.id.checkAccurateRip)
         groupFormat = findViewById(R.id.groupFormat)
         radioFlac = findViewById(R.id.radioFlac)
+        radioOggFlac = findViewById(R.id.radioOggFlac)
         radioWav = findViewById(R.id.radioWav)
         radioOpus = findViewById(R.id.radioOpus)
         radioVorbis = findViewById(R.id.radioVorbis)
+        radioMka = findViewById(R.id.radioMka)
         radioAlac = findViewById(R.id.radioAlac)
         progress = findViewById(R.id.progress)
         textResults.movementMethod = ScrollingMovementMethod()
@@ -457,7 +461,8 @@ class MainActivity : Activity() {
 
     private fun formatButtons(): List<Pair<String, RadioButton>> =
         listOf(
-            "flac" to radioFlac, "alac" to radioAlac, "wav" to radioWav, "opus" to radioOpus, "vorbis" to radioVorbis
+            "flac" to radioFlac, "oggflac" to radioOggFlac, "alac" to radioAlac, "wav" to radioWav, "opus" to radioOpus,
+            "vorbis" to radioVorbis, "mka" to radioMka
         )
 
     private fun selectedFormat(): String = formatButtons().firstOrNull { it.second.isChecked }?.first ?: "flac"
@@ -468,8 +473,9 @@ class MainActivity : Activity() {
     private fun mimeType(format: String): String = when (format) {
         "flac" -> "audio/flac"
         "alac" -> "audio/mp4"  // .m4a
-        "vorbis" -> "audio/ogg"
+        "vorbis", "oggflac" -> "audio/ogg"
         "opus" -> "application/octet-stream"
+        "mka" -> "audio/x-matroska"
         else -> "audio/x-wav"
     }
 
@@ -510,8 +516,8 @@ class MainActivity : Activity() {
         DocumentsContract.createDocument(contentResolver, parent, mimeType, name)
             ?: throw IOException("$name を作成できませんでした")
 
-    // WAV and FLAC headers are patched at the end (and the Ogg pages are
-    // simply written in one go), so the file is written
+    // WAV, FLAC and Ogg FLAC headers are patched at the end (and the other
+    // Ogg pages are simply written in one go), so the file is written
     // locally and then streamed through the document's ParcelFileDescriptor
     // (providers may hand out non-seekable pipes).
     private fun copyToDocument(source: File, document: Uri) {

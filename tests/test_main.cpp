@@ -32,9 +32,11 @@
 #include "cdreader/metadata.h"
 #include "cdreader/mp4.h"
 #include "cdreader/ogg.h"
+#include "cdreader/ogg_flac_writer.h"
 #include "cdreader/resampler.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
+#include "cdreader/subchannel.h"
 #include "cdreader/tags.h"
 #include "cdreader/toc.h"
 #include "cdreader/wav_writer.h"
@@ -425,7 +427,8 @@ TEST(audio_writer_factory) {
     CHECK(std::find(formats.begin(), formats.end(), "wav") != formats.end());
     for (const std::string& f : formats) {
         std::unique_ptr<cdr::AudioWriter> w = cdr::createAudioWriter(f);
-        CHECK(w != nullptr && w->extension() == (f == "vorbis" ? "ogg" : f == "alac" ? "m4a" : f));
+        const std::string extension = f == "vorbis" ? "ogg" : f == "oggflac" ? "oga" : f == "alac" ? "m4a" : f.rfind("mka", 0) == 0 ? "mka" : f;
+        CHECK(w != nullptr && w->extension() == extension);
     }
     CHECK(cdr::createAudioWriter("no-such-format") == nullptr);
 }
@@ -2011,6 +2014,7 @@ namespace {
 
 // Independent reader for the CUESHEET metadata block (FLAC format spec).
 struct ParsedCueSheet {
+    std::string mcn;  // up to the first NUL
     uint64_t leadIn = 0;
     bool isCd = false;
     struct Index {
@@ -2022,6 +2026,7 @@ struct ParsedCueSheet {
         int number;
         bool audio;
         bool preEmphasis;
+        std::string isrc;
         std::vector<Index> indexes;
     };
     std::vector<CueTrackEntry> tracks;
@@ -2047,6 +2052,7 @@ std::vector<uint8_t> flacBlock(const std::vector<uint8_t>& file, int type) {
 
 ParsedCueSheet parseCueSheet(const std::vector<uint8_t>& b) {
     ParsedCueSheet c;
+    c.mcn = std::string(reinterpret_cast<const char*>(b.data()), 128).c_str();
     size_t pos = 128;
     c.leadIn = be64At(b, pos);
     pos += 8;
@@ -2059,6 +2065,7 @@ ParsedCueSheet parseCueSheet(const std::vector<uint8_t>& b) {
         e.number = b[pos + 8];
         e.audio = (b[pos + 21] & 0x80) == 0;
         e.preEmphasis = (b[pos + 21] & 0x40) != 0;
+        e.isrc = std::string(reinterpret_cast<const char*>(b.data() + pos + 9), 12).c_str();
         const int indexes = b[pos + 35];
         pos += 36;
         for (int i = 0; i < indexes; ++i, pos += 12) e.indexes.push_back({be64At(b, pos), b[pos + 8]});
@@ -2070,9 +2077,9 @@ ParsedCueSheet parseCueSheet(const std::vector<uint8_t>& b) {
 
 cdr::EmbeddedCueSheet sampleEmbeddedCue() {
     cdr::EmbeddedCueSheet cue;
-    cue.tracks = {{1, "Image.flac", 0, false, false, "One", ""},
-                  {2, "Image.flac", 30, true, true, "Two", ""},
-                  {3, "Image.flac", 75, false, false, "Three", ""}};
+    cue.tracks = {{1, "Image.flac", 0, false, false, "One", "", ""},
+                  {2, "Image.flac", 30, true, true, "Two", "", ""},
+                  {3, "Image.flac", 75, false, false, "Three", "", ""}};
     cue.totalSectors = 100;
     cue.text = "\xEF\xBB\xBF" "FILE \"Image.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
     return cue;
@@ -2204,6 +2211,274 @@ TEST(single_file_flac_rip_with_embedded_cuesheet) {
     }
 }
 
+// --- Ogg FLAC (FLAC-to-Ogg mapping 1.0) -----------------------------------------
+
+namespace {
+
+// Number of packets that end on each page.
+size_t packetsEndingOn(const OggPage& p) {
+    size_t n = 0;
+    for (uint8_t l : p.lacing) n += l < 255 ? 1 : 0;
+    return n;
+}
+
+struct OggFlac {
+    std::vector<OggPage> pages;
+    std::vector<std::vector<uint8_t>> packets;
+    size_t headerPackets = 0;     // packets before the audio, the first one included
+    std::vector<uint8_t> native;  // the same stream as a native FLAC file, for decodeFlac()
+};
+
+// Checks the Ogg FLAC structure of `file` (header packets, pages, granule
+// positions, BOS / EOS) and rebuilds the native FLAC stream from its packets.
+OggFlac demuxOggFlac(const std::vector<uint8_t>& file) {
+    OggFlac o;
+    o.pages = parseOgg(file);
+    o.packets = oggPackets(o.pages);
+    CHECK(!o.pages.empty() && o.packets.size() >= 2);
+    if (o.pages.empty() || o.packets.size() < 2) return o;
+
+    // First packet: 0x7F "FLAC" 1.0, header packet count, "fLaC", STREAMINFO;
+    // alone on the BOS page, granule position 0.
+    const std::vector<uint8_t>& first = o.packets[0];
+    CHECK_EQ(first.size(), cdr::oggflac::kFirstPacketBytes);
+    CHECK(first.size() == 51 && first[0] == 0x7F && str(first, 1, 4) == "FLAC" && first[5] == 1 && first[6] == 0);
+    CHECK(str(first, 9, 4) == "fLaC");
+    CHECK_EQ(first[13] & 0x7F, 0);  // STREAMINFO
+    CHECK(first[14] == 0 && first[15] == 0 && first[16] == 34);
+    o.headerPackets = 1 + (size_t(first[7]) << 8 | first[8]);
+    CHECK(o.headerPackets <= o.packets.size());
+    if (o.headerPackets > o.packets.size()) return o;
+    CHECK(o.pages[0].lacing == std::vector<uint8_t>({51}));
+    CHECK_EQ(o.pages[0].granule, 0);
+
+    // The header packets hold one metadata block each; only the last is flagged last.
+    o.native = {'f', 'L', 'a', 'C'};
+    o.native.insert(o.native.end(), first.begin() + 13, first.end());
+    for (size_t i = 0; i < o.headerPackets; ++i) {
+        const std::vector<uint8_t>& p = o.packets[i];
+        const size_t block = i == 0 ? 13 : 0;
+        CHECK(p.size() >= block + 4);
+        if (p.size() < block + 4) return o;
+        CHECK_EQ(p.size() - block - 4, size_t(p[block + 1]) << 16 | size_t(p[block + 2]) << 8 | p[block + 3]);
+        CHECK_EQ(bool(p[block] & 0x80), i + 1 == o.headerPackets);
+        if (i > 0) o.native.insert(o.native.end(), p.begin(), p.end());
+    }
+    for (size_t i = o.headerPackets; i < o.packets.size(); ++i)
+        o.native.insert(o.native.end(), o.packets[i].begin(), o.packets[i].end());
+
+    // Pages: the header pages (granule 0) end with the last header packet, the
+    // audio starts on a new page; BOS first, EOS last; serial and sequence.
+    size_t completed = 0;
+    bool headerEnd = false;
+    for (size_t i = 0; i < o.pages.size(); ++i) {
+        const OggPage& p = o.pages[i];
+        CHECK_EQ(p.serial, o.pages[0].serial);
+        CHECK_EQ(p.sequence, uint32_t(i));
+        CHECK_EQ(bool(p.flags & 0x02), i == 0);
+        CHECK_EQ(bool(p.flags & 0x04), i + 1 == o.pages.size());
+        if (completed < o.headerPackets) {
+            CHECK_EQ(p.granule, 0);
+            completed += packetsEndingOn(p);
+            if (completed >= o.headerPackets) {
+                CHECK_EQ(completed, o.headerPackets);
+                CHECK_EQ(p.lacing.back() < 255, true);
+                headerEnd = true;
+            }
+        } else {
+            completed += packetsEndingOn(p);
+        }
+    }
+    CHECK(headerEnd);
+    CHECK_EQ(completed, o.packets.size());
+    return o;
+}
+
+// Granule positions of the audio pages: the samples of the frames completed
+// so far (-1 on pages where no frame ends).
+void checkOggFlacGranules(const OggFlac& o, uint64_t totalSamples) {
+    const size_t frames = o.packets.size() - o.headerPackets;
+    auto samplesThrough = [&](size_t framesDone) {
+        return std::min<uint64_t>(uint64_t(framesDone) * cdr::flac::kBlockSize, totalSamples);
+    };
+    size_t completed = 0;
+    for (const OggPage& p : o.pages) {
+        const size_t ending = packetsEndingOn(p);
+        const bool header = completed < o.headerPackets;
+        completed += ending;
+        if (header) continue;
+        if (ending == 0) {
+            CHECK_EQ(p.granule, -1);
+        } else {
+            CHECK_EQ(uint64_t(p.granule), samplesThrough(completed - o.headerPackets));
+        }
+    }
+    CHECK_EQ(completed - o.headerPackets, frames);
+    if (frames > 0) CHECK_EQ(uint64_t(o.pages.back().granule), totalSamples);
+}
+
+std::vector<uint8_t> encodeOggFlac(const std::vector<uint8_t>& pcm, const cdr::TrackMetadata& meta,
+                                   const cdr::EmbeddedCueSheet* cue = nullptr, size_t chunk = cdr::kSectorBytes) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.oga";
+    {
+        cdr::OggFlacWriter writer;
+        CHECK(writer.canEmbedCueSheet());
+        if (cue) writer.setEmbeddedCueSheet(*cue);
+        writer.open(path, meta);
+        size_t pos = 0;
+        if (pcm.size() > 7) {  // an odd split to exercise partial samples
+            writer.write(pcm.data(), 7);
+            pos = 7;
+        }
+        for (; pos < pcm.size(); pos += chunk) writer.write(pcm.data() + pos, std::min(chunk, pcm.size() - pos));
+        writer.close();
+        CHECK_EQ(writer.totalSamples(), uint64_t(pcm.size() / 4));
+    }
+    std::vector<uint8_t> file = readFile(path);
+    std::filesystem::remove(path);
+    return file;
+}
+
+}  // namespace
+
+TEST(oggflac_first_packet_layout) {
+    std::vector<uint8_t> info(34);
+    for (size_t i = 0; i < info.size(); ++i) info[i] = uint8_t(0xA0 + i);
+    const std::vector<uint8_t> p = cdr::oggflac::firstPacket(2, info);
+    std::vector<uint8_t> expected = {0x7F, 'F', 'L', 'A', 'C', 0x01, 0x00, 0x00, 0x02,
+                                     'f',  'L', 'a', 'C', 0x00, 0x00, 0x00, 0x22};
+    expected.insert(expected.end(), info.begin(), info.end());
+    CHECK(p == expected);
+    CHECK_EQ(p.size(), cdr::oggflac::kFirstPacketBytes);
+    CHECK_EQ(cdr::oggflac::firstPacket(0, info)[13], 0x80);  // no other block: STREAMINFO is the last
+    CHECK_EQ(cdr::oggflac::firstPacket(258, info)[7], 1);
+    CHECK_EQ(cdr::oggflac::firstPacket(258, info)[8], 2);
+    bool threw = false;
+    try {
+        cdr::oggflac::firstPacket(1, std::vector<uint8_t>(33));
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(oggflac_writer_stream_structure_and_pcm) {
+    cdr::TrackMetadata meta = sampleAlbum().forTrack(2, 3);
+    for (size_t samples : {size_t(0), size_t(1), size_t(4096), size_t(4097), size_t(4096 * 25 + 1000)}) {
+        const testsig::Signal music = testsig::music(samples);
+        const std::vector<uint8_t> file = encodeOggFlac(music.pcm, meta, nullptr, 1000);
+        if (samples == 4096 * 25 + 1000) keepSample("music.oga", file);
+        const OggFlac o = demuxOggFlac(file);
+        CHECK_EQ(o.headerPackets, 2u);  // STREAMINFO, VORBIS_COMMENT
+        if (o.native.empty()) continue;
+        const DecodedFlac d = decodeFlac(o.native);
+        CHECK(d.pcm == music.pcm);
+        CHECK(d.md5 == md5Of(music.pcm));
+        CHECK_EQ(d.totalSamples, uint64_t(samples));
+        CHECK_EQ(d.sampleRate, 44100u);
+        CHECK_EQ(d.channels, 2u);
+        CHECK_EQ(d.bitsPerSample, 16u);
+        const unsigned block = samples > 4096 ? 4096u : unsigned(std::max<size_t>(samples, 16));
+        CHECK(d.minBlockSize == block && d.maxBlockSize == block);
+        CHECK(d.blockTypes == std::vector<int>({0, 4}));  // no SEEKTABLE / PADDING in Ogg
+        CHECK(d.vendor.rfind("cdreader ", 0) == 0);
+        CHECK(std::find(d.comments.begin(), d.comments.end(), "TITLE=Two \"2\"") != d.comments.end());
+        CHECK(std::find(d.comments.begin(), d.comments.end(), "ARTIST=Guest") != d.comments.end());
+
+        // One frame per audio packet, the frame size bounds of STREAMINFO match.
+        const size_t frames = o.packets.size() - o.headerPackets;
+        CHECK_EQ(size_t(d.frames), frames);
+        CHECK_EQ(frames, (samples + 4095) / 4096);
+        uint64_t offset = 0;
+        uint32_t minFrame = UINT32_MAX, maxFrame = 0;
+        for (size_t i = 0; i < frames && i < d.frameOffsets.size(); ++i) {
+            const std::vector<uint8_t>& packet = o.packets[o.headerPackets + i];
+            CHECK_EQ(d.frameOffsets[i], offset);
+            offset += packet.size();
+            minFrame = std::min(minFrame, uint32_t(packet.size()));
+            maxFrame = std::max(maxFrame, uint32_t(packet.size()));
+        }
+        CHECK_EQ(d.minFrameSize, frames ? minFrame : 0u);
+        CHECK_EQ(d.maxFrameSize, maxFrame);
+        checkOggFlacGranules(o, samples);
+        if (samples == 0) CHECK_EQ(o.pages.size(), 2u);  // the header pages, the last one with EOS
+
+        // The frames are exactly those of the native FLAC writer.
+        const std::vector<uint8_t> flac = encodeFlac(music.pcm, meta);
+        const DecodedFlac nd = decodeFlac(flac);
+        CHECK(std::equal(o.native.begin() + ptrdiff_t(d.firstFrame), o.native.end(),
+                         flac.begin() + ptrdiff_t(nd.firstFrame), flac.end()));
+        CHECK(d.md5 == nd.md5 && d.minFrameSize == nd.minFrameSize && d.maxFrameSize == nd.maxFrameSize);
+    }
+}
+
+TEST(oggflac_writer_round_trip_synthetic_signals) {
+    for (const testsig::Signal& s : testsig::all()) {
+        const OggFlac o = demuxOggFlac(encodeOggFlac(s.pcm, {}));
+        if (o.native.empty()) continue;
+        const DecodedFlac d = decodeFlac(o.native);
+        const bool ok = d.pcm == s.pcm && d.md5 == md5Of(s.pcm) && d.totalSamples == s.pcm.size() / 4;
+        if (!ok) std::fprintf(stderr, "  Ogg FLAC round trip failed: %s\n", s.name.c_str());
+        CHECK(ok);
+        checkOggFlacGranules(o, s.pcm.size() / 4);
+    }
+}
+
+TEST(oggflac_writer_embeds_cuesheet) {
+    // As with native FLAC: 100 sectors announced, 99 written; the lead-out follows the real length.
+    const testsig::Signal music = testsig::music(99 * 588);
+    const cdr::EmbeddedCueSheet cue = sampleEmbeddedCue();
+    cdr::TrackMetadata meta;
+    meta.album = "Album";
+    const std::vector<uint8_t> file = encodeOggFlac(music.pcm, meta, &cue);
+    keepSample("image.oga", file);
+    const OggFlac o = demuxOggFlac(file);
+    CHECK_EQ(o.headerPackets, 3u);  // STREAMINFO, VORBIS_COMMENT, CUESHEET
+    if (o.native.empty()) return;
+    const DecodedFlac d = decodeFlac(o.native);
+    CHECK(d.pcm == music.pcm);
+    CHECK(d.blockTypes == std::vector<int>({0, 4, 5}));
+    const std::string tag = "CUESHEET=FILE \"Image.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
+    CHECK(std::find(d.comments.begin(), d.comments.end(), tag) != d.comments.end());
+    const ParsedCueSheet c = parseCueSheet(flacBlock(o.native, 5));
+    CHECK_EQ(c.tracks.size(), 4u);
+    if (c.tracks.size() == 4) {
+        CHECK_EQ(c.tracks[1].offset, uint64_t(30 * 588));
+        CHECK_EQ(c.tracks[2].offset, uint64_t(75 * 588));
+        CHECK_EQ(c.tracks[3].number, 170);
+        CHECK_EQ(c.tracks[3].offset, uint64_t(99 * 588));
+    }
+    // The CUESHEET block is the same as in the native FLAC file.
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_cuesheet_test.flac";
+    {
+        cdr::FlacWriter flac;
+        flac.setEmbeddedCueSheet(cue);
+        flac.open(path, meta);
+        flac.write(music.pcm.data(), music.pcm.size());
+        flac.close();
+    }
+    CHECK(flacBlock(readFile(path), 5) == flacBlock(o.native, 5));
+    std::filesystem::remove(path);
+}
+
+TEST(oggflac_writer_rejects_partial_sample) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_partial.oga";
+    bool threw = false;
+    {
+        cdr::OggFlacWriter writer;
+        writer.open(path, {});
+        const uint8_t pcm[6] = {1, 2, 3, 4, 5, 6};
+        writer.write(pcm, sizeof pcm);
+        try {
+            writer.close();
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+    }
+    std::filesystem::remove(path);
+    CHECK(threw);
+}
+
 namespace {
 
 // --- Resampler (44.1 -> 48 kHz for Opus) --------------------------------------
@@ -2323,13 +2598,6 @@ std::vector<uint8_t> encodeWith(cdr::AudioWriter& writer, const std::filesystem:
     return readFile(path);
 }
 
-// Number of packets that end on each page.
-size_t packetsEndingOn(const OggPage& p) {
-    size_t n = 0;
-    for (uint8_t l : p.lacing) n += l < 255 ? 1 : 0;
-    return n;
-}
-
 cdr::TrackMetadata lossyMetadata() {
     cdr::TrackMetadata m;
     m.trackNumber = 3;
@@ -2367,7 +2635,12 @@ TEST(audio_writer_settings_validation) {
     CHECK(throws("wav", bitrate));
     CHECK(throws("flac", quality));
     CHECK(!throws("flac", {}));
-    CHECK(!cdr::isLossyFormat("flac") && !cdr::isLossyFormat("wav"));
+    CHECK(throws("oggflac", bitrate));
+    CHECK(throws("oggflac", quality));
+    CHECK(!throws("oggflac", {}));
+    CHECK(cdr::createAudioWriter("oggflac")->encoderDescription() == "Ogg FLAC (built-in encoder), lossless");
+    CHECK(cdr::createAudioWriter("oggflac")->canEmbedCueSheet());
+    CHECK(!cdr::isLossyFormat("flac") && !cdr::isLossyFormat("wav") && !cdr::isLossyFormat("oggflac"));
     CHECK(cdr::isLossyFormat("opus") && cdr::isLossyFormat("vorbis"));
 #ifdef CDREADER_HAVE_OPUS
     CHECK(!throws("opus", bitrate));
@@ -3017,6 +3290,16 @@ TEST(alac_m4a_box_structure_and_tables) {
     CHECK_EQ(d.tags.size(), size_t(9));
 }
 
+TEST(alac_m4a_isrc_and_barcode_tags) {
+    cdr::TrackMetadata m = alacSampleMetadata();
+    m.isrc = "JPXX01234567";
+    m.mcn = "4988000000017";
+    const DecodedM4a d = decodeM4a(writeM4a(std::vector<uint8_t>(4 * 4096, 0), m, {}, "alac_isrc.m4a"));
+    CHECK(d.tags.at("----:com.apple.iTunes:ISRC") == "JPXX01234567");
+    CHECK(d.tags.at("----:com.apple.iTunes:BARCODE") == "4988000000017");
+    CHECK_EQ(d.tags.size(), size_t(11));
+}
+
 TEST(alac_m4a_edge_cases) {
     // No audio: valid boxes, no frames.
     const DecodedM4a empty = decodeM4a(writeM4a({}, {}, {}, "alac_empty.m4a"));
@@ -3134,6 +3417,334 @@ TEST(alac_compression_against_flac) {
 }
 
 }  // namespace
+
+// --- MCN / ISRC from the Q sub-channel (#22) ------------------------------------
+
+namespace {
+
+// A format 02h / 03h response as a drive returns it.
+std::vector<uint8_t> subChannelResponse(uint8_t format, int track, bool valid, const std::string& code) {
+    std::vector<uint8_t> r(24, 0);
+    r[3] = 20;
+    r[4] = format;
+    if (format == 0x03) {
+        r[5] = 0x30;
+        r[6] = uint8_t(track);
+    }
+    r[8] = valid ? 0x80 : 0x00;
+    std::memcpy(r.data() + 9, code.data(), std::min(code.size(), size_t(format == 0x02 ? 13 : 12)));
+    return r;
+}
+
+using Status = cdr::SubChannelCode::Status;
+
+}  // namespace
+
+TEST(mcn_and_isrc_validation) {
+    CHECK(cdr::isValidMcn("4988001234567"));
+    CHECK(cdr::isValidMcn("0075678263927"));
+    CHECK(!cdr::isValidMcn("0000000000000"));  // "no MCN" on some drives
+    CHECK(!cdr::isValidMcn("498800123456"));   // 12 digits
+    CHECK(!cdr::isValidMcn("498800123456A"));
+    CHECK(!cdr::isValidMcn(std::string("498800123456\0", 13)));
+    CHECK(cdr::isValidIsrc("JPVI09912345"));
+    CHECK(cdr::isValidIsrc("USRC17607839"));
+    CHECK(cdr::isValidIsrc("GBAYE0601498"));
+    CHECK(!cdr::isValidIsrc("jpvi09912345"));   // lower case
+    CHECK(!cdr::isValidIsrc("JP-VI0-99-12345"));
+    CHECK(!cdr::isValidIsrc("J1VI09912345"));   // country: letters only
+    CHECK(!cdr::isValidIsrc("JPV-09912345"));   // registrant: letters or digits
+    CHECK(!cdr::isValidIsrc("JPVI0A912345"));   // year: digits
+    CHECK(!cdr::isValidIsrc("JPVI099123X5"));   // designation: digits
+    CHECK(!cdr::isValidIsrc("000000000000"));
+    CHECK(!cdr::isValidIsrc(""));
+}
+
+TEST(subchannel_cdb_bytes) {
+    FakeDrive fake = makeAudioDisc();
+    cdr::CdDrive drive(fake);
+    drive.readMcn();
+    // READ SUB-CHANNEL, SubQ, format 02h, allocation length 24.
+    CHECK(fake.lastSubChannelCdb == std::vector<uint8_t>({0x42, 0x00, 0x40, 0x02, 0, 0, 0, 0x00, 24, 0}));
+    drive.readIsrc(3);
+    CHECK(fake.lastSubChannelCdb == std::vector<uint8_t>({0x42, 0x00, 0x40, 0x03, 0, 0, 3, 0x00, 24, 0}));
+    uint8_t buf[16];
+    drive.readSubChannel(cdr::SubChannelFormat::CurrentPosition, 5, buf, sizeof buf, true);
+    // MSF bit set, track ignored for the current position format.
+    CHECK(fake.lastSubChannelCdb == std::vector<uint8_t>({0x42, 0x02, 0x40, 0x01, 0, 0, 0, 0x00, 16, 0}));
+    CHECK_EQ(fake.subChannelCommands, 3);
+    // Track numbers outside 1..99 never reach the drive.
+    CHECK(drive.readIsrc(0).status == Status::Invalid);
+    CHECK(drive.readIsrc(100).status == Status::Invalid);
+    CHECK_EQ(fake.subChannelCommands, 3);
+}
+
+TEST(read_mcn_and_isrc_from_drive) {
+    FakeDrive fake = makeAudioDisc();
+    fake.mcn = "4988001234567";
+    fake.isrcs[1] = "JPVI09912345";
+    fake.isrcs[3] = "USRC17607839";
+    cdr::CdDrive drive(fake);
+    const cdr::SubChannelCode mcn = drive.readMcn();
+    CHECK(mcn.found() && mcn.value == "4988001234567");
+    CHECK(mcn.describe() == "4988001234567");
+    CHECK(drive.readIsrc(1).value == "JPVI09912345");
+    CHECK(drive.readIsrc(2).status == Status::NotPresent);  // TCVal = 0
+    CHECK(drive.readIsrc(2).describe() == "not present");
+    CHECK(drive.readIsrc(3).value == "USRC17607839");
+}
+
+TEST(subchannel_not_present_and_garbage) {
+    // MCVal = 0, or MCVal = 1 with all zeros: no MCN.
+    std::vector<uint8_t> r = subChannelResponse(0x02, 0, false, "4988001234567");
+    CHECK(cdr::parseMcnResponse(r.data(), r.size()).status == Status::NotPresent);
+    r = subChannelResponse(0x02, 0, true, "0000000000000");
+    CHECK(cdr::parseMcnResponse(r.data(), r.size()).status == Status::NotPresent);
+    r = subChannelResponse(0x02, 0, true, "4988001234567");
+    CHECK(cdr::parseMcnResponse(r.data(), r.size()).value == "4988001234567");
+    // Malformed codes with the valid bit set.
+    r = subChannelResponse(0x02, 0, true, "49880012\x01" "4567");
+    cdr::SubChannelCode c = cdr::parseMcnResponse(r.data(), r.size());
+    CHECK(c.status == Status::Invalid && c.value.empty());
+    CHECK(c.describe() == "invalid response (MCN \"49880012?4567\")");
+    r = subChannelResponse(0x03, 2, true, "jp-vi0991234");
+    CHECK(cdr::parseIsrcResponse(r.data(), r.size(), 2).status == Status::Invalid);
+    r = subChannelResponse(0x03, 2, true, std::string(12, '\0'));
+    CHECK(cdr::parseIsrcResponse(r.data(), r.size(), 2).status == Status::NotPresent);
+    r = subChannelResponse(0x03, 2, false, "JPVI09912345");
+    CHECK(cdr::parseIsrcResponse(r.data(), r.size(), 2).status == Status::NotPresent);
+    // An answer for another track, or with the track left at 0.
+    r = subChannelResponse(0x03, 3, true, "JPVI09912345");
+    CHECK(cdr::parseIsrcResponse(r.data(), r.size(), 2).status == Status::Invalid);
+    r = subChannelResponse(0x03, 0, true, "JPVI09912345");
+    CHECK(cdr::parseIsrcResponse(r.data(), r.size(), 2).value == "JPVI09912345");
+    // Wrong format code, too small data length, short transfer.
+    r = subChannelResponse(0x03, 1, true, "JPVI09912345");
+    CHECK(cdr::parseMcnResponse(r.data(), r.size()).status == Status::Invalid);
+    r = subChannelResponse(0x02, 0, true, "4988001234567");
+    r[3] = 12;
+    CHECK(cdr::parseMcnResponse(r.data(), r.size()).status == Status::Invalid);
+    r[3] = 20;
+    CHECK(cdr::parseMcnResponse(r.data(), 23).status == Status::Invalid);
+    CHECK(cdr::parseMcnResponse(r.data(), 0).status == Status::Invalid);
+    CHECK(cdr::parseMcnResponse(nullptr, 24).status == Status::Invalid);
+
+    // The same through the drive.
+    FakeDrive fake = makeAudioDisc();
+    fake.mcn = "12345";  // MCVal set, then 5 digits and NULs
+    fake.isrcs[1] = "JPVI0991234";  // 11 characters
+    cdr::CdDrive drive(fake);
+    CHECK(drive.readMcn().status == Status::Invalid);
+    CHECK(drive.readIsrc(1).status == Status::Invalid);
+    fake.mcn = "4988001234567";
+    fake.subChannelTransferLimit = 20;  // the drive returns fewer bytes than asked for
+    c = drive.readMcn();
+    CHECK(c.status == Status::Invalid);
+    CHECK(c.detail == "short response (20 of 24 bytes)");
+}
+
+TEST(subchannel_unsupported_and_errors) {
+    FakeDrive fake = makeAudioDisc();
+    fake.mcn = "4988001234567";
+    fake.subChannelSupported = false;  // ILLEGAL REQUEST, invalid command operation code
+    cdr::CdDrive drive(fake);
+    CHECK(drive.readMcn().status == Status::Unsupported);
+    CHECK(drive.readIsrc(1).status == Status::Unsupported);
+    CHECK(drive.readMcn().describe() == "not supported by the drive");
+
+    fake.subChannelSupported = true;
+    fake.discPresent = false;  // NOT READY: another failure
+    const cdr::SubChannelCode c = drive.readMcn();
+    CHECK(c.status == Status::Failed);
+    CHECK(c.detail.find("NOT READY") != std::string::npos);
+
+    cdr::ScsiResult transport;
+    transport.error = "device gone";
+    CHECK(cdr::subChannelError(transport).status == Status::Failed);
+    CHECK(cdr::subChannelError(transport).describe() == "read failed (device gone)");
+}
+
+TEST(read_disc_codes_for_tracks) {
+    // Track 2 is a data track: no ISRC read.
+    FakeDrive fake({{0, false}, {300, true}, {450, false}}, 750);
+    fake.mcn = "4988001234567";
+    fake.isrcs[1] = "JPVI09912345";
+    fake.isrcs[2] = "JPVI09900000";
+    fake.isrcs[3] = "bad";
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscCodes codes = cdr::readDiscCodes(drive, toc.tracks);
+    CHECK(codes.read);
+    CHECK_EQ(fake.subChannelCommands, 3);
+    CHECK(codes.mcnValue() == "4988001234567");
+    CHECK_EQ(codes.isrcs.size(), 2u);
+    CHECK(codes.isrc(1) == "JPVI09912345");
+    CHECK(codes.isrc(2).empty());
+    CHECK(codes.isrc(3).empty());
+    CHECK(codes.isrcs.at(3).status == Status::Invalid);
+    const std::vector<std::string> lines = codes.logLines();
+    CHECK(lines == std::vector<std::string>({"MCN: 4988001234567", "Track  1  ISRC: JPVI09912345",
+                                             "Track  3  ISRC: invalid response (ISRC \"bad\")"}));
+
+    cdr::AlbumMetadata album = sampleAlbum();
+    album.trackIsrcs = {"OLD", "OLD", "OLD"};
+    codes.applyTo(album);
+    CHECK(album.mcn == "4988001234567");
+    CHECK(album.trackIsrcs == std::vector<std::string>({"JPVI09912345"}));
+    CHECK(album.forTrack(1, 3).isrc == "JPVI09912345");
+    CHECK(album.forTrack(1, 3).mcn == "4988001234567");
+    CHECK(album.forTrack(3, 3).isrc.empty());
+    CHECK(album.forTrack(0, 3).isrc.empty() && album.forTrack(0, 3).mcn == "4988001234567");
+
+    // A drive that rejects the command is asked once only.
+    FakeDrive old = makeAudioDisc();
+    old.subChannelSupported = false;
+    cdr::CdDrive oldDrive(old);
+    const cdr::DiscCodes none = cdr::readDiscCodes(oldDrive, oldDrive.readToc().tracks);
+    CHECK_EQ(old.subChannelCommands, 1);
+    CHECK(none.mcn.status == Status::Unsupported);
+    CHECK(none.isrcs.at(3).status == Status::Skipped);
+    CHECK(none.mcnValue().empty() && none.isrc(1).empty());
+    CHECK(none.logLines()[1] == "Track  1  ISRC: not read (command not supported)");
+    CHECK(cdr::DiscCodes{}.logLines() == std::vector<std::string>({"MCN / ISRC: not read (disabled)"}));
+}
+
+// A drive that throws from the transport (e.g. a USB device that went away)
+// must not abort the rip either.
+TEST(read_disc_codes_survives_throwing_transport) {
+    struct Throwing : cdr::ScsiTransport {
+        cdr::ScsiResult execute(const uint8_t*, size_t, void*, size_t, cdr::DataDirection, unsigned) override {
+            throw std::runtime_error("usb gone");
+        }
+    } transport;
+    cdr::CdDrive drive(transport);
+    std::vector<cdr::Track> tracks = {{1, 0, 300}};
+    const cdr::DiscCodes codes = cdr::readDiscCodes(drive, tracks);
+    CHECK(codes.mcn.status == Status::Failed && codes.mcn.detail == "usb gone");
+    CHECK(codes.isrcs.at(1).status == Status::Failed);
+}
+
+TEST(cue_sheet_catalog_and_isrc) {
+    std::vector<cdr::Track> tracks = {{1, 0, 300}, {2, 300, 150}, {3, 450, 300}};
+    tracks[1].preEmphasis = true;
+    cdr::AlbumMetadata album;
+    album.artist = "Artist";
+    album.mcn = "4988001234567";
+    album.trackIsrcs = {"JPVI09912345", "JPVI09912346", "garbage"};
+    const std::string cue = cdr::formatCueSheet(album, cdr::singleFileCueTracks(tracks, "a.flac", album));
+    // CATALOG at disc level; ISRC after TRACK (and FLAGS), before INDEX, as
+    // metaflac --export-cuesheet-to writes them. Invalid codes are left out.
+    CHECK(cue ==
+          "REM COMMENT \"cdreader\"\r\n"
+          "CATALOG 4988001234567\r\n"
+          "PERFORMER \"Artist\"\r\n"
+          "FILE \"a.flac\" WAVE\r\n"
+          "  TRACK 01 AUDIO\r\n"
+          "    PERFORMER \"Artist\"\r\n"
+          "    ISRC JPVI09912345\r\n"
+          "    INDEX 01 00:00:00\r\n"
+          "  TRACK 02 AUDIO\r\n"
+          "    PERFORMER \"Artist\"\r\n"
+          "    FLAGS PRE\r\n"
+          "    ISRC JPVI09912346\r\n"
+          "    INDEX 01 00:04:00\r\n"
+          "  TRACK 03 AUDIO\r\n"
+          "    PERFORMER \"Artist\"\r\n"
+          "    INDEX 01 00:06:00\r\n");
+    keepSample("isrc.cue", std::vector<uint8_t>(cue.begin(), cue.end()));
+    // Per-track sheets carry them too; an invalid MCN is left out.
+    album.mcn = "123";
+    const std::string perTrack =
+        cdr::formatCueSheet(album, cdr::perTrackCueTracks({tracks[0]}, {"01.flac"}, album));
+    CHECK(perTrack.find("CATALOG") == std::string::npos);
+    CHECK(perTrack.find("  TRACK 01 AUDIO\r\n    PERFORMER \"Artist\"\r\n    ISRC JPVI09912345\r\n    INDEX 01") !=
+          std::string::npos);
+}
+
+TEST(flac_cuesheet_block_mcn_and_isrc) {
+    cdr::EmbeddedCueSheet cue = sampleEmbeddedCue();
+    cue.mcn = "4988001234567";
+    cue.tracks[0].isrc = "JPVI09912345";
+    cue.tracks[2].isrc = "JPVI0991234X";  // invalid: left out
+    const std::vector<uint8_t> block = cdr::flac::cueSheet(cue, 100 * 588);
+    CHECK_EQ(block.size(), size_t(396 + 3 * 48 + 36));
+    // 13 ASCII digits, then NUL bytes up to 128.
+    CHECK(str(block, 0, 13) == "4988001234567");
+    CHECK(std::all_of(block.begin() + 13, block.begin() + 128, [](uint8_t b) { return b == 0; }));
+    const ParsedCueSheet c = parseCueSheet(block);
+    CHECK(c.mcn == "4988001234567");
+    CHECK(c.isCd);
+    CHECK_EQ(c.tracks.size(), 4u);
+    if (c.tracks.size() == 4) {
+        CHECK(c.tracks[0].isrc == "JPVI09912345");
+        CHECK(c.tracks[1].isrc.empty());
+        CHECK(c.tracks[2].isrc.empty());
+        CHECK(c.tracks[3].isrc.empty());  // lead-out
+    }
+    // The ISRC is the 12 bytes after the track offset and number.
+    const size_t track1 = 396;
+    CHECK(str(block, track1 + 9, 12) == "JPVI09912345");
+    CHECK_EQ(block[track1 + 21], 0);  // flags follow unchanged
+    // An invalid MCN is not written.
+    cue.mcn = "0000000000000";
+    const std::vector<uint8_t> noMcn = cdr::flac::cueSheet(cue, 100 * 588);
+    CHECK(std::all_of(noMcn.begin(), noMcn.begin() + 128, [](uint8_t b) { return b == 0; }));
+}
+
+TEST(tags_carry_isrc_and_mcn) {
+    cdr::TrackMetadata m = sampleAlbum().forTrack(2, 3);
+    m.isrc = "JPVI09912345";
+    m.mcn = "4988001234567";
+    const std::vector<uint8_t> vc = cdr::vorbisComment(m, "v");
+    const std::string text(vc.begin(), vc.end());
+    CHECK(text.find("ISRC=JPVI09912345") != std::string::npos);
+    CHECK(text.find("BARCODE=4988001234567") != std::string::npos);
+
+    const std::vector<uint8_t> tag = cdr::id3v2Tag(m);
+    const auto f = id3Frames(tag, 0);
+    CHECK(fieldValue(f, "TSRC") == "JPVI09912345");
+    int barcode = 0;
+    for (const auto& [id, value] : f)
+        barcode += id == "TXXX" && value == std::string("BARCODE") + '\0' + "4988001234567";
+    CHECK_EQ(barcode, 1);
+
+    // RIFF INFO has no ISRC field ("ISRC" there means "source"): unchanged.
+    cdr::TrackMetadata plain = m;
+    plain.isrc.clear();
+    plain.mcn.clear();
+    CHECK(cdr::riffInfoChunk(m) == cdr::riffInfoChunk(plain));
+
+    // Without codes nothing is added.
+    const std::vector<uint8_t> none = cdr::vorbisComment(plain, "v");
+    const std::string noneText(none.begin(), none.end());
+    CHECK(noneText.find("ISRC=") == std::string::npos && noneText.find("BARCODE=") == std::string::npos);
+    CHECK(fieldValue(id3Frames(cdr::id3v2Tag(plain), 0), "TSRC") == "<missing>");
+}
+
+TEST(flac_rip_tags_isrc_per_track) {
+    // ISRCs read from the fake drive end up in each track's FLAC tags.
+    FakeDrive fake = makeAudioDisc();
+    fake.mcn = "4988001234567";
+    fake.isrcs[2] = "JPVI09912346";
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::AlbumMetadata album;
+    cdr::readDiscCodes(drive, toc.tracks).applyTo(album);
+    cdr::Ripper ripper(drive, toc, {});
+    for (int n : {1, 2}) {
+        const std::filesystem::path path =
+            std::filesystem::temp_directory_path() / ("cdreader_isrc_" + std::to_string(n) + ".flac");
+        cdr::FlacWriter writer;
+        writer.open(path, album.forTrack(n, 3));
+        ripper.ripTrack(*toc.findTrack(n), [&](const uint8_t* p, size_t b) { writer.write(p, b); });
+        writer.close();
+        const DecodedFlac d = decodeFlac(readFile(path));
+        std::filesystem::remove(path);
+        const bool hasIsrc = std::find(d.comments.begin(), d.comments.end(), "ISRC=JPVI09912346") != d.comments.end();
+        CHECK_EQ(hasIsrc, n == 2);
+        CHECK(std::find(d.comments.begin(), d.comments.end(), "BARCODE=4988001234567") != d.comments.end());
+    }
+}
 
 int main() {
     for (auto& [name, fn] : registry()) {

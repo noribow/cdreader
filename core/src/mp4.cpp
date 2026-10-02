@@ -263,6 +263,8 @@ std::vector<uint8_t> itunesMetadata(const TrackMetadata& m, const std::string& e
     text("\xA9gen", m.genre);
     text("\xA9too", encoder);
     if (!m.discId.empty()) append(ilst, freeformItem("CDDB", m.discId));
+    if (!m.isrc.empty()) append(ilst, freeformItem("ISRC", m.isrc));
+    if (!m.mcn.empty()) append(ilst, freeformItem("BARCODE", m.mcn));
 
     std::vector<uint8_t> meta = handler("mdir", "appl", "");
     append(meta, box("ilst", ilst));

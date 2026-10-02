@@ -25,6 +25,7 @@
 #include "cdreader/file_naming.h"
 #include "cdreader/metadata.h"
 #include "cdreader/ripper.h"
+#include "cdreader/subchannel.h"
 #include "cdreader/toc.h"
 #include "spti_transport.h"
 #include "winhttp_client.h"
@@ -51,7 +52,8 @@ void printUsage() {
         "\n"
         "Usage:\n"
         "  cdreader drives                       List optical drives\n"
-        "  cdreader toc <drive> [cddb options]   Show the table of contents and disc info\n"
+        "  cdreader toc <drive> [options]        Show the table of contents and disc info\n"
+        "                        (CDDB options and --no-isrc)\n"
         "  cdreader rip <drive> [options]        Rip audio tracks (see --format)\n"
         "  cdreader offset <drive> [options]     Detect the drive read offset (AccurateRip)\n"
         "\n"
@@ -60,11 +62,16 @@ void printUsage() {
         "                        otherwise cd_<CDDB id>)\n"
         "                        A CUE sheet (<album>.cue) is written next to the audio\n"
         "  -f, --format <name>   Output format: %s (default: wav)\n"
+        "                        oggflac = FLAC in an Ogg container (.oga, lossless)\n"
         "                        opus = Ogg Opus (.opus), vorbis = Ogg Vorbis (.ogg)\n"
         "                        (when built with libopus / libvorbis)\n"
+        "                        mka = Matroska (.mka) with FLAC; mka-pcm, mka-opus,\n"
+        "                        mka-vorbis = Matroska with that codec\n"
         "  -b, --bitrate <kbps>  Lossy formats: target bitrate in kbit/s (VBR)\n"
-        "                        opus: 6-510 (default 160), vorbis: 45-500 (average)\n"
-        "  -q, --quality <q>     vorbis: VBR quality -1..10 (default 5, about 160 kbit/s)\n"
+        "                        opus, mka-opus: 6-510 (default 160),\n"
+        "                        vorbis, mka-vorbis: 45-500 (average)\n"
+        "  -q, --quality <q>     vorbis, mka-vorbis: VBR quality -1..10 (default 5,\n"
+        "                        about 160 kbit/s)\n"
         "  -t, --tracks <list>   Tracks to rip, e.g. 1,3-5 (default: all audio tracks)\n"
         "  -r, --retries <n>     Retries per failing read (default: 5)\n"
         "      --offset <n>      Drive read offset correction in samples, e.g. 6 or -472\n"
@@ -73,8 +80,11 @@ void printUsage() {
         "      --no-accuraterip  Do not look up the AccurateRip database after ripping\n"
         "      --single-file     Rip the tracks into one file (an image of the disc);\n"
         "                        the CUE sheet then marks the track positions. FLAC\n"
-        "                        images also carry the CUE sheet inside the file\n"
+        "                        and Ogg FLAC images also carry the CUE sheet inside\n"
+        "                        the file, Matroska images a chapter per track\n"
         "      --no-cue-file     Do not write the external .cue file\n"
+        "      --no-isrc         Do not read the MCN (catalog number) and the ISRCs\n"
+        "                        from the Q sub-channel (some drives are slow at it)\n"
         "\n"
         "Offset options:\n"
         "  -t, --track <n>       Track to compare (default: the best known track)\n"
@@ -234,6 +244,16 @@ cdr::CddbLookupResult lookupDisc(const cdr::Toc& toc, const CddbSettings& cddb) 
     return result;
 }
 
+// Reads the MCN and the ISRCs of `tracks` (all optional). Never throws.
+cdr::DiscCodes readDiscCodes(cdr::CdDrive& drive, const std::vector<cdr::Track>& tracks, bool enabled) {
+    if (!enabled) return {};
+    std::printf("Reading MCN / ISRC ...\r");
+    std::fflush(stdout);
+    cdr::DiscCodes codes = cdr::readDiscCodes(drive, tracks);
+    std::printf("                      \r");
+    return codes;
+}
+
 void printAlbum(const cdr::AlbumMetadata& album, FILE* out) {
     std::fprintf(out, "Artist: %s\nAlbum:  %s\n", album.artist.c_str(), album.title.c_str());
     if (!album.year.empty()) std::fprintf(out, "Year:   %s\n", album.year.c_str());
@@ -266,7 +286,7 @@ cdr::Toc readTocOrExplain(cdr::CdDrive& drive) {
     return drive.readToc();
 }
 
-void printToc(const cdr::Toc& toc, const cdr::AlbumMetadata& album, FILE* out) {
+void printToc(const cdr::Toc& toc, const cdr::AlbumMetadata& album, const cdr::DiscCodes& codes, FILE* out) {
     std::fprintf(out, "CDDB disc id: %s\n", hex32(toc.cddbId()).c_str());
     std::fprintf(out, "AccurateRip disc id: %s\n", cdr::AccurateRipDiscId::fromToc(toc).toString().c_str());
     std::fprintf(out, "Track  Start LBA   Length     Type\n");
@@ -277,6 +297,8 @@ void printToc(const cdr::Toc& toc, const cdr::AlbumMetadata& album, FILE* out) {
                      t.preEmphasis ? " (pre-emphasis)" : "", title.empty() ? "" : "  ", title.c_str());
     }
     std::fprintf(out, "Lead-out at LBA %u, total %s\n", toc.leadOutLba, cdr::formatMsf(toc.leadOutLba).c_str());
+    std::fprintf(out, "\n");
+    for (const std::string& line : codes.logLines()) std::fprintf(out, "%s\n", line.c_str());
 }
 
 int cmdDrives() {
@@ -300,18 +322,22 @@ int cmdToc(const std::vector<std::string>& args) {
     if (args.size() < 2) throw UsageError("toc needs a drive argument");
     const char letter = parseDriveLetter(args[1]);
     CddbSettings cddb;
-    for (size_t i = 2; i < args.size(); ++i)
-        if (!parseCddbOption(args, i, cddb)) throw UsageError("unknown option '" + args[i] + "'");
+    bool discCodes = true;
+    for (size_t i = 2; i < args.size(); ++i) {
+        if (args[i] == "--no-isrc") discCodes = false;
+        else if (!parseCddbOption(args, i, cddb)) throw UsageError("unknown option '" + args[i] + "'");
+    }
 
     OpenedDrive d = openDrive(letter);
     std::printf("Drive: %s\n", d.info.displayName().c_str());
     const cdr::Toc toc = readTocOrExplain(*d.drive);
+    const cdr::DiscCodes codes = readDiscCodes(*d.drive, toc.tracks, discCodes);
     const cdr::CddbLookupResult found = lookupDisc(toc, cddb);
     if (found.found) {
         printAlbum(found.album, stdout);
         std::printf("\n");
     }
-    printToc(toc, found.album, stdout);
+    printToc(toc, found.album, codes, stdout);
     return 0;
 }
 
@@ -397,6 +423,7 @@ int cmdRip(const std::vector<std::string>& args) {
     bool accurateRip = true;
     bool singleFile = false;
     bool cueFile = true;
+    bool discCodes = true;
     cdr::EncoderSettings encoder;
 
     for (size_t i = 2; i < args.size(); ++i) {
@@ -413,6 +440,7 @@ int cmdRip(const std::vector<std::string>& args) {
         else if (a == "-r" || a == "--retries") options.maxRetries = parseInt(value(), "retry count");
         else if (a == "--offset") options.readOffsetSamples = parseSignedInt(value(), "read offset");
         else if (a == "--no-cue-file") cueFile = false;
+        else if (a == "--no-isrc") discCodes = false;
         else if (a == "--verify") options.verify = true;
         else if (parseCddbOption(args, i, cddb)) continue;
         else if (a == "--no-accuraterip") accurateRip = false;
@@ -454,6 +482,11 @@ int cmdRip(const std::vector<std::string>& args) {
 
     std::printf("Drive: %s\n", d.info.displayName().c_str());
 
+    // MCN / ISRC are optional too: a drive that cannot read them only means
+    // no CATALOG / ISRC lines and tags.
+    const cdr::DiscCodes codes = readDiscCodes(*d.drive, selected, discCodes);
+    if (codes.mcn.found()) std::printf("MCN: %s\n", codes.mcn.value.c_str());
+
     // Metadata is optional: a failed lookup only means generic names.
     const cdr::CddbLookupResult found = lookupDisc(toc, cddb);
     cdr::AlbumMetadata album;
@@ -462,6 +495,7 @@ int cmdRip(const std::vector<std::string>& args) {
         printAlbum(album, stdout);
     }
     album.discId = hex32(toc.cddbId());
+    codes.applyTo(album);
 
     // In single-file mode the tracks are written back to back, which is only
     // an image of the disc if they are adjacent on it.
@@ -507,6 +541,8 @@ int cmdRip(const std::vector<std::string>& args) {
             log << line << (title.empty() ? "" : "  ") << title << "\n";
         }
         log << "\n";
+        for (const std::string& l : codes.logLines()) log << l << "\n";
+        log << "\n";
     }
     if (!cddb.enabled) {
         log << "CDDB lookup: disabled\n\n";
@@ -536,6 +572,7 @@ int cmdRip(const std::vector<std::string>& args) {
         if (writer->canEmbedCueSheet()) {
             cdr::EmbeddedCueSheet embedded;
             embedded.tracks = cueTracks;
+            embedded.mcn = album.mcn;
             for (const cdr::Track& t : selected) embedded.totalSectors += t.lengthSectors;
             embedded.text = cdr::formatCueSheet(album, cueTracks);
             writer->setEmbeddedCueSheet(embedded);
@@ -543,8 +580,10 @@ int cmdRip(const std::vector<std::string>& args) {
         writer->open(dir / fs::u8path(imageName), album.forTrack(0, toc.lastTrack));
         log << "Single file: " << imageName << "\n";
         if (writer->canEmbedCueSheet()) {
-            std::printf("Embedded CUE sheet: CUESHEET block and tag in %s\n\n", imageName.c_str());
-            log << "Embedded CUE sheet: CUESHEET block and tag\n";
+            // FLAC: CUESHEET block + tag; Matroska: chapters (#23).
+            const char* what = extension == "mka" ? "Matroska chapters (one per track)" : "CUESHEET block and tag";
+            std::printf("Embedded CUE sheet: %s in %s\n\n", what, imageName.c_str());
+            log << "Embedded CUE sheet: " << what << "\n";
         }
     }
     for (const cdr::Track& t : selected) {
