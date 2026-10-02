@@ -43,7 +43,11 @@ struct Toc {
     const Track* findTrack(int number) const;
 
     // The run of consecutive audio tracks containing `track`: the area that
-    // can be read as CD-DA around it (used for read offset correction).
+    // can be read as CD-DA around it (used for read offset correction),
+    // from LBA 0 when it includes the first track (an HTOA before it is
+    // audio, see gaps.h). A
+    // track that is not in the TOC (the HTOA, track 0) belongs to the run of
+    // the track starting where it ends.
     LbaRange audioRange(const Track& track) const;
     size_t audioTrackCount() const;
 

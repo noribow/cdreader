@@ -100,6 +100,7 @@ const Toc& RipSession::readToc() {
     album_ = {};
     album_.discId = hex32(toc_->cddbId());
     discCodes_ = {};
+    gaps_ = gapsFromToc(*toc_);
     ripped_.clear();
     accurateRip_ = {};
     accurateRipChecked_ = false;
@@ -140,6 +141,12 @@ const DiscCodes& RipSession::readDiscCodes() {
     return discCodes_;
 }
 
+const DiscGaps& RipSession::detectGaps() {
+    const Toc& t = toc();
+    gaps_ = cdr::detectGaps(drive_, t);
+    return gaps_;
+}
+
 TrackMetadata RipSession::trackMetadata(int number) { return album_.forTrack(number, toc().lastTrack); }
 
 std::string RipSession::trackLabel(int number) {
@@ -173,6 +180,7 @@ void RipSession::beginRip(const RipSettings& settings) {
     accurateRipChecked_ = false;
     cancelled_ = false;
     if (settings.readDiscCodes && !discCodes_.read) readDiscCodes();
+    if (settings.detectGaps && gaps_.status == DiscGaps::Status::NotRun) detectGaps();
 }
 
 const RippedTrack& RipSession::ripTrack(int number, const std::filesystem::path& path,
@@ -291,6 +299,8 @@ std::string RipSession::ripLog() {
     }
     log << "\n";
     for (const std::string& l : discCodes_.logLines()) log << l << "\n";
+    log << "\n";
+    for (const std::string& l : gaps_.logLines()) log << l << "\n";
     log << "\n";
 
     if (!cddbLookedUp_ || !cddbSettings_.enabled) {

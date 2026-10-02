@@ -63,7 +63,7 @@ void OggFlacWriter::open(const std::filesystem::path& path, const TrackMetadata&
         const std::vector<uint8_t> sheet = flac::cueSheet(*cue_, uint64_t(cue_->totalSectors) * kSamplesPerSector);
         std::vector<uint8_t> block;
         flac::putBlockHeader(block, flac::kCueSheet, true, uint32_t(sheet.size()));
-        leadOutOffsetPos_ = block.size() + flac::cueSheetLeadOutOffsetPosition(cue_->tracks.size());
+        leadOutOffsetPos_ = block.size() + flac::cueSheetLeadOutOffsetPosition(*cue_);
         block.insert(block.end(), sheet.begin(), sheet.end());
         headers_.push_back(std::move(block));
     }

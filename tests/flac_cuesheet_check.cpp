@@ -3,7 +3,8 @@
 // the expected track positions, and re-importing that sheet with metaflac
 // (which validates it as CD-DA) must produce a byte-identical CUESHEET block.
 // The sheet carries an MCN (CATALOG) and ISRCs (#22), which must survive the
-// round trip. With ffprobe, the ISRC / BARCODE tags of a FLAC track and of a
+// round trip, and so must a sheet with an HTOA, a pregap (INDEX 00) and an
+// INDEX 02 (#25). With ffprobe, the ISRC / BARCODE tags of a FLAC track and of a
 // WAV track (ID3 chunk) must be readable as well.
 //
 // Usage: cdreader_flac_cuesheet_check <flac> <metaflac> [<ffprobe>]
@@ -20,6 +21,7 @@
 
 #include "cdreader/cue_sheet.h"
 #include "cdreader/flac_writer.h"
+#include "cdreader/gaps.h"
 #include "cdreader/wav_writer.h"
 
 namespace fs = std::filesystem;
@@ -133,6 +135,65 @@ int main(int argc, char** argv) {
     check(reimported, "metaflac re-imports the sheet (CD-DA validation)");
     check(reimported && metadataBlock(copy, 5) == metadataBlock(image, 5) && !metadataBlock(image, 5).empty(),
           "re-imported CUESHEET block is byte-identical");
+
+    // A disc with an HTOA (track 1 at 00:01:00), a 2-second pregap before
+    // track 2 and an INDEX 02 in track 3 (#25): the CUESHEET block starts
+    // track 1 at INDEX 00 (offset 0) and track 2 at its INDEX 00, and must
+    // round-trip through metaflac byte for byte as well.
+    {
+        const fs::path gapImage = dir / "gaps.flac";
+        const fs::path gapCopy = dir / "gaps_reimported.flac";
+        const fs::path gapExported = dir / "gaps.cue";
+        std::vector<cdr::Track> discTracks = {{1, 75, 300}, {2, 375, 450}, {3, 825, 226}};
+        discTracks[1].preEmphasis = true;
+        cdr::DiscGaps gaps;
+        gaps.status = cdr::DiscGaps::Status::Detected;
+        gaps.htoaSectors = 75;
+        for (const cdr::Track& t : discTracks) {
+            cdr::TrackIndexes ti;
+            ti.track = t.number;
+            ti.index01Lba = t.startLba;
+            ti.status = cdr::TrackIndexes::Status::Detected;
+            gaps.tracks.push_back(ti);
+        }
+        gaps.tracks[0].pregapSectors = 75;
+        gaps.tracks[1].pregapSectors = 150;
+        gaps.tracks[2].laterIndexes = {900};
+        cdr::EmbeddedCueSheet gapCue;
+        gapCue.tracks = cdr::singleFileCueTracks(discTracks, "gaps.flac", album, gaps, true);
+        gapCue.totalSectors = 1051;
+        gapCue.mcn = album.mcn;
+        gapCue.text = cdr::formatCueSheet(album, gapCue.tracks);
+        cdr::FlacWriter gapWriter;
+        gapWriter.setEmbeddedCueSheet(gapCue);
+        gapWriter.open(gapImage, album.forTrack(0, 3));
+        std::vector<uint8_t> gapPcm(size_t(1051) * cdr::kSectorBytes);
+        for (size_t i = 0; i < gapPcm.size(); ++i) gapPcm[i] = uint8_t(i * 5 + (i >> 11));
+        gapWriter.write(gapPcm.data(), gapPcm.size());
+        gapWriter.close();
+
+        check(run(flac + " -t -s " + quote(gapImage)) == 0, "flac -t accepts the image with pregaps");
+        check(run(metaflac + " --export-cuesheet-to=" + quote(gapExported) + " " + quote(gapImage)) == 0,
+              "metaflac exports the CUESHEET block with INDEX 00");
+        const std::string gapSheet = readText(gapExported);
+        check(gapSheet.find("  TRACK 01 AUDIO\n    ISRC JPVI09912345\n    INDEX 00 00:00:00\n    INDEX 01 00:01:00\n") !=
+                  std::string::npos,
+              "HTOA: track 1 INDEX 00 at 00:00:00, INDEX 01 at 00:01:00");
+        check(gapSheet.find("  TRACK 02 AUDIO\n    FLAGS PRE\n    INDEX 00 00:03:00\n    INDEX 01 00:05:00\n") !=
+                  std::string::npos,
+              "track 2 INDEX 00 at 00:03:00, INDEX 01 at 00:05:00");
+        check(gapSheet.find("    INDEX 01 00:11:00\n    INDEX 02 00:12:00\n") != std::string::npos,
+              "track 3 INDEX 01 at 00:11:00, INDEX 02 at 00:12:00");
+        fs::copy_file(gapImage, gapCopy, fs::copy_options::overwrite_existing);
+        const bool gapReimported =
+            run(metaflac + " --remove --block-type=CUESHEET " + quote(gapCopy)) == 0 &&
+            run(metaflac + " --import-cuesheet-from=" + quote(gapExported) + " " + quote(gapCopy)) == 0;
+        check(gapReimported, "metaflac re-imports the sheet with INDEX 00 (CD-DA validation)");
+        check(gapReimported && metadataBlock(gapCopy, 5) == metadataBlock(gapImage, 5) &&
+                  !metadataBlock(gapImage, 5).empty(),
+              "re-imported CUESHEET block with INDEX 00 is byte-identical");
+        if (failures) std::printf("%s\n", gapSheet.c_str());
+    }
 
     // ffprobe reads the ISRC (Vorbis comment ISRC, ID3 TSRC) and the MCN
     // (BARCODE) of single tracks.

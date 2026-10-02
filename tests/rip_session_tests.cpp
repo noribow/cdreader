@@ -800,6 +800,37 @@ TEST(unreadable_sectors_are_reported) {
     CHECK(contains(log, "\nFinished with errors\n"));
 }
 
+TEST(gaps_in_rip_log) {
+    // Track 2 has a 1-second pregap, track 3 an INDEX 02; read through the BOT.
+    Rig rig;
+    rig.fake.pregaps[2] = 75;
+    rig.fake.laterIndexes[3] = {600};
+    rig.session.readToc();
+    CHECK(rig.session.discGaps().status == cdr::DiscGaps::Status::NotRun);
+    rig.session.beginRip(settings("wav"));
+    const cdr::DiscGaps& gaps = rig.session.discGaps();
+    CHECK(gaps.status == cdr::DiscGaps::Status::Detected);
+    CHECK_EQ(gaps.pregap(2), 75u);
+    const int reads = rig.fake.subQReads;
+    CHECK(reads > 0);
+    rig.session.beginRip(settings("wav"));  // once per disc
+    CHECK_EQ(rig.fake.subQReads, reads);
+    TempDir dir;
+    CHECK(rig.session.ripTrack(1, dir.path / "1.wav").result.clean());
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "Gap detection: READ CD with formatted Q sub-channel, "));
+    CHECK(contains(log, "Track  2  pregap 00:01.00  INDEX 00 at LBA 225\n"));
+    CHECK(contains(log, "Track  3  pregap 00:00.00  INDEX 02 at LBA 600\n"));
+
+    // Disabled: no reads, the HTOA from the TOC only.
+    Rig off;
+    cdr::RipSettings s = settings("wav");
+    s.detectGaps = false;
+    off.session.beginRip(s);
+    CHECK_EQ(off.fake.subQReads, 0);
+    CHECK(contains(off.session.ripLog(), "Gap detection: not run (disabled)\n"));
+}
+
 int main() {
     for (auto& [name, fn] : registry()) {
         const int before = failures;

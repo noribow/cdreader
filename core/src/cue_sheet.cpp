@@ -51,24 +51,66 @@ CueTrack makeCueTrack(const Track& t, const std::string& file, uint32_t start, c
 }  // namespace
 
 std::vector<CueTrack> singleFileCueTracks(const std::vector<Track>& tracks, const std::string& file,
-                                          const AlbumMetadata& album) {
+                                          const AlbumMetadata& album, const DiscGaps& gaps, bool withHtoa) {
     std::vector<CueTrack> out;
     uint32_t position = 0;
+    if (withHtoa && !tracks.empty()) {
+        if (tracks.front().number != 1 || gaps.htoaSectors == 0 || tracks.front().startLba != gaps.htoaSectors)
+            throw std::invalid_argument("the image can only start with an HTOA before track 1");
+        position = gaps.htoaSectors;
+    }
     for (size_t i = 0; i < tracks.size(); ++i) {
-        if (i > 0 && (tracks[i].number != tracks[i - 1].number + 1 || tracks[i].startLba != tracks[i - 1].endLba()))
+        const Track& t = tracks[i];
+        if (i > 0 && (t.number != tracks[i - 1].number + 1 || t.startLba != tracks[i - 1].endLba()))
             throw std::invalid_argument("tracks " + std::to_string(tracks[i - 1].number) + " and " +
-                                        std::to_string(tracks[i].number) + " are not adjacent on the disc");
-        out.push_back(makeCueTrack(tracks[i], file, position, album));
-        position += tracks[i].lengthSectors;
+                                        std::to_string(t.number) + " are not adjacent on the disc");
+        CueTrack c = makeCueTrack(t, file, position, album);
+        // The pregap is inside the image when it lies within what precedes
+        // the track in the file: the previous track or the HTOA.
+        const uint32_t pregap = gaps.pregap(t.number);
+        if (pregap > 0 && pregap <= position && (i > 0 || (withHtoa && t.number == 1))) {
+            c.hasIndex00 = true;
+            c.index00Sectors = position - pregap;
+        } else if (i == 0 && t.number == 1 && gaps.htoaSectors > 0 && !withHtoa) {
+            c.pregapCommandSectors = gaps.htoaSectors;
+        }
+        for (uint32_t lba : gaps.laterIndexes(t.number))
+            if (lba > t.startLba && lba < t.endLba()) c.laterIndexes.push_back(position + (lba - t.startLba));
+        out.push_back(c);
+        position += t.lengthSectors;
     }
     return out;
 }
 
 std::vector<CueTrack> perTrackCueTracks(const std::vector<Track>& tracks, const std::vector<std::string>& files,
-                                        const AlbumMetadata& album) {
+                                        const AlbumMetadata& album, const DiscGaps& gaps,
+                                        const std::string& htoaFile) {
     if (files.size() != tracks.size()) throw std::invalid_argument("one file per track expected");
     std::vector<CueTrack> out;
-    for (size_t i = 0; i < tracks.size(); ++i) out.push_back(makeCueTrack(tracks[i], files[i], 0, album));
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        const Track& t = tracks[i];
+        CueTrack c = makeCueTrack(t, files[i], 0, album);
+        const uint32_t pregap = gaps.pregap(t.number);
+        if (t.number == 1 && gaps.htoaSectors > 0) {
+            if (!htoaFile.empty()) {
+                c.hasIndex00 = true;
+                c.index00File = htoaFile;
+                c.index00Sectors = 0;
+            } else {
+                c.pregapCommandSectors = gaps.htoaSectors;
+            }
+        } else if (pregap > 0 && i > 0) {
+            const Track& prev = tracks[i - 1];
+            if (prev.number + 1 == t.number && prev.endLba() == t.startLba && pregap <= prev.lengthSectors) {
+                c.hasIndex00 = true;
+                c.index00File = files[i - 1];
+                c.index00Sectors = prev.lengthSectors - pregap;
+            }
+        }
+        for (uint32_t lba : gaps.laterIndexes(t.number))
+            if (lba > t.startLba && lba < t.endLba()) c.laterIndexes.push_back(lba - t.startLba);
+        out.push_back(c);
+    }
     return out;
 }
 
@@ -108,13 +150,17 @@ std::string formatCueSheet(const AlbumMetadata& album, const std::vector<CueTrac
 
     std::string currentFile;
     bool first = true;
+    auto fileLine = [&](const std::string& file) {
+        if (!first && file == currentFile) return;
+        const size_t dot = file.rfind('.');
+        line("FILE " + quoted(file) + " " + cueFileType(dot == std::string::npos ? "" : file.substr(dot + 1)));
+        currentFile = file;
+        first = false;
+    };
     for (const CueTrack& t : tracks) {
-        if (first || t.file != currentFile) {
-            const size_t dot = t.file.rfind('.');
-            line("FILE " + quoted(t.file) + " " + cueFileType(dot == std::string::npos ? "" : t.file.substr(dot + 1)));
-            currentFile = t.file;
-            first = false;
-        }
+        // A track whose INDEX 00 is in another file (the previous track's)
+        // starts in that file; its own FILE line comes before INDEX 01.
+        fileLine(t.hasIndex00 && !t.index00File.empty() ? t.index00File : t.file);
         char head[32];
         std::snprintf(head, sizeof head, "  TRACK %02d AUDIO", t.number);
         line(head);
@@ -123,7 +169,14 @@ std::string formatCueSheet(const AlbumMetadata& album, const std::vector<CueTrac
         if (t.preEmphasis || t.copyPermitted)
             line(std::string("    FLAGS") + (t.copyPermitted ? " DCP" : "") + (t.preEmphasis ? " PRE" : ""));
         if (isValidIsrc(t.isrc)) line("    ISRC " + t.isrc);
+        if (t.pregapCommandSectors) line("    PREGAP " + formatCueTime(t.pregapCommandSectors));
+        if (t.hasIndex00) line("    INDEX 00 " + formatCueTime(t.index00Sectors));
+        fileLine(t.file);
         line("    INDEX 01 " + formatCueTime(t.startSectors));
+        for (size_t i = 0; i < t.laterIndexes.size() && i < 98; ++i) {
+            std::snprintf(head, sizeof head, "    INDEX %02d ", int(i + 2));
+            line(head + formatCueTime(t.laterIndexes[i]));
+        }
     }
 
     for (char c : s)

@@ -641,6 +641,68 @@ TEST(mka_image_chapters_at_cue_positions) {
     CHECK(decodeFlac(flac).pcm == s.pcm);
 }
 
+// #25: pregaps (INDEX 00) and the HTOA in a disc image. A chapter still
+// starts at the track's INDEX 01 and ends at the next INDEX 01 (a pregap is
+// the end of the previous chapter, as in the per-track files); an image that
+// starts with the HTOA gets a "Hidden Track" chapter before track 1.
+TEST(mka_image_chapters_with_pregaps_and_htoa) {
+    for (bool htoa : {false, true}) {
+        cdr::EmbeddedCueSheet cue;
+        const uint32_t starts[] = {htoa ? 40u : 0u, 301, 452};
+        for (int i = 0; i < 3; ++i) {
+            cdr::CueTrack t;
+            t.number = i + 1;
+            t.startSectors = starts[i];
+            t.title = "Song " + std::to_string(i + 1);
+            cue.tracks.push_back(t);
+        }
+        if (htoa) cue.tracks[0].hasIndex00 = true;  // INDEX 00 at 00:00:00
+        cue.tracks[1].hasIndex00 = true;             // a pregap of 11 frames
+        cue.tracks[1].index00Sectors = 290;
+        cue.tracks[2].laterIndexes = {500};          // INDEX 02: no chapter of its own
+        cue.totalSectors = 620;
+        cue.text = "REM test\r\n";
+        const testsig::Signal s = testsig::music(size_t(cue.totalSectors) * cdr::kSamplesPerSector);
+        cdr::TrackMetadata album = trackMetadata();
+        album.trackNumber = 0;
+        const Parsed p = encodeFile("mka-pcm", s.pcm, album, &cue);
+
+        const ebml::Element edition = ebml::find(p.d, p.topLevel(id::kChapters), id::kEditionEntry);
+        const std::vector<ebml::Element> atoms = ebml::all(p.d, edition, id::kChapterAtom);
+        std::vector<uint32_t> bounds = {starts[0], starts[1], starts[2], cue.totalSectors};
+        std::vector<std::string> titles = {"Song 1", "Song 2", "Song 3"};
+        if (htoa) {
+            bounds.insert(bounds.begin(), 0);
+            titles.insert(titles.begin(), "Hidden Track");
+        }
+        CHECK_EQ(atoms.size(), titles.size());
+        CHECK_EQ(cdr::MkaWriter::hasHtoaChapter(cue), htoa);
+        std::vector<uint64_t> uids;
+        for (size_t i = 0; i < atoms.size() && i < titles.size(); ++i) {
+            const uint64_t start = ebml::uintValue(p.d, ebml::find(p.d, atoms[i], id::kChapterTimeStart));
+            const uint64_t end = ebml::uintValue(p.d, ebml::find(p.d, atoms[i], id::kChapterTimeEnd));
+            CHECK_EQ(start, uint64_t(std::llround(double(bounds[i]) * 1e9 / 75)));
+            CHECK_EQ(end, uint64_t(std::llround(double(bounds[i + 1]) * 1e9 / 75)));
+            const ebml::Element display = ebml::find(p.d, atoms[i], id::kChapterDisplay);
+            CHECK(ebml::stringValue(p.d, ebml::find(p.d, display, id::kChapString)) == titles[i]);
+            uids.push_back(ebml::uintValue(p.d, ebml::find(p.d, atoms[i], id::kChapterUid)));
+        }
+        // Chapter tags follow the chapters: the HTOA is part 0.
+        if (htoa && uids.size() == 4) {
+            CHECK(tagsOf(p, 30, uids[0]) == TagList({{"TITLE", "Hidden Track"}, {"PART_NUMBER", "0"}}));
+            CHECK(uids[0] != uids[1]);
+        }
+        if (uids.size() >= 3) {
+            const uint64_t song2 = uids[uids.size() - 2];
+            CHECK(tagsOf(p, 30, song2) == TagList({{"TITLE", "Song 2"}, {"PART_NUMBER", "2"}}));
+        }
+        // The audio is the whole image, gaps and HTOA included.
+        Bytes pcm;
+        for (const Frame& f : p.frames) pcm.insert(pcm.end(), f.data.begin(), f.data.end());
+        CHECK(pcm == s.pcm);
+    }
+}
+
 #ifdef CDREADER_HAVE_OPUS
 TEST(mka_opus_codec_delay_and_end_trimming) {
     const cdr::Resampler resampler(44100, 48000, 2);

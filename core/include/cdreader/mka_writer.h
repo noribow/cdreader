@@ -58,8 +58,13 @@ public:
     Codec codec() const { return codec_; }
 
     // Chapters of a disc image: one per CUE track, from its INDEX 01 to the
-    // next track (the last one to the lead-out), times rounded to nanoseconds.
+    // next track's INDEX 01 (the last one to the lead-out), times rounded to
+    // nanoseconds. A pregap (INDEX 00, #25) is thus the end of the previous
+    // chapter, as in the per-track files; an image starting with the HTOA
+    // gets a first chapter "Hidden Track" from 0 to track 1's INDEX 01.
     static std::vector<mkv::Chapter> chaptersFor(const EmbeddedCueSheet& cue, const TrackMetadata& album);
+    // Whether chaptersFor(cue) starts with the HTOA chapter.
+    static bool hasHtoaChapter(const EmbeddedCueSheet& cue);
     // The Tags written for `metadata` (and the chapters of a disc image).
     static std::vector<mkv::Tag> tagsFor(const TrackMetadata& metadata, const std::vector<mkv::Chapter>& chapters,
                                          const EmbeddedCueSheet* cue);

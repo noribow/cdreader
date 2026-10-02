@@ -282,6 +282,53 @@ void checkImage(Checker& c, const std::string& format) {
     fs::remove(file);
 }
 
+// #25: an image starting with the HTOA (track 1: INDEX 00 at 0, INDEX 01 at
+// 75) and a pregap before track 2. ffprobe must show the "Hidden Track"
+// chapter first and the tracks' chapters at their INDEX 01.
+void checkHtoaImage(Checker& c) {
+    const uint32_t bounds[] = {0, 75, 1501, 2876, 4000};
+    cdr::EmbeddedCueSheet cue;
+    for (int i = 0; i < 3; ++i) {
+        cdr::CueTrack t;
+        t.number = i + 1;
+        t.startSectors = bounds[i + 1];
+        t.title = "Song " + std::to_string(i + 1);
+        cue.tracks.push_back(t);
+    }
+    cue.tracks[0].hasIndex00 = true;
+    cue.tracks[1].hasIndex00 = true;
+    cue.tracks[1].index00Sectors = 1351;
+    cue.totalSectors = bounds[4];
+    const testsig::Signal s = testsig::music(size_t(cue.totalSectors) * cdr::kSamplesPerSector);
+    cdr::TrackMetadata album = metadata();
+    album.trackNumber = 0;
+    album.title.clear();
+    const fs::path file = c.dir / "htoa.mka";
+    encode("mka", file, s.pcm, album, &cue);
+    const std::string label = "mka disc image with HTOA and pregap";
+    c.mkvinfo(file, label);
+    if (!c.tools.ffprobe.empty()) {
+        const std::string text = c.probe(file, "-show_chapters -of default=noprint_wrappers=1");
+        std::istringstream lines(text);
+        std::string line;
+        std::vector<long long> chapterStarts, chapterEnds;
+        std::vector<std::string> titles;
+        while (std::getline(lines, line)) {
+            if (line.rfind("start=", 0) == 0) chapterStarts.push_back(std::atoll(line.c_str() + 6));
+            else if (line.rfind("end=", 0) == 0) chapterEnds.push_back(std::atoll(line.c_str() + 4));
+            else if (lower(line).rfind("tag:title=", 0) == 0) titles.push_back(line.substr(10));
+        }
+        bool ok = chapterStarts.size() == 4 && chapterEnds.size() == 4 && titles.size() == 4;
+        for (size_t i = 0; ok && i < 4; ++i)
+            ok = chapterStarts[i] == std::llround(double(bounds[i]) * 1e9 / 75) &&
+                 chapterEnds[i] == std::llround(double(bounds[i + 1]) * 1e9 / 75) &&
+                 titles[i] == (i == 0 ? std::string("Hidden Track") : "Song " + std::to_string(i));
+        c.expect(ok, "ffprobe chapters (HTOA first, tracks at INDEX 01): " + label);
+        if (!ok) std::printf("%s\n", text.c_str());
+    }
+    fs::remove(file);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -317,6 +364,7 @@ int main(int argc, char** argv) {
         }
     }
     checkImage(c, "mka");
+    checkHtoaImage(c);
     if (std::find(formats.begin(), formats.end(), "mka-opus") != formats.end()) checkImage(c, "mka-opus");
     fs::remove_all(c.dir);
     std::printf("\n%s\n", c.failures ? "FAILED" : "PASSED");

@@ -2,7 +2,7 @@
 //   flac      `flac -t --ogg` (CRCs + MD5) and `flac -d --ogg` must give the
 //             input PCM bit for bit; for a disc image, `flac -d --cue=` (which
 //             reads the CUESHEET block through libFLAC) must cut each track at
-//             its position,
+//             its position (and at the INDEX 00 / 02 points of #25),
 //   ogginfo   must accept the stream without warnings,
 //   ffmpeg    must decode it to the input PCM bit for bit,
 //   ffprobe   must read the tags (and the CUESHEET tag of a disc image).
@@ -190,9 +190,12 @@ void checkSignals(Checker& c) {
     }
 }
 
-// A three-track disc image with an embedded CUE sheet.
-void checkImage(Checker& c) {
-    const uint32_t starts[] = {0, 40, 115};  // sectors
+// A three-track disc image with an embedded CUE sheet. With `gaps` (#25):
+// an HTOA of 10 sectors (track 1: INDEX 00 at 0, INDEX 01 at 10), a pregap
+// of 10 sectors before track 2 and an INDEX 02 in track 3; `flac -d --cue=`
+// must find every index point in the CUESHEET block.
+void checkImage(Checker& c, bool gaps) {
+    const uint32_t starts[] = {gaps ? 10u : 0u, 40, 115};  // INDEX 01, sectors
     const uint32_t sectors = 200;
     const testsig::Signal s = testsig::music(size_t(sectors) * cdr::kSamplesPerSector);
     cdr::AlbumMetadata album;
@@ -207,33 +210,49 @@ void checkImage(Checker& c) {
         t.title = "Track " + std::to_string(i + 1);
         cue.tracks.push_back(t);
     }
+    if (gaps) {
+        cue.tracks[0].hasIndex00 = true;  // the HTOA
+        cue.tracks[1].hasIndex00 = true;
+        cue.tracks[1].index00Sectors = 30;
+        cue.tracks[2].laterIndexes = {150};
+    }
     cue.totalSectors = sectors;
     cue.text = cdr::formatCueSheet(album, cue.tracks);
     const fs::path file = c.dir / "image.oga";
     encode(file, s.pcm, album.forTrack(0, 3), &cue);
-    const std::string label = "disc image with CUESHEET";
+    const std::string label = gaps ? "disc image with HTOA / pregap CUESHEET" : "disc image with CUESHEET";
+    auto cut = [&](const std::string& range, uint32_t from, uint32_t to, const std::string& what) {
+        const fs::path raw = c.dir / "track.raw";
+        fs::remove(raw);
+        const int status = run(c.flacDecode(file, raw, "--cue=" + range));
+        const std::vector<uint8_t> want(s.pcm.begin() + std::ptrdiff_t(size_t(from) * cdr::kSectorBytes),
+                                        s.pcm.begin() + std::ptrdiff_t(size_t(to) * cdr::kSectorBytes));
+        c.expect(status == 0 && readFile(raw) == want, "flac -d --cue=" + range + ": " + what + " from the CUESHEET block");
+        fs::remove(raw);
+    };
     if (!c.tools.flac.empty()) {
         c.flac(file, s.pcm, label);
         // Track n = INDEX 01 of track n up to INDEX 01 of track n + 1 (the last one to the end).
         for (int i = 0; i < 3; ++i) {
             const std::string range = std::to_string(i + 1) + ".1" + (i < 2 ? "-" + std::to_string(i + 2) + ".1" : "");
-            const fs::path raw = c.dir / "track.raw";
-            fs::remove(raw);
-            const int status = run(c.flacDecode(file, raw, "--cue=" + range));
-            const size_t begin = size_t(starts[i]) * cdr::kSectorBytes;
-            const size_t end = (i < 2 ? size_t(starts[i + 1]) : size_t(sectors)) * cdr::kSectorBytes;
-            const std::vector<uint8_t> want(s.pcm.begin() + std::ptrdiff_t(begin), s.pcm.begin() + std::ptrdiff_t(end));
-            c.expect(status == 0 && readFile(raw) == want, "flac -d --cue=" + range + ": track " + std::to_string(i + 1) +
-                                                               " from the CUESHEET block");
-            fs::remove(raw);
+            cut(range, starts[i], i < 2 ? starts[i + 1] : sectors, "track " + std::to_string(i + 1));
+        }
+        if (gaps) {
+            cut("1.0-1.1", 0, 10, "the HTOA");
+            cut("2.0-2.1", 30, 40, "the pregap of track 2");
+            cut("3.2", 150, sectors, "INDEX 02 of track 3");
         }
     }
     if (!c.tools.ogginfo.empty()) c.ogginfo(file, label);
     if (!c.tools.ffmpeg.empty()) c.ffmpeg(file, s.pcm, label);
     if (!c.tools.ffprobe.empty()) {
-        // The CUESHEET tag (multi-line text) with each track's INDEX 01.
-        c.tags(file, {{"album", "Album"}}, label + ": tags and CUESHEET tag",
-               {"tag:cuesheet=", "TRACK 01 AUDIO", "INDEX 01 00:00:40", "TRACK 03 AUDIO", "INDEX 01 00:01:40"});
+        // The CUESHEET tag (multi-line text) with each track's index points.
+        if (gaps)
+            c.tags(file, {{"album", "Album"}}, label + ": tags and CUESHEET tag",
+                   {"tag:cuesheet=", "INDEX 00 00:00:00", "INDEX 01 00:00:10", "INDEX 00 00:00:30", "INDEX 02 00:02:00"});
+        else
+            c.tags(file, {{"album", "Album"}}, label + ": tags and CUESHEET tag",
+                   {"tag:cuesheet=", "TRACK 01 AUDIO", "INDEX 01 00:00:40", "TRACK 03 AUDIO", "INDEX 01 00:01:40"});
     }
     fs::remove(file);
 }
@@ -263,7 +282,8 @@ int main(int argc, char** argv) {
     c.dir = fs::temp_directory_path() / "cdreader_ogg_flac_check";
     fs::create_directories(c.dir);
     checkSignals(c);
-    checkImage(c);
+    checkImage(c, false);
+    checkImage(c, true);
     fs::remove_all(c.dir);
     std::printf("\n%s\n", c.failures ? "FAILED" : "PASSED");
     return c.failures ? 1 : 0;

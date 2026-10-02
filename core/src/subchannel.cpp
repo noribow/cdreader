@@ -118,6 +118,109 @@ SubChannelCode subChannelError(const ScsiResult& r) {
     return make(SubChannelCode::Status::Failed, {}, r.describe());
 }
 
+// --- Per-sector Q frames --------------------------------------------------------
+
+size_t subChannelBytesPerSector(SubChannelSelection selection) {
+    switch (selection) {
+        case SubChannelSelection::None: return 0;
+        case SubChannelSelection::RawPW: return 96;
+        case SubChannelSelection::FormattedQ: return 16;
+    }
+    return 0;
+}
+
+uint16_t subQCrc16(const uint8_t* data, size_t length) {
+    uint16_t crc = 0;
+    for (size_t i = 0; i < length; ++i) {
+        crc ^= uint16_t(data[i]) << 8;
+        for (int b = 0; b < 8; ++b) crc = uint16_t((crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1);
+    }
+    return crc;
+}
+
+void deinterleaveQ(const uint8_t* rawPw, uint8_t q[12]) {
+    for (size_t i = 0; i < 12; ++i) {
+        uint8_t v = 0;
+        for (size_t b = 0; b < 8; ++b) v = uint8_t(v << 1 | ((rawPw[i * 8 + b] >> 6) & 1));
+        q[i] = v;
+    }
+}
+
+void interleaveQ(const uint8_t q[12], bool pause, uint8_t* rawPw) {
+    for (size_t j = 0; j < 96; ++j) {
+        const uint8_t bit = (q[j / 8] >> (7 - j % 8)) & 1;
+        rawPw[j] = uint8_t((rawPw[j] & 0x3F) | (pause ? 0x80 : 0) | (bit << 6));
+    }
+}
+
+namespace {
+
+// A BCD byte (00..99), or -1.
+int bcd(uint8_t v) {
+    const int hi = v >> 4, lo = v & 0x0F;
+    return hi > 9 || lo > 9 ? -1 : hi * 10 + lo;
+}
+
+// Sectors of an MSF time, or -1 when it is not valid BCD / out of range.
+int32_t msfSectors(const uint8_t* msf) {
+    const int m = bcd(msf[0]), s = bcd(msf[1]), f = bcd(msf[2]);
+    if (m < 0 || s < 0 || s > 59 || f < 0 || f >= int(kSectorsPerSecond)) return -1;
+    return (m * 60 + s) * int32_t(kSectorsPerSecond) + f;
+}
+
+int32_t be32s(const uint8_t* p) {
+    return int32_t(uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]);
+}
+
+}  // namespace
+
+QFrame parseQ(const uint8_t* q, bool withCrc) {
+    QFrame f;
+    f.control = q[0] >> 4;
+    f.adr = q[0] & 0x0F;
+    if (withCrc)
+        f.crc = uint16_t(subQCrc16(q, 10) ^ 0xFFFF) == uint16_t(q[10] << 8 | q[11]) ? QFrame::Crc::Valid
+                                                                                     : QFrame::Crc::Invalid;
+    if (f.adr != 1) {  // MCN / ISRC / unknown mode: no position to decode
+        f.parsed = f.adr == 2 || f.adr == 3;
+        return f;
+    }
+    f.track = q[1] == 0xAA ? 170 : bcd(q[1]);
+    f.index = bcd(q[2]);
+    const int32_t relative = msfSectors(q + 3);
+    const int32_t absolute = msfSectors(q + 7);
+    f.parsed = f.track >= 1 && (f.track <= 99 || f.track == 170) && f.index >= 0 && relative >= 0 && absolute >= 0;
+    if (!f.parsed) return f;
+    // The relative time counts down to INDEX 01 in the pregap.
+    f.relative = f.index == 0 && f.track != 170 ? -relative : relative;
+    f.absoluteLba = absolute - int32_t(kPregapSectors);
+    return f;
+}
+
+QFrame parseFormattedQ(const uint8_t* data) { return parseQ(data, data[10] != 0 || data[11] != 0); }
+
+QFrame parseRawPwQ(const uint8_t* rawPw) {
+    uint8_t q[12];
+    deinterleaveQ(rawPw, q);
+    return parseQ(q, true);
+}
+
+// MMC CD current position data format: byte 5 ADR (high nibble) / CONTROL,
+// byte 6 track, byte 7 index (binary), bytes 8..11 absolute and 12..15
+// track relative address (LBA, signed).
+QFrame parseCurrentPosition(const uint8_t* d, size_t length) {
+    QFrame f;
+    if (d == nullptr || length < 16 || d[4] != uint8_t(SubChannelFormat::CurrentPosition)) return f;
+    f.adr = d[5] >> 4;
+    f.control = d[5] & 0x0F;
+    f.track = d[6];
+    f.index = d[7];
+    f.absoluteLba = be32s(d + 8);
+    f.relative = be32s(d + 12);
+    f.parsed = f.adr == 1 && f.track >= 1 && (f.track <= 99 || f.track == 170) && f.index <= 99;
+    return f;
+}
+
 std::string DiscCodes::isrc(int track) const {
     const auto it = isrcs.find(track);
     return it != isrcs.end() && it->second.found() ? it->second.value : std::string();

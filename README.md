@@ -20,6 +20,8 @@
 - WAV へのタグ書き込み (RIFF `LIST`/`INFO` と ID3v2.4 の `id3 ` チャンク、UTF-8)
 - CUE シートの出力 (シングルファイル / トラックごとのどちらでも)
 - ディスクの MCN (カタログ番号、JAN / UPC) とトラックごとの ISRC をサブチャンネル Q から読み取り、CUE シート・FLAC の `CUESHEET`・タグ・`rip.log` に記録
+- トラック間のプリギャップ (`INDEX 00`)・`INDEX 02` 以降と、1 曲目の前の隠しトラック (HTOA) をサブチャンネル Q から検出し、
+  CUE シート・FLAC の `CUESHEET`・`rip.log` に反映 (HTOA はシングルファイルのイメージに含め、`--htoa` でトラック 00 としても保存)
 - 読み取りエラー時のリトライ、失敗したブロックはセクタ単位で再読込し、読めないセクタだけを無音で補完
 - `--verify` で 2 回読みして一致を確認 (セキュアモード)
 - ドライブの読み取りオフセット補正 (`--offset`、EAC / AccurateRip と同じ値)
@@ -53,6 +55,8 @@ cdreader rip D: --cddb-match 2      CDDB の候補が複数あるとき 2 番目
 cdreader rip D: --no-cddb           CDDB に問い合わせない (cd_<CDDB ID>\TrackNN.wav)
 cdreader rip D: --no-accuraterip    AccurateRip の照合 (ネットワークアクセス) をしない
 cdreader rip D: --no-isrc           MCN / ISRC を読み取らない (読み取りの遅いドライブ向け)
+cdreader rip D: --no-gaps           プリギャップ (INDEX 00) を検出しない (時間短縮)
+cdreader rip D: -f flac --htoa      1 曲目の前の隠しトラック (HTOA) も 00 - Hidden Track.flac として保存
 cdreader offset D:                  読み取りオフセットを AccurateRip で検出
 ```
 
@@ -70,6 +74,8 @@ cdreader offset D:                  読み取りオフセットを AccurateRip �
 | `--no-cue-file` | 外部の `.cue` ファイルを書かない |
 | `--no-accuraterip` | リッピング後に AccurateRip データベースを照会しない (チェックサムは `rip.log` に記録されます) |
 | `--no-isrc` | MCN (カタログ番号) と ISRC を読み取らない (`toc` でも使えます)。読み取りに時間のかかるドライブ向け |
+| `--no-gaps` | プリギャップ (`INDEX 00`)・`INDEX 02` 以降の検出をしない (`toc` でも使えます)。CUE シートは `INDEX 01` のみになります。HTOA は TOC から分かるため従来どおり扱います |
+| `--htoa` | トラックごとのリッピングで、1 曲目の前の隠しトラック (HTOA) をトラック 00 (`00 - Hidden Track.<拡張子>` / `Track00.<拡張子>`) としても保存する (シングルファイルでは常にイメージに含めます) |
 
 CDDB のオプション (`rip` と `toc` の両方で使えます):
 
@@ -140,7 +146,9 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - `--no-cue-file` を付けると外部の `.cue` を書きません (埋め込みのみ)。
 - MCN (カタログ番号) と各トラックの ISRC も `CUESHEET` ブロックに入ります (MCN は 128 バイトの欄に 13 桁の ASCII、ISRC は 12 バイト)。
   `metaflac --import-cuesheet-from` で取り込んだ場合とバイト単位で同じブロックになることをテストで確認しています。
-  プリギャップ (`INDEX 00`) は含みません。
+- プリギャップを検出したトラックは index point 0 (`INDEX 00`) と 1 (`INDEX 01`) を持ちます (トラックの開始位置は `INDEX 00`、
+  `INDEX 01` はそこからの相対位置。`INDEX 02` 以降も同様)。HTOA を含むイメージではトラック 1 が 0 サンプル目の `INDEX 00` から始まります。
+  これも `metaflac` で書き出し・再取り込みしてバイト単位で一致することをテストで確認しています。
 - トラックごとのリッピング (`--single-file` なし) では埋め込みません (1 ファイル 1 トラックのため)。
 
 ### Ogg FLAC 出力
@@ -156,9 +164,12 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - `SEEKTABLE` は書きません (Ogg ではグラニュール位置でシークするため)。`PADDING` も書きません (Ogg のタグ編集はファイルを書き直すため)。
 - `STREAMINFO` の総サンプル数・MD5・フレームサイズと `CUESHEET` のリードアウトは最後に確定するので、ファイルを閉じるときに
   ヘッダーのページ (大きさは変わりません) を作り直して先頭に上書きします (CRC も再計算)。
-- タグと CUE シートの埋め込み (`CUESHEET` ブロック + `CUESHEET` タグ) は FLAC 出力と同じです。
+- タグと CUE シートの埋め込み (`CUESHEET` ブロック + `CUESHEET` タグ) は FLAC 出力と同じです
+  (プリギャップの `INDEX 00`・`INDEX 02` 以降・HTOA も同じ index point になり、`CUESHEET` ブロックは FLAC 出力とバイト単位で同一)。
   `flac -t ファイル名.oga` で CRC と MD5 を検証できます。`metaflac` は Ogg FLAC を読めないため、埋め込み CUE シートは
-  `flac -d --cue=2.1-3.1 ファイル名.oga` (トラック 2 だけをデコード) や foobar2000 などで使えます。
+  `flac -d --cue=2.1-3.1 ファイル名.oga` (トラック 2 だけをデコード。`--cue=2.0-2.1` ならトラック 2 のプリギャップ、
+  `--cue=1.0-1.1` なら HTOA) や foobar2000 などで使えます。
+
 ### ALAC (M4A) 出力
 
 `--format alac` を指定すると、各トラックを ALAC (Apple Lossless Audio Codec、可逆圧縮) で MP4 コンテナの `.m4a` ファイルに保存します
@@ -247,6 +258,11 @@ WAV / FLAC / Opus と同じ 1 つの `--format` で選べるようにしてい�
   (FFmpeg / ffprobe では `title` が曲名、`album` がアルバム名、`track` がトラック番号として読めます)。
 - **`--single-file`**: 外部の `.cue` に加えて、CUE シートの各トラックの位置 (`INDEX 01`) をチャプター (`ChapterAtom`、名前は曲名) として記録します。
   チャプターの時刻は 1/75 秒単位の CUE の位置をナノ秒に丸めたもので、曲名・アーティスト・トラック番号・ISRC はチャプターごとのタグ (`TagChapterUID`) にも書きます。
+  チャプターは各トラックの `INDEX 01` から次のトラックの `INDEX 01` まで (最後はイメージの終わりまで) で、
+  プリギャップ (`INDEX 00`) は前のトラックのチャプターの末尾に含まれます (トラックごとのリッピングでギャップを前のファイルに付ける
+  のと同じ区切り。チャプターを選ぶと CUE シートのトラックと同じく `INDEX 01` から再生されます)。`INDEX 02` 以降はチャプターにしません。
+  HTOA を含むイメージ ([#25](https://github.com/noribow/cdreader/issues/25)) では、先頭に 0 秒からトラック 1 の `INDEX 01` までの
+  チャプター「Hidden Track」(タグの `PART_NUMBER` は 0) を加え、イメージ全体がチャプターで覆われるようにします。
 - Opus / Vorbis をビルドに含めていない場合、`mka-opus` / `mka-vorbis` は使えません (「このビルドでは使えない」旨のエラーになります)。
 
 #### MP3 / AAC に対応しない理由
@@ -369,8 +385,73 @@ CD のサブチャンネル Q には、ディスクの **MCN** (Media Catalog Nu
   ANSI コードページ (日本語 Windows では Shift_JIS) を既定とするソフトは BOM がないと UTF-8 と判別できない一方、
   古いパーサー (cuetools 1.4 / libcue など) は BOM を 1 行目の一部として扱いその行を読み飛ばします。
   そのため 1 行目は常に読み飛ばされても困らない `REM COMMENT "cdreader"` にしています。
-- プリギャップ (`INDEX 00`) は現状読み取っていません。トラック間のギャップは前のトラックの末尾に含まれます (EAC の「ギャップを前のトラックに付加」と同じ)。
-  トラック 1 の前の隠しトラック (HTOA) も保存しません。
+- プリギャップ (`INDEX 00`)・`INDEX 02` 以降・HTOA の書き方は次の節を参照してください。
+
+### プリギャップ (INDEX 00) と HTOA の検出
+
+TOC に載っているのは各トラックの `INDEX 01` (曲の開始位置) だけです。多くの CD ではトラックの間に
+**プリギャップ** (次のトラックの `INDEX 00`。2 秒の無音が多いが、拍手やカウントなど音の入ったものもある) があり、
+TOC 上は前のトラックの末尾に含まれます。また、1 曲目の `INDEX 01` が LBA 0 より後ろにあるディスクでは、その手前
+(1 曲目の `INDEX 00`) に巻き戻さないと聴けない **隠しトラック (HTOA, Hidden Track One Audio)** が入っています。
+
+`rip` / `toc` は既定でサブチャンネル Q を読んでこれらを検出します (`--no-gaps` で省略)。
+
+- 各セクタの Q フレームには「トラック番号・インデックス番号・絶対位置」が記録されています。
+  「トラック番号 × 100 + インデックス番号」はディスク上で単調に増えるため、`INDEX 01` から前へ 1, 2, 4, 8 … セクタと戻って
+  (ギャロッピング) 前のトラックに入った位置を見つけ、その間を二分探索して `INDEX 00` の先頭を求めます。
+  2 秒のギャップなら 1 トラックあたり 20 回程度の読み取りです (ディスク全体の上限は 4000 回。超えたトラックは「不明」)。
+  `INDEX 02` 以降は各トラックの末尾 (次のプリギャップの直前) を 1 回読んで、あれば同様に探索します。
+- 読み取り方法は、対応しているものを次の順に自動で選びます:
+  1. `READ CD` (BEh) + サブチャンネル選択 010b (フォーマット済み Q、16 バイト/セクタ)。CRC を返すドライブでは CRC を確認
+  2. `READ CD` + サブチャンネル選択 001b (生の P-W、96 バイト/セクタ)。Q をデインターリーブし、CRC-16 (CCITT、反転格納) を確認
+  3. `READ CD` の後に `READ SUB-CHANNEL` (42h) 形式 01h (現在位置)。遅いため最後の手段
+- 堅牢性: 1 回のコマンドで 3 セクタ読み、MCN / ISRC のフレーム (ADR 2 / 3、約 100 セクタに 1 回) や CRC エラーのセクタの代わりに隣のセクタを使います。
+  位置はフレーム自身の絶対アドレスを使い、要求したセクタから 10 セクタを超えて離れたフレームは捨てます。
+  見つけた境界は前後のセクタを読み直して確認し、矛盾した場合 (CRC を返さないドライブが誤ったフレームを返した場合) は
+  「同じ位置で 2 回一致したフレームだけを使う」モードで探索し直します。それでも決まらないトラックは「不明」としてプリギャップなし扱いにします。
+- コマンドに対応していない・正しいフレームを返さないドライブでは検出をあきらめ、従来どおり `INDEX 01` だけの CUE シートになります (リッピングは続行)。
+- HTOA は TOC だけで分かります (トラック 1 の開始 LBA > 0)。検出時は LBA 0 とトラック 1 の直前が「トラック 1・INDEX 00」であることを Q で確認します。
+- 結果は `rip.log` と `cdreader toc` に表示します (所要時間・読み取り回数を含む):
+
+```
+Gap detection: READ CD with formatted Q sub-channel, 112 reads in 3.8 s
+HTOA (hidden track before track 1): 00:32.00, LBA 0-2399, confirmed by the Q sub-channel
+Track  1  pregap 00:32.00  INDEX 00 at LBA 0 (HTOA)
+Track  2  pregap 00:02.00  INDEX 00 at LBA 18350
+Track  3  pregap 00:00.00  INDEX 02 at LBA 40125
+Track  4  pregap unknown (no usable Q frame near LBA 51230)
+```
+
+CUE シート・FLAC への反映:
+
+| 出力 | プリギャップ | HTOA |
+| --- | --- | --- |
+| `--single-file` | イメージ内の位置で `INDEX 00` / `INDEX 01` (ギャップはイメージの一部) | イメージを LBA 0 から作り、トラック 1 を `INDEX 00 00:00:00` / `INDEX 01 <HTOA の長さ>` にする (既定) |
+| トラックごと | EAC の既定 (「ギャップを前のトラックに付加」、noncompliant) と同じ: ギャップは前のトラックのファイルの末尾。トラック N は前のファイルの中で `TRACK` と `INDEX 00` を書き、続けて自分の `FILE` と `INDEX 01 00:00:00` | `--htoa` でトラック 00 のファイルに保存し、トラック 1 の `INDEX 00 00:00:00` をそのファイルに置く。`--htoa` なしでは `PREGAP <長さ>` (書き込み時に同じ長さの無音を生成し、ディスクのレイアウトを保つ) |
+| FLAC の `CUESHEET` (シングルファイル) | index point 0 と 1 | トラック 1 の index point 0 がファイル先頭 |
+
+トラックごとの CUE シートの例 (トラック 2 に 2 秒のギャップ、HTOA をトラック 00 として保存):
+
+```
+FILE "00 - Hidden Track.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 00 00:00:00
+FILE "01 - Opening.flac" WAVE
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    INDEX 00 04:11:20
+FILE "02 - Song.flac" WAVE
+    INDEX 01 00:00:00
+```
+
+- 位置は TOC と同じ LBA (セクタ単位) です。読み取りオフセット補正をしても、トラックの境界と同じく各インデックスの位置はそのままです。
+- 一部のトラックだけを指定した場合、先頭トラックのギャップ (ファイルに含まれない) は書きません。トラックごとの場合も、直前のトラックを
+  リッピングしていないトラックのギャップは書きません。
+- シングルファイルではトラック 1 を含めると HTOA もイメージに入ります (`rip.log` に `Track 00 (HTOA)` の CRC32 を記録)。
+  HTOA は AccurateRip の照合対象外です。トラックごとのリッピングで HTOA があり `--htoa` を付けなかった場合は、その旨を表示します。
+- 検出はトラックごと・シングルファイルのどちらでも既定で行います (EAC と同様)。時間を節約したい場合は `--no-gaps` を付けます
+  (HTOA は TOC から分かるため、シングルファイルではそのまま含めます)。
+- ドライブによってサブチャンネルの精度が異なるため、実機での確認はこれからです ([#25](https://github.com/noribow/cdreader/issues/25))。
 
 ドライブへのアクセスは SCSI パススルー (`IOCTL_SCSI_PASS_THROUGH_DIRECT`) を使います。
 "Access is denied" になる環境では管理者として実行してください。
@@ -410,6 +491,7 @@ SCSI/MMC コマンドを送ります)。
 保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`。Ogg FLAC は `.oga`、ALAC は `.m4a`、Opus は `.opus`、Vorbis は `.ogg`、MKA は `.mka`) と `rip.log` が作られます。
 ファイルにはタグ (曲名・アーティスト・アルバム・年・ジャンル・トラック番号・CDDB ID、ディスクに記録されていれば ISRC と MCN) が書き込まれます。
 MCN / ISRC はリッピング開始時にディスクごとに 1 回読み取り、`rip.log` にも記録します。
+プリギャップ・HTOA もリッピング開始時にディスクごとに 1 回検出し、`rip.log` に記録します (Android 版はまだ CUE シート・シングルファイルを書かないため記録のみ。HTOA は保存しません)。
 `rip.log` には Windows 版と同じく、ドライブ・設定・TOC・CDDB の結果・トラックごとの CRC32 / リトライ回数 / 読めなかったセクタ数・
 AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
 読み取り中は「キャンセル」で中断できます。リトライ回数は 5 回固定です。
@@ -473,6 +555,12 @@ FLAC は MD5 / CRC / ビット書き込み / Rice 符号の単体テストと、
 `ffprobe` があれば FLAC / WAV の `ISRC` / `BARCODE` タグが読めることも確認します)。
 MCN / ISRC は仮想ドライブの `READ SUB-CHANNEL` 応答で、CDB のバイト列、有効ビット 0、不正な文字・短い応答・形式コードやトラック番号の不一致、
 非対応ドライブ (ILLEGAL REQUEST) を検証します。
+プリギャップ・HTOA は、仮想ドライブがセクタごとのサブチャンネル Q (フォーマット済み Q・生の P-W・`READ SUB-CHANNEL` 現在位置) を返し、
+Q の解析 (BCD・CRC-16・デインターリーブ)、さまざまな長さのギャップ (0・1・150・157・ほぼ 1 トラック分)、HTOA、`INDEX 02` 以降、
+MCN / ISRC フレームや CRC エラー・CRC なしの誤ったフレームの混入、非対応ドライブ、読み取り回数の上限、CUE シート (シングルファイル・トラックごと)、
+`CUESHEET` ブロックのバイト列、HTOA を含むイメージが各トラックの連結と一致すること (オフセット補正あり) を検証します。
+HTOA・プリギャップを含むイメージは Ogg FLAC (`CUESHEET` ブロックが FLAC と同一、`flac -d --cue=1.0-1.1` / `2.0-2.1` / `3.2` で切り出し)、
+MKA (チャプターの時刻・「Hidden Track」チャプター、`ffprobe` での読み取り)、ALAC (イメージの PCM がそのまま入ること) でも確認します。
 Ogg FLAC は、最初のパケットのバイト列、パケット・ページ構成 (ヘッダーのページ、BOS / EOS、通し番号)、グラニュール位置、`STREAMINFO` の値を検証し、
 パケットから組み立て直した FLAC を簡易デコーダでデコードして元の PCM と一致すること、フレームが FLAC 出力とバイト単位で同一であることを確かめます。
 さらに `ogg_flac_check` が、インストールされているツールで `flac -t` / `flac -d` (ビット単位で一致)、埋め込み CUE シートの `CUESHEET` ブロックを使った
@@ -535,7 +623,8 @@ cmake -S . -B build -DCDREADER_BUILD_JNI=ON && cmake --build build
 core/       プラットフォーム非依存のコア (Windows / Android で共有)
   scsi      ScsiTransport インターフェース、センスデータ解析
   cd_drive  MMC コマンド (INQUIRY, TEST UNIT READY, READ TOC, READ CD, READ SUB-CHANNEL)
-  subchannel  サブチャンネル Q の MCN / ISRC 応答の解析・検証、ディスク全体の読み取り (DiscCodes)
+  subchannel  サブチャンネル Q の MCN / ISRC 応答の解析・検証、ディスク全体の読み取り (DiscCodes)、セクタごとの Q フレームの解析
+  gaps      プリギャップ (INDEX 00)・INDEX 02 以降・HTOA の検出 (Q の二分探索)
   toc       TOC 解析、CDDB ID
   cddb      CDDB の問い合わせ・応答解析 (HttpClient 経由)
   file_naming  メタデータからのファイル名・フォルダ名・アルバム単位のファイル名 (使えない文字の置換)
@@ -597,7 +686,8 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
   - [x] Ogg FLAC — [#21](https://github.com/noribow/cdreader/issues/21)
   - [x] M4A (ALAC) — [#24](https://github.com/noribow/cdreader/issues/24) (AAC はライセンス上の理由で対応しません)
   - [x] MKA (Matroska。FLAC / PCM / Opus / Vorbis、タグ、シングルファイルのチャプター) — [#23](https://github.com/noribow/cdreader/issues/23)
-  - [ ] プリギャップ (`INDEX 00`) と HTOA の検出 (サブチャンネル Q の読み取り)
+  - [x] プリギャップ (`INDEX 00`) と HTOA の検出 (サブチャンネル Q の読み取り) — [#25](https://github.com/noribow/cdreader/issues/25)
+    (実装済み・実機での動作確認待ち)
 - [ ] セキュアモードでのドライブキャッシュ回避 (現状の `--verify` はキャッシュされたデータを再読込する可能性があります)
 - [ ] Windows GUI
 

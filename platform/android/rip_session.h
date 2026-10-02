@@ -19,6 +19,7 @@
 #include "cdreader/audio_writer.h"
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
+#include "cdreader/gaps.h"
 #include "cdreader/http.h"
 #include "cdreader/metadata.h"
 #include "cdreader/ripper.h"
@@ -46,6 +47,9 @@ struct RipSettings {
     // Read the MCN and the ISRCs from the Q sub-channel (once per disc) for
     // the tags and rip.log.
     bool readDiscCodes = true;
+    // Detect pregaps / index points / the HTOA from the Q sub-channel (once
+    // per disc, #25). The app writes no CUE sheet yet: they go to rip.log.
+    bool detectGaps = true;
 };
 
 struct RippedTrack {
@@ -100,6 +104,12 @@ public:
     const DiscCodes& readDiscCodes();
     const DiscCodes& discCodes() const { return discCodes_; }
 
+    // Detects the pregaps, index points and HTOA (again). Never throws for a
+    // drive that cannot read the Q sub-channel; beginRip() calls it when enabled.
+    const DiscGaps& detectGaps();
+    // Before detection: the HTOA from the TOC only (status NotRun).
+    const DiscGaps& discGaps() const { return gaps_; }
+
     // Album metadata from CDDB (empty without a match); discId is always set,
     // and the MCN / ISRCs once read.
     const AlbumMetadata& album() const { return album_; }
@@ -112,8 +122,9 @@ public:
     std::string trackFileName(int number, const std::string& format);
 
     // Starts a rip: validates the settings, forgets earlier rip results,
-    // clears a pending cancel and reads the MCN / ISRCs if not done yet for
-    // this disc (settings.readDiscCodes). Throws std::invalid_argument.
+    // clears a pending cancel and reads the MCN / ISRCs and detects the gaps
+    // if not done yet for this disc (settings.readDiscCodes / detectGaps).
+    // Throws std::invalid_argument.
     void beginRip(const RipSettings& settings);
     const RipSettings& ripSettings() const { return settings_; }
 
@@ -150,6 +161,7 @@ private:
     bool cddbLookedUp_ = false;
     AlbumMetadata album_;
     DiscCodes discCodes_;
+    DiscGaps gaps_;
     RipSettings settings_;
     std::vector<RippedTrack> ripped_;
     AccurateRipReport accurateRip_;

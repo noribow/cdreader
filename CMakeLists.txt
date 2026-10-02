@@ -41,6 +41,7 @@ add_library(cdreader_core STATIC
   core/src/file_naming.cpp
   core/src/flac_encoder.cpp
   core/src/flac_writer.cpp
+  core/src/gaps.cpp
   core/src/matroska.cpp
   core/src/md5.cpp
   core/src/metadata.cpp

@@ -23,6 +23,7 @@
 #include "cdreader/crc32.h"
 #include "cdreader/cue_sheet.h"
 #include "cdreader/file_naming.h"
+#include "cdreader/gaps.h"
 #include "cdreader/metadata.h"
 #include "cdreader/ripper.h"
 #include "cdreader/subchannel.h"
@@ -53,7 +54,7 @@ void printUsage() {
         "Usage:\n"
         "  cdreader drives                       List optical drives\n"
         "  cdreader toc <drive> [options]        Show the table of contents and disc info\n"
-        "                        (CDDB options and --no-isrc)\n"
+        "                        (CDDB options, --no-isrc and --no-gaps)\n"
         "  cdreader rip <drive> [options]        Rip audio tracks (see --format)\n"
         "  cdreader offset <drive> [options]     Detect the drive read offset (AccurateRip)\n"
         "\n"
@@ -86,6 +87,11 @@ void printUsage() {
         "      --no-cue-file     Do not write the external .cue file\n"
         "      --no-isrc         Do not read the MCN (catalog number) and the ISRCs\n"
         "                        from the Q sub-channel (some drives are slow at it)\n"
+        "      --no-gaps         Do not detect pregaps (INDEX 00) and index points from\n"
+        "                        the Q sub-channel (takes a few seconds per track); the\n"
+        "                        CUE sheet then has INDEX 01 only\n"
+        "      --htoa            Also rip the hidden track before track 1 (HTOA) as\n"
+        "                        track 00 (single-file images always include it)\n"
         "\n"
         "Offset options:\n"
         "  -t, --track <n>       Track to compare (default: the best known track)\n"
@@ -255,6 +261,20 @@ cdr::DiscCodes readDiscCodes(cdr::CdDrive& drive, const std::vector<cdr::Track>&
     return codes;
 }
 
+// Detects pregaps / index points / the HTOA, or takes the HTOA from the TOC
+// alone when disabled. Never throws.
+cdr::DiscGaps detectGaps(cdr::CdDrive& drive, const cdr::Toc& toc, bool enabled) {
+    if (!enabled) return cdr::gapsFromToc(toc);
+    cdr::GapDetectionOptions options;
+    options.progress = [](int track, int last) {
+        std::printf("Detecting gaps: track %d of %d   \r", track, last);
+        std::fflush(stdout);
+    };
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc, options);
+    std::printf("                                   \r");
+    return gaps;
+}
+
 void printAlbum(const cdr::AlbumMetadata& album, FILE* out) {
     std::fprintf(out, "Artist: %s\nAlbum:  %s\n", album.artist.c_str(), album.title.c_str());
     if (!album.year.empty()) std::fprintf(out, "Year:   %s\n", album.year.c_str());
@@ -287,7 +307,8 @@ cdr::Toc readTocOrExplain(cdr::CdDrive& drive) {
     return drive.readToc();
 }
 
-void printToc(const cdr::Toc& toc, const cdr::AlbumMetadata& album, const cdr::DiscCodes& codes, FILE* out) {
+void printToc(const cdr::Toc& toc, const cdr::AlbumMetadata& album, const cdr::DiscCodes& codes,
+              const cdr::DiscGaps& gaps, FILE* out) {
     std::fprintf(out, "CDDB disc id: %s\n", hex32(toc.cddbId()).c_str());
     std::fprintf(out, "AccurateRip disc id: %s\n", cdr::AccurateRipDiscId::fromToc(toc).toString().c_str());
     std::fprintf(out, "Track  Start LBA   Length     Type\n");
@@ -300,6 +321,8 @@ void printToc(const cdr::Toc& toc, const cdr::AlbumMetadata& album, const cdr::D
     std::fprintf(out, "Lead-out at LBA %u, total %s\n", toc.leadOutLba, cdr::formatMsf(toc.leadOutLba).c_str());
     std::fprintf(out, "\n");
     for (const std::string& line : codes.logLines()) std::fprintf(out, "%s\n", line.c_str());
+    std::fprintf(out, "\n");
+    for (const std::string& line : gaps.logLines()) std::fprintf(out, "%s\n", line.c_str());
 }
 
 int cmdDrives() {
@@ -324,8 +347,10 @@ int cmdToc(const std::vector<std::string>& args) {
     const char letter = parseDriveLetter(args[1]);
     CddbSettings cddb;
     bool discCodes = true;
+    bool gapDetection = true;
     for (size_t i = 2; i < args.size(); ++i) {
         if (args[i] == "--no-isrc") discCodes = false;
+        else if (args[i] == "--no-gaps") gapDetection = false;
         else if (!parseCddbOption(args, i, cddb)) throw UsageError("unknown option '" + args[i] + "'");
     }
 
@@ -333,12 +358,13 @@ int cmdToc(const std::vector<std::string>& args) {
     std::printf("Drive: %s\n", d.info.displayName().c_str());
     const cdr::Toc toc = readTocOrExplain(*d.drive);
     const cdr::DiscCodes codes = readDiscCodes(*d.drive, toc.tracks, discCodes);
+    const cdr::DiscGaps gaps = detectGaps(*d.drive, toc, gapDetection);
     const cdr::CddbLookupResult found = lookupDisc(toc, cddb);
     if (found.found) {
         printAlbum(found.album, stdout);
         std::printf("\n");
     }
-    printToc(toc, found.album, codes, stdout);
+    printToc(toc, found.album, codes, gaps, stdout);
     return 0;
 }
 
@@ -425,6 +451,8 @@ int cmdRip(const std::vector<std::string>& args) {
     bool singleFile = false;
     bool cueFile = true;
     bool discCodes = true;
+    bool gapDetection = true;
+    bool ripHtoa = false;
     cdr::EncoderSettings encoder;
 
     for (size_t i = 2; i < args.size(); ++i) {
@@ -442,6 +470,8 @@ int cmdRip(const std::vector<std::string>& args) {
         else if (a == "--offset") options.readOffsetSamples = parseSignedInt(value(), "read offset");
         else if (a == "--no-cue-file") cueFile = false;
         else if (a == "--no-isrc") discCodes = false;
+        else if (a == "--no-gaps") gapDetection = false;
+        else if (a == "--htoa") ripHtoa = true;
         else if (a == "--verify") options.verify = true;
         else if (parseCddbOption(args, i, cddb)) continue;
         else if (a == "--no-accuraterip") accurateRip = false;
@@ -488,6 +518,30 @@ int cmdRip(const std::vector<std::string>& args) {
     const cdr::DiscCodes codes = readDiscCodes(*d.drive, selected, discCodes);
     if (codes.mcn.found()) std::printf("MCN: %s\n", codes.mcn.value.c_str());
 
+    // Pregaps / index points for the CUE sheet. The HTOA (audio before track
+    // 1) is part of a single-file image; per-track rips save it as track 00
+    // only with --htoa.
+    const cdr::DiscGaps gaps = detectGaps(*d.drive, toc, gapDetection);
+    const bool htoaSelected = gaps.hasHtoa() && selected.front().number == 1;
+    const bool withHtoa = htoaSelected && (singleFile || ripHtoa);
+    if (gapDetection) {
+        int pregaps = 0;
+        for (const cdr::TrackIndexes& t : gaps.tracks) pregaps += t.track > 1 && t.pregapSectors ? 1 : 0;
+        if (gaps.status == cdr::DiscGaps::Status::Unsupported)
+            std::printf("Gap detection: %s\n", gaps.detail.c_str());
+        else
+            std::printf("Gap detection: %d pregap(s)%s (%.1f s)\n", pregaps,
+                        gaps.status == cdr::DiscGaps::Status::Partial ? ", some tracks unknown (see rip.log)" : "",
+                        gaps.seconds);
+    }
+    if (gaps.hasHtoa())
+        std::printf("Hidden track before track 1 (HTOA): %s%s\n", cdr::formatMsf(gaps.htoaSectors).c_str(),
+                    withHtoa                 ? (singleFile ? " (included in the image)" : " (ripped as track 00)")
+                    : htoaSelected && !singleFile ? " (not ripped; use --htoa)"
+                                                 : "");
+    else if (ripHtoa)
+        std::printf("--htoa: this disc has no hidden track before track 1\n");
+
     // Metadata is optional: a failed lookup only means generic names.
     const cdr::CddbLookupResult found = lookupDisc(toc, cddb);
     cdr::AlbumMetadata album;
@@ -507,7 +561,7 @@ int cmdRip(const std::vector<std::string>& args) {
     std::vector<cdr::CueTrack> cueTracks;
     if (singleFile) {
         try {
-            cueTracks = cdr::singleFileCueTracks(selected, imageName, album);
+            cueTracks = cdr::singleFileCueTracks(selected, imageName, album, gaps, withHtoa);
         } catch (const std::invalid_argument& e) {
             throw UsageError(std::string("--single-file needs consecutive audio tracks (") + e.what() + ")");
         }
@@ -544,6 +598,8 @@ int cmdRip(const std::vector<std::string>& args) {
         log << "\n";
         for (const std::string& l : codes.logLines()) log << l << "\n";
         log << "\n";
+        for (const std::string& l : gaps.logLines()) log << l << "\n";
+        log << "\n";
     }
     if (!cddb.enabled) {
         log << "CDDB lookup: disabled\n\n";
@@ -575,6 +631,7 @@ int cmdRip(const std::vector<std::string>& args) {
             embedded.tracks = cueTracks;
             embedded.mcn = album.mcn;
             for (const cdr::Track& t : selected) embedded.totalSectors += t.lengthSectors;
+            if (withHtoa) embedded.totalSectors += gaps.htoaSectors;
             embedded.text = cdr::formatCueSheet(album, cueTracks);
             writer->setEmbeddedCueSheet(embedded);
         }
@@ -582,31 +639,41 @@ int cmdRip(const std::vector<std::string>& args) {
         log << "Single file: " << imageName << "\n";
         if (writer->canEmbedCueSheet()) {
             // FLAC: CUESHEET block + tag; Matroska: chapters (#23).
-            const char* what = extension == "mka" ? "Matroska chapters (one per track)" : "CUESHEET block and tag";
+            const char* what = extension != "mka" ? "CUESHEET block and tag"
+                               : withHtoa         ? "Matroska chapters (one per track, plus the HTOA)"
+                                                  : "Matroska chapters (one per track)";
             std::printf("Embedded CUE sheet: %s in %s\n\n", what, imageName.c_str());
             log << "Embedded CUE sheet: " << what << "\n";
         }
     }
-    for (const cdr::Track& t : selected) {
+    // The HTOA comes first (track 00): in the image before track 1, or in its own file.
+    std::vector<cdr::Track> parts = selected;
+    if (withHtoa) parts.insert(parts.begin(), cdr::htoaTrack(toc));
+    std::string htoaFile;
+    for (const cdr::Track& t : parts) {
+        const bool htoa = t.number == 0;
         std::string name;
         if (singleFile) {
             char base[32];
-            std::snprintf(base, sizeof base, "Track %02d", t.number);
+            std::snprintf(base, sizeof base, htoa ? "Track %02d (HTOA)" : "Track %02d", t.number);
             name = base;
         } else {
             writer = cdr::createAudioWriter(format, encoder);
-            const cdr::TrackMetadata metadata = album.forTrack(t.number, toc.lastTrack);
+            cdr::TrackMetadata metadata = album.forTrack(t.number, toc.lastTrack);
+            if (htoa && !album.title.empty()) metadata.title = "Hidden Track";  // "00 - Hidden Track"; else Track00
             name = cdr::trackFileBaseName(metadata) + "." + extension;
             writer->open(dir / fs::u8path(name), metadata);
-            trackFiles.push_back(name);
+            if (htoa) htoaFile = name;
+            else trackFiles.push_back(name);
         }
         int lastPercent = -1;
-        cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, t);
+        // No AccurateRip checksums for the HTOA: the database has none.
+        cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, htoa ? selected.front() : t);
         cdr::TrackRipResult r = ripper.ripTrack(
             t,
             [&](const uint8_t* pcm, size_t bytes) {
                 writer->write(pcm, bytes);
-                ar.update(pcm, bytes);
+                if (!htoa) ar.update(pcm, bytes);
                 if (singleFile) imageCrc.update(pcm, bytes);
             },
             [&](uint32_t done, uint32_t total) {
@@ -626,7 +693,7 @@ int cmdRip(const std::vector<std::string>& args) {
         if (r.paddedSamples) log << "  (" << r.paddedSamples << " samples outside the disc padded with silence)";
         log << "\n";
         if (!r.clean()) ++problems;
-        arTracks.push_back({t, ar.v1(), ar.v2()});
+        if (!htoa) arTracks.push_back({t, ar.v1(), ar.v2()});
     }
     if (singleFile) {
         writer->close();
@@ -636,7 +703,8 @@ int cmdRip(const std::vector<std::string>& args) {
     if (cueFile) {
         const std::string cueName = albumBase + ".cue";
         const std::string cue =
-            cdr::formatCueSheet(album, singleFile ? cueTracks : cdr::perTrackCueTracks(selected, trackFiles, album));
+            cdr::formatCueSheet(album, singleFile ? cueTracks
+                                                  : cdr::perTrackCueTracks(selected, trackFiles, album, gaps, htoaFile));
         std::ofstream out(dir / fs::u8path(cueName), std::ios::binary);
         out << cue;
         if (!out.flush()) throw std::runtime_error("failed to write " + cueName);

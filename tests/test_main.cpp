@@ -11,6 +11,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -27,6 +28,7 @@
 #include "cdreader/file_naming.h"
 #include "cdreader/flac_encoder.h"
 #include "cdreader/flac_writer.h"
+#include "cdreader/gaps.h"
 #include "cdreader/http.h"
 #include "cdreader/md5.h"
 #include "cdreader/metadata.h"
@@ -2077,9 +2079,17 @@ ParsedCueSheet parseCueSheet(const std::vector<uint8_t>& b) {
 
 cdr::EmbeddedCueSheet sampleEmbeddedCue() {
     cdr::EmbeddedCueSheet cue;
-    cue.tracks = {{1, "Image.flac", 0, false, false, "One", "", ""},
-                  {2, "Image.flac", 30, true, true, "Two", "", ""},
-                  {3, "Image.flac", 75, false, false, "Three", "", ""}};
+    auto track = [](int number, uint32_t start, bool preEmphasis, const char* title) {
+        cdr::CueTrack t;
+        t.number = number;
+        t.file = "Image.flac";
+        t.startSectors = start;
+        t.preEmphasis = preEmphasis;
+        t.copyPermitted = preEmphasis;
+        t.title = title;
+        return t;
+    };
+    cue.tracks = {track(1, 0, false, "One"), track(2, 30, true, "Two"), track(3, 75, false, "Three")};
     cue.totalSectors = 100;
     cue.text = "\xEF\xBB\xBF" "FILE \"Image.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
     return cue;
@@ -2110,7 +2120,7 @@ TEST(flac_cuesheet_block_layout) {
         CHECK_EQ(c.tracks[3].offset, uint64_t(100 * 588));
         CHECK(c.tracks[3].indexes.empty());
     }
-    CHECK_EQ(be64At(block, cdr::flac::cueSheetLeadOutOffsetPosition(3)), uint64_t(100 * 588));
+    CHECK_EQ(be64At(block, cdr::flac::cueSheetLeadOutOffsetPosition(cue)), uint64_t(100 * 588));
 
     // Offsets that are not on CD frame boundaries: not marked as CD-DA.
     CHECK(!parseCueSheet(cdr::flac::cueSheet(cue, 100 * 588 + 1)).isCd);
@@ -3744,6 +3754,633 @@ TEST(flac_rip_tags_isrc_per_track) {
         CHECK_EQ(hasIsrc, n == 2);
         CHECK(std::find(d.comments.begin(), d.comments.end(), "BARCODE=4988001234567") != d.comments.end());
     }
+}
+
+// --- Pregap / index / HTOA detection from the Q sub-channel (#25) ----------------
+
+namespace {
+
+FakeDrive makeDisc(const std::vector<uint32_t>& starts, uint32_t leadOut) {
+    std::vector<FakeDrive::FakeTrack> tracks;
+    for (uint32_t s : starts) tracks.push_back({s, false});
+    return FakeDrive(tracks, leadOut);
+}
+
+uint8_t toBcd(int v) { return uint8_t((v / 10) << 4 | (v % 10)); }
+
+// A mode 1 Q frame with CRC: track / index, relative and absolute MSF.
+std::vector<uint8_t> qBytes(int track, int index, int rm, int rs, int rf, int am, int as, int af,
+                            uint8_t control = 0) {
+    std::vector<uint8_t> q = {uint8_t(control << 4 | 1), toBcd(track), toBcd(index), toBcd(rm), toBcd(rs), toBcd(rf), 0,
+                              toBcd(am), toBcd(as), toBcd(af), 0, 0};
+    const uint16_t crc = uint16_t(cdr::subQCrc16(q.data(), 10) ^ 0xFFFF);
+    q[10] = uint8_t(crc >> 8);
+    q[11] = uint8_t(crc);
+    return q;
+}
+
+cdr::GapDetectionOptions forced(cdr::QSource source) {
+    cdr::GapDetectionOptions o;
+    o.source = source;
+    return o;
+}
+
+}  // namespace
+
+TEST(subq_crc_and_formatted_q) {
+    const char* check = "123456789";
+    CHECK_EQ(cdr::subQCrc16(reinterpret_cast<const uint8_t*>(check), 9), 0x31C3);  // CRC-16/XMODEM check value
+
+    // Track 2, INDEX 00, 1 s 74 frames before INDEX 01, at 03:02:10 absolute.
+    std::vector<uint8_t> f = qBytes(2, 0, 0, 1, 74, 3, 2, 10);
+    f.resize(16, 0);
+    cdr::QFrame q = cdr::parseFormattedQ(f.data());
+    CHECK(q.usable());
+    CHECK(q.crc == cdr::QFrame::Crc::Valid);
+    CHECK_EQ(q.track, 2);
+    CHECK_EQ(q.index, 0);
+    CHECK_EQ(q.relative, -(75 + 74));
+    CHECK_EQ(q.absoluteLba, (3 * 60 + 2) * 75 + 10 - 150);
+    CHECK_EQ(q.key(), 200);
+
+    // Bit error: the CRC catches it.
+    std::vector<uint8_t> bad = f;
+    bad[8] ^= 0x01;
+    CHECK(cdr::parseFormattedQ(bad.data()).crc == cdr::QFrame::Crc::Invalid);
+    CHECK(!cdr::parseFormattedQ(bad.data()).usable());
+    // A drive that does not report the CRC (bytes 10, 11 zero): not checked.
+    std::vector<uint8_t> noCrc = f;
+    noCrc[10] = noCrc[11] = 0;
+    CHECK(cdr::parseFormattedQ(noCrc.data()).crc == cdr::QFrame::Crc::Absent);
+    CHECK(cdr::parseFormattedQ(noCrc.data()).usable());
+    // Not BCD / out of range: unusable.
+    noCrc[4] = 0x6A;
+    CHECK(!cdr::parseFormattedQ(noCrc.data()).usable());
+    noCrc[4] = 0x60;  // 60 seconds
+    CHECK(!cdr::parseFormattedQ(noCrc.data()).usable());
+
+    // Mode 2 (MCN) frames carry no position.
+    std::vector<uint8_t> mcn(16, 0);
+    mcn[0] = 0x02;
+    mcn[1] = 0x49;
+    q = cdr::parseFormattedQ(mcn.data());
+    CHECK(q.parsed && q.adr == 2 && !q.usable());
+
+    // Data track control bits, lead-out (AAh), track 1 INDEX 01 at LBA 0.
+    std::vector<uint8_t> lo = qBytes(1, 1, 0, 0, 5, 40, 0, 0, 0x4);
+    lo[1] = 0xAA;
+    q = cdr::parseQ(lo.data(), false);
+    CHECK(q.usable() && q.track == 170 && q.control == 0x4 && q.relative == 5);
+    q = cdr::parseQ(qBytes(1, 1, 0, 0, 0, 0, 2, 0).data(), true);
+    CHECK(q.usable() && q.absoluteLba == 0 && q.key() == 101);
+}
+
+TEST(subq_raw_pw_deinterleave) {
+    const std::vector<uint8_t> q = qBytes(12, 1, 1, 2, 3, 45, 6, 7);
+    uint8_t raw[96];
+    for (size_t j = 0; j < 96; ++j) raw[j] = uint8_t(j * 13 + 5);  // R-W noise
+    cdr::interleaveQ(q.data(), true, raw);
+    // Byte 0 of Q is 01h: bit 6 of the 8th byte only; P = 1 (pause) everywhere.
+    for (size_t j = 0; j < 8; ++j) CHECK_EQ((raw[j] >> 6) & 1, j == 7 ? 1 : 0);
+    CHECK(std::all_of(raw, raw + 96, [](uint8_t b) { return (b & 0x80) != 0; }));
+    CHECK_EQ(raw[20] & 0x3F, uint8_t(20 * 13 + 5) & 0x3F);  // R-W untouched
+    uint8_t back[12];
+    cdr::deinterleaveQ(raw, back);
+    CHECK(std::equal(back, back + 12, q.begin()));
+    cdr::QFrame f = cdr::parseRawPwQ(raw);
+    CHECK(f.usable() && f.crc == cdr::QFrame::Crc::Valid && f.track == 12 && f.index == 1);
+    CHECK_EQ(f.absoluteLba, (45 * 60 + 6) * 75 + 7 - 150);
+    raw[50] ^= 0x40;  // one Q bit flipped
+    CHECK(cdr::parseRawPwQ(raw).crc == cdr::QFrame::Crc::Invalid);
+}
+
+TEST(subq_current_position_response) {
+    uint8_t r[16] = {0, 0x15, 0, 12, 0x01, 0x10, 3, 0, 0, 0, 0x3A, 0x98, 0xFF, 0xFF, 0xFF, 0xFE};
+    cdr::QFrame f = cdr::parseCurrentPosition(r, sizeof r);
+    CHECK(f.usable() && f.crc == cdr::QFrame::Crc::Absent);
+    CHECK_EQ(f.track, 3);
+    CHECK_EQ(f.index, 0);
+    CHECK_EQ(f.absoluteLba, 15000);
+    CHECK_EQ(f.relative, -2);
+    CHECK(!cdr::parseCurrentPosition(r, 12).usable());  // short
+    r[4] = 0x02;
+    CHECK(!cdr::parseCurrentPosition(r, sizeof r).usable());  // other format
+}
+
+TEST(read_cd_with_subchannel_cdb_and_frames) {
+    FakeDrive fake = makeDisc({0, 300, 450}, 750);
+    fake.pregaps[2] = 20;
+    cdr::CdDrive drive(fake);
+    std::vector<uint8_t> buf(2 * (2352 + 16));
+    CHECK(drive.readAudioWithSubChannel(279, 2, cdr::SubChannelSelection::FormattedQ, buf.data()).ok());
+    CHECK(fake.lastReadCdCdb ==
+          std::vector<uint8_t>({0xBE, 0x04, 0, 0, 0x01, 0x17, 0, 0, 2, 0x10, 0x02, 0}));
+    CHECK_EQ(fake.subQReads, 1);
+    CHECK_EQ(fake.readCommands, 0);
+    // Audio data as usual, Q after each sector: 279 is track 1, 280 the pregap of track 2.
+    CHECK_EQ(buf[0], FakeDrive::sampleByte(279, 0));
+    const cdr::QFrame a = cdr::parseFormattedQ(buf.data() + 2352);
+    const cdr::QFrame b = cdr::parseFormattedQ(buf.data() + 2368 + 2352);
+    CHECK(a.key() == 101 && a.absoluteLba == 279 && a.relative == 279);
+    CHECK(b.key() == 200 && b.absoluteLba == 280 && b.relative == -20);
+    CHECK_EQ(buf[2368], FakeDrive::sampleByte(280, 0));
+
+    std::vector<uint8_t> raw(2352 + 96);
+    CHECK(drive.readAudioWithSubChannel(300, 1, cdr::SubChannelSelection::RawPW, raw.data()).ok());
+    CHECK_EQ(fake.lastReadCdCdb[10], 0x01);
+    CHECK(cdr::parseRawPwQ(raw.data() + 2352).key() == 201);
+    fake.rawSubChannelSupported = false;
+    const cdr::ScsiResult r = drive.readAudioWithSubChannel(300, 1, cdr::SubChannelSelection::RawPW, raw.data());
+    CHECK(!r.ok() && r.sense.key == 0x5);
+}
+
+TEST(gaps_detected_for_various_pregap_lengths) {
+    // 0, 1, 150 (2 s), 157 (2 s + 7), 1000 and 2999 (all but the first sector
+    // of the previous track) sectors.
+    const std::vector<uint32_t> starts = {0, 3000, 6000, 9000, 12000, 15000, 18000};
+    const std::map<int, uint32_t> pregaps = {{3, 1}, {4, 150}, {5, 157}, {6, 1000}, {7, 2999}};
+    for (cdr::QSource source :
+         {cdr::QSource::Auto, cdr::QSource::FormattedQ, cdr::QSource::RawPW, cdr::QSource::CurrentPosition}) {
+        FakeDrive fake = makeDisc(starts, 21000);
+        fake.pregaps = pregaps;
+        cdr::CdDrive drive(fake);
+        const cdr::Toc toc = drive.readToc();
+        const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc, forced(source));
+        CHECK(gaps.status == cdr::DiscGaps::Status::Detected);
+        CHECK(gaps.source == (source == cdr::QSource::Auto ? cdr::QSource::FormattedQ : source));
+        CHECK_EQ(gaps.tracks.size(), 7u);
+        CHECK(!gaps.hasHtoa());
+        for (int n = 1; n <= 7; ++n) {
+            const auto it = pregaps.find(n);
+            CHECK_EQ(gaps.pregap(n), it == pregaps.end() ? 0u : it->second);
+            CHECK(gaps.find(n) && gaps.find(n)->detected());
+            CHECK(gaps.laterIndexes(n).empty());
+        }
+        CHECK_EQ(gaps.find(5)->index00Lba(), 12000u - 157);
+        // A few dozen reads per track (READ SUB-CHANNEL needs two commands per sector).
+        const unsigned perTrack = source == cdr::QSource::CurrentPosition ? 80 : 40;
+        CHECK(gaps.reads <= 7 * perTrack);
+        CHECK_EQ(gaps.reads, unsigned(fake.subQReads + fake.subChannelCommands + fake.readCommands));
+    }
+}
+
+TEST(gaps_fall_back_when_formatted_q_is_unsupported) {
+    FakeDrive fake = makeDisc({0, 3000, 6000}, 9000);
+    fake.pregaps = {{2, 150}, {3, 33}};
+    fake.formattedQSupported = false;
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::DiscGaps gaps = cdr::detectGaps(drive, toc);
+    CHECK(gaps.source == cdr::QSource::RawPW);
+    CHECK(gaps.pregap(2) == 150 && gaps.pregap(3) == 33);
+    // Neither READ CD selection: READ SUB-CHANNEL after each read.
+    fake.rawSubChannelSupported = false;
+    gaps = cdr::detectGaps(drive, toc);
+    CHECK(gaps.source == cdr::QSource::CurrentPosition);
+    CHECK(gaps.pregap(2) == 150 && gaps.pregap(3) == 33);
+    CHECK(gaps.logLines()[0].find("READ SUB-CHANNEL current position") != std::string::npos);
+}
+
+TEST(gaps_unsupported_drive_means_no_gaps) {
+    FakeDrive fake = makeDisc({0, 3000, 6000}, 9000);
+    fake.pregaps = {{2, 150}};
+    fake.formattedQSupported = fake.rawSubChannelSupported = fake.currentPositionSupported = false;
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc);
+    CHECK(gaps.status == cdr::DiscGaps::Status::Unsupported);
+    CHECK(gaps.tracks.empty());
+    CHECK_EQ(gaps.pregap(2), 0u);
+    CHECK(gaps.reads <= 4);  // one rejected command per method (+ the READ CD before READ SUB-CHANNEL)
+    CHECK(gaps.logLines()[0] ==
+          "Gap detection: not possible (the drive does not return Q sub-channel data), no pregaps known");
+    // The sheet is the one written without detection.
+    const cdr::AlbumMetadata album;
+    const std::string cue = cdr::formatCueSheet(album, cdr::singleFileCueTracks(toc.tracks, "a.wav", album, gaps));
+    CHECK(cue.find("INDEX 00") == std::string::npos);
+
+    // Q frames that never validate (always corrupt) are as good as none.
+    FakeDrive noisy = makeDisc({0, 3000}, 6000);
+    noisy.currentPositionSupported = false;
+    for (uint32_t s = 0; s < 40; ++s) noisy.badQ[s] = -1;
+    cdr::CdDrive noisyDrive(noisy);
+    const cdr::DiscGaps none = cdr::detectGaps(noisyDrive, noisyDrive.readToc());
+    CHECK(none.status == cdr::DiscGaps::Status::Unsupported);
+    CHECK(none.detail == "no usable Q sub-channel frames");
+}
+
+TEST(gaps_htoa_detected_and_confirmed) {
+    // Track 1 starts 1 min 2 s after LBA 0: a hidden track of 4650 sectors.
+    FakeDrive fake = makeDisc({4650, 9000, 12000}, 15000);
+    fake.pregaps = {{2, 150}};
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    CHECK_EQ(cdr::htoaSectors(toc), 4650u);
+    const cdr::Track h = cdr::htoaTrack(toc);
+    CHECK(h.number == 0 && h.startLba == 0 && h.lengthSectors == 4650);
+    // The HTOA is readable audio: offset correction reads across it.
+    CHECK_EQ(toc.audioRange(*toc.findTrack(1)).begin, 0u);
+    CHECK(toc.audioRange(h).begin == 0 && toc.audioRange(h).end == 15000);
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc);
+    CHECK(gaps.hasHtoa() && gaps.htoaConfirmed);
+    CHECK_EQ(gaps.pregap(1), 4650u);
+    CHECK_EQ(gaps.find(1)->index00Lba(), 0u);
+    CHECK_EQ(gaps.pregap(2), 150u);
+    const std::vector<std::string> log = gaps.logLines();
+    CHECK(log.size() == 5);
+    if (log.size() == 5) {
+        CHECK(log[1] == "HTOA (hidden track before track 1): 01:02.00, LBA 0-4649, confirmed by the Q sub-channel");
+        CHECK(log[2] == "Track  1  pregap 01:02.00  INDEX 00 at LBA 0 (HTOA)");
+        CHECK(log[3] == "Track  2  pregap 00:02.00  INDEX 00 at LBA 8850");
+        CHECK(log[4] == "Track  3  pregap 00:00.00");
+    }
+    // Known from the TOC without detection.
+    const cdr::DiscGaps toc0 = cdr::gapsFromToc(toc);
+    CHECK(toc0.status == cdr::DiscGaps::Status::NotRun && toc0.pregap(1) == 4650 && toc0.pregap(2) == 0);
+    CHECK(toc0.logLines() == std::vector<std::string>({"Gap detection: not run (disabled)",
+                                                        "HTOA (hidden track before track 1): 01:02.00, LBA 0-4649 "
+                                                        "(from the TOC)"}));
+    // A disc without HTOA, and a mixed-mode disc (data track 1).
+    CHECK_EQ(cdr::htoaSectors(makeCddbToc()), 0u);
+    FakeDrive mixed({{0, true}, {9000, false}}, 12000);
+    cdr::CdDrive mixedDrive(mixed);
+    const cdr::Toc mixedToc = mixedDrive.readToc();
+    CHECK_EQ(cdr::htoaSectors(mixedToc), 0u);
+    const cdr::DiscGaps mixedGaps = cdr::detectGaps(mixedDrive, mixedToc);
+    CHECK(mixedGaps.tracks.size() == 1 && mixedGaps.tracks[0].status == cdr::TrackIndexes::Status::Skipped);
+    CHECK(mixedGaps.logLines().back() == "Track  2  pregap not searched (follows a data track)");
+}
+
+TEST(gaps_later_index_points) {
+    FakeDrive fake = makeDisc({0, 3000, 6000, 9000}, 12000);
+    fake.pregaps = {{2, 150}, {3, 75}};
+    fake.laterIndexes[2] = {3500, 4000, 5800};  // INDEX 02 / 03 / 04 of track 2
+    fake.laterIndexes[4] = {11999};             // INDEX 02 in the last sector
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc);
+    CHECK(gaps.status == cdr::DiscGaps::Status::Detected);
+    CHECK(gaps.laterIndexes(2) == std::vector<uint32_t>({3500, 4000, 5800}));
+    CHECK(gaps.laterIndexes(1).empty() && gaps.laterIndexes(3).empty());
+    CHECK(gaps.laterIndexes(4) == std::vector<uint32_t>({11999}));
+    CHECK(gaps.pregap(3) == 75);
+    CHECK(gaps.logLines()[2].find("INDEX 00 at LBA 2850  INDEX 02 at LBA 3500  INDEX 03 at LBA 4000  INDEX 04 at LBA 5800") !=
+          std::string::npos);
+    // Without the option: one read less per track, no index points.
+    cdr::GapDetectionOptions options;
+    options.laterIndexes = false;
+    const cdr::DiscGaps plain = cdr::detectGaps(drive, toc, options);
+    CHECK(plain.laterIndexes(2).empty() && plain.pregap(2) == 150);
+    CHECK(plain.reads < gaps.reads);
+}
+
+TEST(gaps_survive_noisy_q_frames) {
+    // Mode 2 / 3 frames every 7th sector (real discs: about 1 in 100), and
+    // corrupt frames (bad CRC) around every boundary, some never readable.
+    for (cdr::QSource source : {cdr::QSource::FormattedQ, cdr::QSource::RawPW}) {
+        FakeDrive fake = makeDisc({0, 3000, 6000, 9000}, 12000);
+        fake.pregaps = {{2, 150}, {3, 1}, {4, 0}};
+        fake.otherAdrEvery = 7;
+        for (uint32_t b : {2850u, 5999u, 9000u}) {
+            for (uint32_t s = b - 4; s <= b + 4; ++s) fake.badQ[s] = s % 2 ? 1 : 2;
+            fake.badQ[b - 3] = fake.badQ[b + 2] = -1;
+        }
+        cdr::CdDrive drive(fake);
+        const cdr::Toc toc = drive.readToc();
+        const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc, forced(source));
+        CHECK(gaps.status == cdr::DiscGaps::Status::Detected);
+        CHECK_EQ(gaps.pregap(2), 150u);
+        CHECK_EQ(gaps.pregap(3), 1u);
+        CHECK_EQ(gaps.pregap(4), 0u);
+    }
+}
+
+TEST(gaps_wrong_frames_without_crc_are_voted_out) {
+    // A drive that reports no CRC returns frames from the wrong side of the
+    // boundary once: the confirmation reads catch it and the search repeats
+    // with two agreeing reads per position.
+    FakeDrive fake = makeDisc({0, 3000, 6000}, 9000);
+    fake.pregaps = {{2, 150}, {3, 20}};
+    fake.formattedQCrc = false;
+    for (uint32_t s = 2780; s < 3000; ++s) fake.wrongQ[s] = 1;
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc, forced(cdr::QSource::FormattedQ));
+    CHECK(gaps.status == cdr::DiscGaps::Status::Detected);
+    CHECK_EQ(gaps.pregap(2), 150u);
+    CHECK_EQ(gaps.pregap(3), 20u);
+    // With a CRC the same faults are simply discarded.
+    FakeDrive withCrc = makeDisc({0, 3000, 6000}, 9000);
+    withCrc.pregaps = fake.pregaps;
+    for (uint32_t s = 2780; s < 3000; ++s) withCrc.wrongQ[s] = 1;
+    cdr::CdDrive crcDrive(withCrc);
+    CHECK_EQ(cdr::detectGaps(crcDrive, toc, forced(cdr::QSource::RawPW)).pregap(2), 150u);
+    // No readable frame around the boundary: the track stays unknown (no INDEX 00).
+    FakeDrive broken = makeDisc({0, 3000, 6000}, 9000);
+    broken.pregaps = fake.pregaps;
+    broken.formattedQCrc = false;
+    for (uint32_t s = 2840; s <= 2860; ++s) broken.badQ[s] = -1;
+    cdr::CdDrive brokenDrive(broken);
+    const cdr::DiscGaps unsure = cdr::detectGaps(brokenDrive, toc, forced(cdr::QSource::FormattedQ));
+    CHECK(unsure.status == cdr::DiscGaps::Status::Partial);
+    CHECK(unsure.find(2) && unsure.find(2)->status == cdr::TrackIndexes::Status::Unknown);
+    CHECK_EQ(unsure.pregap(2), 0u);
+    CHECK_EQ(unsure.pregap(3), 20u);
+}
+
+TEST(gaps_read_budget) {
+    FakeDrive fake = makeDisc({0, 3000, 6000, 9000, 12000}, 15000);
+    fake.pregaps = {{2, 150}, {3, 150}, {4, 150}, {5, 150}};
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::GapDetectionOptions options;
+    options.maxReads = 40;
+    std::vector<int> progress;
+    options.progress = [&](int track, int last) {
+        CHECK_EQ(last, 5);
+        progress.push_back(track);
+    };
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc, options);
+    CHECK(progress == std::vector<int>({1, 2, 3, 4, 5}));
+    CHECK(gaps.status == cdr::DiscGaps::Status::Partial);
+    CHECK(gaps.reads <= 40);
+    CHECK_EQ(fake.subQReads, int(gaps.reads));
+    CHECK_EQ(gaps.pregap(2), 150u);
+    CHECK(gaps.find(5)->status == cdr::TrackIndexes::Status::Unknown);
+    CHECK(gaps.find(5)->detail == "read budget exhausted");
+    CHECK_EQ(gaps.pregap(5), 0u);
+}
+
+TEST(cue_sheet_single_file_with_gaps_and_htoa) {
+    // HTOA of 450 sectors, track 2 with a 2-second pregap and an INDEX 02.
+    const std::vector<cdr::Track> tracks = {{1, 450, 1050}, {2, 1500, 750}, {3, 2250, 300}};
+    cdr::DiscGaps gaps;
+    gaps.status = cdr::DiscGaps::Status::Detected;
+    gaps.htoaSectors = 450;
+    gaps.tracks.resize(3);
+    for (int i = 0; i < 3; ++i) {
+        gaps.tracks[size_t(i)].track = i + 1;
+        gaps.tracks[size_t(i)].index01Lba = tracks[size_t(i)].startLba;
+        gaps.tracks[size_t(i)].status = cdr::TrackIndexes::Status::Detected;
+    }
+    gaps.tracks[0].pregapSectors = 450;
+    gaps.tracks[1].pregapSectors = 150;
+    gaps.tracks[1].laterIndexes = {1800};
+    cdr::AlbumMetadata album;
+    const std::string cue =
+        cdr::formatCueSheet(album, cdr::singleFileCueTracks(tracks, "image.wav", album, gaps, true));
+    CHECK(cue ==
+          "REM COMMENT \"cdreader\"\r\n"
+          "FILE \"image.wav\" WAVE\r\n"
+          "  TRACK 01 AUDIO\r\n"
+          "    INDEX 00 00:00:00\r\n"
+          "    INDEX 01 00:06:00\r\n"
+          "  TRACK 02 AUDIO\r\n"
+          "    INDEX 00 00:18:00\r\n"
+          "    INDEX 01 00:20:00\r\n"
+          "    INDEX 02 00:24:00\r\n"
+          "  TRACK 03 AUDIO\r\n"
+          "    INDEX 01 00:30:00\r\n");
+    keepSample("gaps_single.cue", std::vector<uint8_t>(cue.begin(), cue.end()));
+    // Without the HTOA in the image: positions from track 1's INDEX 01, and a
+    // PREGAP line keeps the layout.
+    const std::string noHtoa = cdr::formatCueSheet(album, cdr::singleFileCueTracks(tracks, "image.wav", album, gaps));
+    CHECK(noHtoa.find("  TRACK 01 AUDIO\r\n    PREGAP 00:06:00\r\n    INDEX 01 00:00:00\r\n") != std::string::npos);
+    CHECK(noHtoa.find("    INDEX 00 00:12:00\r\n    INDEX 01 00:14:00\r\n    INDEX 02 00:18:00\r\n") !=
+          std::string::npos);
+    // A selection starting at track 2: its pregap is not in the image.
+    const std::vector<cdr::Track> tail(tracks.begin() + 1, tracks.end());
+    const std::string tailCue = cdr::formatCueSheet(album, cdr::singleFileCueTracks(tail, "t.wav", album, gaps));
+    CHECK(tailCue.find("INDEX 00") == std::string::npos);
+    CHECK(tailCue.find("  TRACK 02 AUDIO\r\n    INDEX 01 00:00:00\r\n    INDEX 02 00:04:00\r\n") != std::string::npos);
+    bool threw = false;
+    try {
+        cdr::singleFileCueTracks(tail, "t.wav", album, gaps, true);  // the HTOA belongs before track 1
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+TEST(cue_sheet_per_track_gaps_appended_to_previous) {
+    const std::vector<cdr::Track> tracks = {{1, 450, 1050}, {2, 1500, 750}, {3, 2250, 300}};
+    cdr::DiscGaps gaps;
+    gaps.status = cdr::DiscGaps::Status::Detected;
+    gaps.htoaSectors = 450;
+    for (int i = 0; i < 3; ++i) {
+        cdr::TrackIndexes t;
+        t.track = i + 1;
+        t.index01Lba = tracks[size_t(i)].startLba;
+        t.status = cdr::TrackIndexes::Status::Detected;
+        gaps.tracks.push_back(t);
+    }
+    gaps.tracks[1].pregapSectors = 150;
+    gaps.tracks[2].pregapSectors = 32;
+    gaps.tracks[2].laterIndexes = {2400};
+    cdr::AlbumMetadata album;
+    const std::vector<std::string> files = {"01.flac", "02.flac", "03.flac"};
+    // EAC's default sheet: the HTOA ripped as track 00, each pregap at the
+    // end of the previous file.
+    const std::string cue =
+        cdr::formatCueSheet(album, cdr::perTrackCueTracks(tracks, files, album, gaps, "00.flac"));
+    CHECK(cue ==
+          "REM COMMENT \"cdreader\"\r\n"
+          "FILE \"00.flac\" WAVE\r\n"
+          "  TRACK 01 AUDIO\r\n"
+          "    INDEX 00 00:00:00\r\n"
+          "FILE \"01.flac\" WAVE\r\n"
+          "    INDEX 01 00:00:00\r\n"
+          "  TRACK 02 AUDIO\r\n"
+          "    INDEX 00 00:12:00\r\n"
+          "FILE \"02.flac\" WAVE\r\n"
+          "    INDEX 01 00:00:00\r\n"
+          "  TRACK 03 AUDIO\r\n"
+          "    INDEX 00 00:09:43\r\n"
+          "FILE \"03.flac\" WAVE\r\n"
+          "    INDEX 01 00:00:00\r\n"
+          "    INDEX 02 00:02:00\r\n");
+    keepSample("gaps_per_track.cue", std::vector<uint8_t>(cue.begin(), cue.end()));
+    // HTOA not ripped: PREGAP for track 1.
+    const std::string noHtoa = cdr::formatCueSheet(album, cdr::perTrackCueTracks(tracks, files, album, gaps));
+    CHECK(noHtoa.rfind("REM COMMENT \"cdreader\"\r\n"
+                       "FILE \"01.flac\" WAVE\r\n"
+                       "  TRACK 01 AUDIO\r\n"
+                       "    PREGAP 00:06:00\r\n"
+                       "    INDEX 01 00:00:00\r\n",
+                       0) == 0);
+    // Track 2 not ripped: track 3's pregap (in track 2's file) is left out.
+    const std::string gap = cdr::formatCueSheet(
+        album, cdr::perTrackCueTracks({tracks[0], tracks[2]}, {"01.flac", "03.flac"}, album, gaps, "00.flac"));
+    CHECK(gap.find("FILE \"03.flac\" WAVE\r\n  TRACK 03 AUDIO\r\n    INDEX 01 00:00:00\r\n    INDEX 02 00:02:00\r\n") !=
+          std::string::npos);
+    // Without gap information the sheet is unchanged.
+    CHECK(cdr::formatCueSheet(album, cdr::perTrackCueTracks(tracks, files, album)) ==
+          cdr::formatCueSheet(album, cdr::perTrackCueTracks(tracks, files, album, cdr::DiscGaps{})));
+}
+
+TEST(flac_cuesheet_block_with_index_00) {
+    cdr::EmbeddedCueSheet cue = sampleEmbeddedCue();  // tracks at 0, 30, 75; 100 sectors
+    cue.tracks[0].hasIndex00 = true;  // an HTOA of 10 sectors: INDEX 00 at 0, INDEX 01 at 10
+    cue.tracks[0].index00Sectors = 0;
+    cue.tracks[0].startSectors = 10;
+    cue.tracks[1].hasIndex00 = true;  // pregap of 5 sectors
+    cue.tracks[1].index00Sectors = 25;
+    cue.tracks[2].laterIndexes = {80, 90};
+    const std::vector<uint8_t> block = cdr::flac::cueSheet(cue, 100 * 588);
+    CHECK_EQ(block.size(), size_t(396 + 3 * 36 + 7 * 12 + 36));
+    const ParsedCueSheet c = parseCueSheet(block);
+    CHECK_EQ(c.tracks.size(), 4u);
+    if (c.tracks.size() == 4) {
+        // A track starts at its first index point; index offsets are relative to it.
+        CHECK_EQ(c.tracks[0].offset, 0u);
+        CHECK_EQ(c.tracks[0].indexes.size(), 2u);
+        CHECK(c.tracks[0].indexes[0].number == 0 && c.tracks[0].indexes[0].offset == 0);
+        CHECK(c.tracks[0].indexes[1].number == 1 && c.tracks[0].indexes[1].offset == 10 * 588);
+        CHECK_EQ(c.tracks[1].offset, uint64_t(25 * 588));
+        CHECK(c.tracks[1].indexes.size() == 2 && c.tracks[1].indexes[1].offset == 5 * 588);
+        CHECK_EQ(c.tracks[2].offset, uint64_t(75 * 588));
+        CHECK_EQ(c.tracks[2].indexes.size(), 3u);
+        if (c.tracks[2].indexes.size() == 3) {
+            CHECK(c.tracks[2].indexes[1].number == 2 && c.tracks[2].indexes[1].offset == 5 * 588);
+            CHECK(c.tracks[2].indexes[2].number == 3 && c.tracks[2].indexes[2].offset == 15 * 588);
+        }
+    }
+    CHECK_EQ(cdr::flac::cueSheetLeadOutOffsetPosition(cue), block.size() - 36);
+    CHECK_EQ(be64At(block, cdr::flac::cueSheetLeadOutOffsetPosition(cue)), uint64_t(100 * 588));
+    // An INDEX 00 in another file (per-track sheet) is not part of the block.
+    cue.tracks[1].index00File = "other.flac";
+    CHECK_EQ(parseCueSheet(cdr::flac::cueSheet(cue, 100 * 588)).tracks[1].offset, uint64_t(30 * 588));
+}
+
+// Whole disc with an HTOA, pregaps and read offset correction into one FLAC:
+// the image equals the disc from LBA 0 (shifted by the offset), every INDEX
+// points where the Q sub-channel put it, and the lead-out written on close
+// lands after the extra index points.
+TEST(single_file_image_with_htoa_and_gaps) {
+    for (int offset : {0, 667, -1206}) {
+        FakeDrive fake = makeDisc({300, 900, 1200}, 1500);
+        fake.pregaps = {{2, 150}, {3, 7}};
+        fake.laterIndexes[2] = {1000};
+        cdr::CdDrive drive(fake);
+        const cdr::Toc toc = drive.readToc();
+        const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc);
+        CHECK(gaps.htoaConfirmed && gaps.pregap(2) == 150 && gaps.pregap(3) == 7);
+        cdr::RipOptions options;
+        options.readOffsetSamples = offset;
+        cdr::Ripper ripper(drive, toc, options);
+        cdr::AlbumMetadata album;
+        cdr::EmbeddedCueSheet cue;
+        cue.tracks = cdr::singleFileCueTracks(toc.tracks, "image.flac", album, gaps, true);
+        cue.totalSectors = toc.leadOutLba;
+        cue.text = cdr::formatCueSheet(album, cue.tracks);
+        CHECK(cue.text.find("    INDEX 00 00:00:00\r\n    INDEX 01 00:04:00\r\n") != std::string::npos);
+        CHECK(cue.text.find("    INDEX 00 00:10:00\r\n    INDEX 01 00:12:00\r\n    INDEX 02 00:13:25\r\n") !=
+              std::string::npos);
+
+        const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_htoa_image.flac";
+        cdr::FlacWriter writer;
+        writer.setEmbeddedCueSheet(cue);
+        writer.open(path, album.forTrack(0, 3));
+        std::vector<uint8_t> concatenated;
+        std::vector<cdr::Track> parts = {cdr::htoaTrack(toc)};
+        parts.insert(parts.end(), toc.tracks.begin(), toc.tracks.end());
+        for (const cdr::Track& t : parts)
+            ripper.ripTrack(t, [&](const uint8_t* p, size_t n) {
+                writer.write(p, n);
+                concatenated.insert(concatenated.end(), p, p + n);
+            });
+        writer.close();
+        const std::vector<uint8_t> file = readFile(path);
+        std::filesystem::remove(path);
+
+        CHECK(concatenated == expectedWithOffset(0, 1500, offset, 0, 1500));
+        const DecodedFlac d = decodeFlac(file);
+        CHECK(d.pcm == concatenated);
+        const ParsedCueSheet c = parseCueSheet(flacBlock(file, 5));
+        CHECK_EQ(c.tracks.size(), 4u);
+        if (c.tracks.size() == 4) {
+            CHECK(c.tracks[0].offset == 0 && c.tracks[0].indexes.size() == 2);
+            CHECK_EQ(c.tracks[0].indexes[1].offset, uint64_t(300 * 588));
+            CHECK_EQ(c.tracks[1].offset, uint64_t(750 * 588));
+            CHECK_EQ(c.tracks[1].indexes.size(), 3u);
+            CHECK_EQ(c.tracks[2].offset, uint64_t(1193 * 588));
+            CHECK_EQ(c.tracks[3].offset, d.totalSamples);
+        }
+        // Each track's INDEX 01 is where its own rip starts.
+        for (const cdr::CueTrack& t : cue.tracks) {
+            const OffsetRip alone = ripWithOffset(fake, t.number, offset);
+            const size_t at = size_t(t.startSectors) * cdr::kSectorBytes;
+            CHECK(std::equal(alone.bytes.begin(), alone.bytes.end(), concatenated.begin() + ptrdiff_t(at)));
+        }
+    }
+}
+
+// #25 with the other formats: the image with an HTOA and pregaps (CUE sheet
+// as in single_file_image_with_htoa_and_gaps) as Ogg FLAC carries the same
+// CUESHEET block as the native FLAC (index points 0 / 1 / 2, lead-out patched
+// on close after the extra index points); ALAC (no embedded CUE sheet) just
+// holds the image. One sector less than announced, so the lead-out moves.
+TEST(single_file_htoa_gaps_in_ogg_flac_and_alac) {
+    FakeDrive fake = makeDisc({300, 900, 1200}, 1500);
+    fake.pregaps = {{2, 150}, {3, 7}};
+    fake.laterIndexes[2] = {1000};
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DiscGaps gaps = cdr::detectGaps(drive, toc);
+    cdr::Ripper ripper(drive, toc, cdr::RipOptions{});
+    cdr::AlbumMetadata album;
+    cdr::EmbeddedCueSheet cue;
+    cue.tracks = cdr::singleFileCueTracks(toc.tracks, "image.oga", album, gaps, true);
+    cue.totalSectors = toc.leadOutLba;
+    cue.text = cdr::formatCueSheet(album, cue.tracks);
+    std::vector<uint8_t> image;
+    std::vector<cdr::Track> parts = {cdr::htoaTrack(toc)};
+    parts.insert(parts.end(), toc.tracks.begin(), toc.tracks.end());
+    for (const cdr::Track& t : parts)
+        ripper.ripTrack(t, [&](const uint8_t* p, size_t n) { image.insert(image.end(), p, p + n); });
+    CHECK_EQ(image.size(), size_t(1500) * cdr::kSectorBytes);
+    image.resize(image.size() - cdr::kSectorBytes);
+
+    auto encode = [&](const std::string& format, const std::string& name) {
+        std::unique_ptr<cdr::AudioWriter> w = cdr::createAudioWriter(format);
+        if (w->canEmbedCueSheet()) w->setEmbeddedCueSheet(cue);
+        const std::filesystem::path path = std::filesystem::temp_directory_path() / name;
+        w->open(path, album.forTrack(0, 3));
+        for (size_t pos = 0; pos < image.size(); pos += 4000)
+            w->write(image.data() + pos, std::min<size_t>(4000, image.size() - pos));
+        w->close();
+        std::vector<uint8_t> file = readFile(path);
+        std::filesystem::remove(path);
+        return file;
+    };
+    const std::vector<uint8_t> native = encode("flac", "cdreader_gaps_image.flac");
+    const std::vector<uint8_t> ogg = encode("oggflac", "cdreader_gaps_image.oga");
+    keepSample("gaps_htoa_image.oga", ogg);
+    const OggFlac o = demuxOggFlac(ogg);
+    CHECK_EQ(o.headerPackets, 3u);
+    if (!o.native.empty()) {
+        const DecodedFlac d = decodeFlac(o.native);
+        CHECK(d.pcm == image);
+        const std::vector<uint8_t> block = flacBlock(o.native, 5);
+        CHECK(block == flacBlock(native, 5));
+        const ParsedCueSheet c = parseCueSheet(block);
+        CHECK_EQ(c.tracks.size(), 4u);
+        if (c.tracks.size() == 4) {
+            CHECK(c.tracks[0].offset == 0 && c.tracks[0].indexes.size() == 2);
+            CHECK(c.tracks[0].indexes[0].number == 0 && c.tracks[0].indexes[1].offset == 300 * 588);
+            CHECK_EQ(c.tracks[1].offset, uint64_t(750 * 588));
+            CHECK_EQ(c.tracks[1].indexes.size(), 3u);
+            CHECK_EQ(c.tracks[2].offset, uint64_t(1193 * 588));
+            CHECK_EQ(c.tracks[3].number, 170);
+            CHECK_EQ(c.tracks[3].offset, uint64_t(1499 * 588));  // the written length, not the announced one
+        }
+        const std::string tag = "CUESHEET=" + cdr::flac::cueSheetTagText(cue.text);
+        CHECK(std::find(d.comments.begin(), d.comments.end(), tag) != d.comments.end());
+    }
+
+    CHECK(!cdr::createAudioWriter("alac")->canEmbedCueSheet());
+    const DecodedM4a m = decodeM4a(encode("alac", "cdreader_gaps_image.m4a"));
+    CHECK(m.pcm == image);
 }
 
 int main() {

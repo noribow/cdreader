@@ -329,10 +329,27 @@ MkaWriter::~MkaWriter() {
 
 std::string MkaWriter::encoderDescription() const { return encoder_->description(); }
 
+bool MkaWriter::hasHtoaChapter(const EmbeddedCueSheet& cue) {
+    if (cue.tracks.empty()) return false;
+    const CueTrack& t = cue.tracks.front();
+    return t.number == 1 && t.hasIndex00 && t.index00File.empty() && t.index00Sectors == 0 && t.startSectors > 0;
+}
+
 std::vector<mkv::Chapter> MkaWriter::chaptersFor(const EmbeddedCueSheet& cue, const TrackMetadata& album) {
     std::vector<mkv::Chapter> chapters;
     // 1/75 s per CD frame: 40000000/3 ns, rounded.
     auto ns = [](uint64_t sectors) { return (sectors * 40000000u + 1) / 3; };
+    // An image that starts with the HTOA (#25: track 1 with INDEX 00 at the
+    // start of the file) gets a leading "Hidden Track" chapter up to track 1's
+    // INDEX 01, so the whole timeline is covered and the HTOA can be reached.
+    if (hasHtoaChapter(cue)) {
+        mkv::Chapter c;
+        c.uid = uidFrom(metadataKey(album) + "\nchapter 0", 0);
+        c.startNs = 0;
+        c.endNs = ns(cue.tracks.front().startSectors);
+        c.title = "Hidden Track";
+        chapters.push_back(c);
+    }
     for (size_t i = 0; i < cue.tracks.size(); ++i) {
         const CueTrack& t = cue.tracks[i];
         mkv::Chapter c;
@@ -371,11 +388,21 @@ std::vector<mkv::Tag> MkaWriter::tagsFor(const TrackMetadata& m, const std::vect
     if (!album.simpleTags.empty()) tags.push_back(album);
 
     if (cue) {
-        for (size_t i = 0; i < chapters.size() && i < cue->tracks.size(); ++i) {
+        // The HTOA chapter (if any) comes before the tracks' chapters.
+        const size_t first = hasHtoaChapter(*cue) && chapters.size() > cue->tracks.size() ? 1 : 0;
+        if (first) {
+            mkv::Tag tag;
+            tag.targetTypeValue = 30;
+            tag.chapterUid = chapters[0].uid;
+            add(tag, "TITLE", chapters[0].title);
+            add(tag, "PART_NUMBER", "0");
+            tags.push_back(tag);
+        }
+        for (size_t i = 0; i + first < chapters.size() && i < cue->tracks.size(); ++i) {
             const CueTrack& t = cue->tracks[i];
             mkv::Tag tag;
             tag.targetTypeValue = 30;
-            tag.chapterUid = chapters[i].uid;
+            tag.chapterUid = chapters[i + first].uid;
             add(tag, "TITLE", t.title);
             add(tag, "ARTIST", t.performer);
             add(tag, "PART_NUMBER", std::to_string(t.number));
