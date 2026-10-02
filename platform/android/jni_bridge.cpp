@@ -380,10 +380,12 @@ JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTrackFi
 // Starts a rip with these settings: forgets earlier results, clears a cancel.
 // Lossy formats use their default settings (Opus VBR 160 kbit/s, Vorbis q5).
 // `useC2`: read with C2 error pointers if the drive supports them (#33).
+// `cacheMode`: drive cache defeat for re-reads (#34): 0 auto (timing test,
+// once per disc), 1 FUA, 2 flush, 3 none.
 JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(JNIEnv* env, jclass, jlong handle,
                                                                                jstring format, jint readOffset,
                                                                                jint maxRetries, jboolean verify,
-                                                                               jboolean useC2) {
+                                                                               jboolean useC2, jint cacheMode) {
     try {
         cdr::RipSettings settings;
         if (!fromJava(env, format, settings.format)) return;
@@ -391,6 +393,13 @@ JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(J
         settings.options.maxRetries = maxRetries;
         settings.options.verify = verify == JNI_TRUE;
         settings.useC2 = useC2 == JNI_TRUE;
+        switch (cacheMode) {
+            case 0: settings.cache = cdr::CacheSetting::Auto; break;
+            case 1: settings.cache = cdr::CacheSetting::Fua; break;
+            case 2: settings.cache = cdr::CacheSetting::Flush; break;
+            case 3: settings.cache = cdr::CacheSetting::None; break;
+            default: throw std::invalid_argument("invalid cache mode " + std::to_string(cacheMode));
+        }
         session(handle)->rip.beginRip(settings);
     } catch (const std::exception& e) {
         throwJava(env, "java/lang/IllegalArgumentException", e.what());
@@ -401,7 +410,8 @@ JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(J
 // nativeBeginRip), calling listener.onProgress(done, total) in sectors.
 // Returns [sectors, unreadableSectors, retries, paddedSamples, crc32,
 // accurateRipV1, accurateRipV2, c2 (1: read with C2 pointers), C2 error
-// sectors, C2 re-reads, unresolved C2 sectors, suspicious sectors]. Throws
+// sectors, C2 re-reads, unresolved C2 sectors, suspicious sectors, cache
+// defeat operations (FUA commands or flushes before re-reads, #34)]. Throws
 // java.util.concurrent.CancellationException after nativeCancel() and
 // IOException on errors; the partial file is left for the caller to delete.
 JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTrack(JNIEnv* env, jclass,
@@ -430,7 +440,8 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTr
                                                   jint(r.result.crc32), jint(r.accurateRipV1), jint(r.accurateRipV2),
                                                   jint(r.result.c2 ? 1 : 0), jint(r.result.c2ErrorSectors),
                                                   jint(r.result.c2Rereads), jint(r.result.c2Unresolved),
-                                                  jint(r.result.suspiciousSectors.size())});
+                                                  jint(r.result.suspiciousSectors.size()),
+                                                  jint(r.result.cacheDefeats)});
     } catch (const cdr::RipCancelled&) {
         throwJava(env, "java/util/concurrent/CancellationException", "rip cancelled");
     } catch (const JavaExceptionPending&) {
@@ -493,6 +504,32 @@ JNIEXPORT jint JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeC2Status(J
         case cdr::C2Availability::Mode::Supported: break;
     }
     return rip.c2Fallback().empty() ? 2 : 3;
+}
+
+// Drive cache check of the current rip (#34): [result (0 not tested, 1 no
+// cache, 2 cache and FUA works, 3 FUA ignored, 4 FUA rejected, 5 test
+// inconclusive), method in use (0 none, 1 FUA, 2 flush), reported cache
+// size in KB (0: unknown), 1 if FUA was given up during the rip].
+JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeCacheStatus(JNIEnv* env, jclass,
+                                                                                       jlong handle) {
+    const cdr::RipSession& rip = session(handle)->rip;
+    const cdr::DriveCacheCheck& c = rip.cacheCheck();
+    using R = cdr::DriveCacheCheck::Result;
+    jint result = 0;
+    switch (c.result) {
+        case R::NotRun: result = 0; break;
+        case R::NoCache: result = 1; break;
+        case R::FuaWorks: result = 2; break;
+        case R::FuaIgnored: result = 3; break;
+        case R::FuaRejected: result = 4; break;
+        case R::Unknown: result = 5; break;
+    }
+    const cdr::CacheDefeat method = rip.ripSettings().options.cacheDefeat;
+    return toJavaArray(env, std::vector<jint>{result,
+                                              method == cdr::CacheDefeat::Fua     ? 1
+                                              : method == cdr::CacheDefeat::Flush ? 2
+                                                                                  : 0,
+                                              jint(c.cacheKB), rip.cacheFallback().empty() ? 0 : 1});
 }
 
 // rip.log text for the current rip.

@@ -1,6 +1,7 @@
 #include "fake_drive.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "cdreader/cd_drive.h"
@@ -47,6 +48,21 @@ bool fault(std::map<uint32_t, int>& faults, uint32_t lba) {
 }
 
 }  // namespace
+
+void FakeDrive::cacheStore(uint32_t lba, const uint8_t* sector) {
+    auto it = cache_.find(lba);
+    if (it != cache_.end()) {
+        if (it->second.data() != sector) it->second.assign(sector, sector + cdr::kSectorBytes + 296);
+        cacheOrder_.erase(std::find(cacheOrder_.begin(), cacheOrder_.end(), lba));
+    } else {
+        cache_[lba].assign(sector, sector + cdr::kSectorBytes + 296);
+    }
+    cacheOrder_.push_back(lba);
+    while (cacheOrder_.size() > cacheSectors) {
+        cache_.erase(cacheOrder_.front());
+        cacheOrder_.pop_front();
+    }
+}
 
 int FakeDrive::trackAt(uint32_t lba) const {
     int owner = 0;
@@ -137,6 +153,8 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
     cdr::ScsiResult ok;
     ok.transportOk = true;
     ok.transferred = dataLength;
+    simulatedMicros += commandMicros;
+    commandLog.push_back({cdb[0], 0, 0});
 
     switch (cdb[0]) {
         case 0x00:  // TEST UNIT READY
@@ -238,10 +256,27 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
             page[0] = 0x2A;
             page[1] = 26;
             page[5] = uint8_t(0x01 | 0x02 | (c2Supported ? 0x10 : 0x00));  // CD-DA commands, accurate stream, C2
+            page[12] = uint8_t(bufferKB >> 8);
+            page[13] = uint8_t(bufferKB);
             const size_t allocation = size_t(cdb[7]) << 8 | cdb[8];
             const size_t n = std::min({sizeof response, allocation, dataLength});
             std::memcpy(out, response, n);
             ok.transferred = n;
+            return ok;
+        }
+
+        case 0xA8: {  // READ(12): only as the FUA cache flush (transfer length 0, no data)
+            ++fuaCommands;
+            lastRead12Cdb.assign(cdb, cdb + 12);
+            const uint32_t lba = (uint32_t(cdb[2]) << 24) | (uint32_t(cdb[3]) << 16) | (uint32_t(cdb[4]) << 8) | cdb[5];
+            const uint32_t count = (uint32_t(cdb[6]) << 24) | (uint32_t(cdb[7]) << 16) | (uint32_t(cdb[8]) << 8) | cdb[9];
+            commandLog.back().lba = lba;
+            commandLog.back().count = count;
+            if (!fuaSupported) return checkCondition(0x5, 0x64, 0x00);  // illegal mode for this track
+            if (count != 0 || dataLength != 0) return checkCondition(0x5, 0x24, 0x00);
+            if (lba >= leadOut_) return checkCondition(0x5, 0x21, 0x00);
+            if ((cdb[1] & 0x08) && fuaHonoured) clearCache();
+            ok.transferred = 0;
             return ok;
         }
 
@@ -270,6 +305,32 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
             const size_t perSector = (userData ? cdr::kSectorBytes : 0) + subBytes + c2Bytes;
             if (dataLength != size_t(count) * perSector) return checkCondition(0x5, 0x24, 0x00);
             if (lba + count > leadOut_) return checkCondition(0x5, 0x21, 0x00);
+            commandLog.back().lba = lba;
+            commandLog.back().count = count;
+
+            const bool cacheable = selection == 0 && userData && cacheSectors > 0;
+            bool hit = cacheable && count > 0;
+            for (uint32_t s = lba; hit && s < lba + count; ++s) hit = cache_.count(s) != 0;
+            if (hit) {
+                ++cacheHits;
+                simulatedMicros += uint64_t(count) * cachedSectorMicros;
+                for (uint32_t i = 0; i < count; ++i) {
+                    cacheStore(lba + i, cache_[lba + i].data());  // most recently used
+                    const std::vector<uint8_t>& cachedSector = cache_[lba + i];
+                    std::memcpy(out + size_t(i) * perSector, cachedSector.data(), cdr::kSectorBytes + c2Bytes);
+                }
+                lastReadLba_ = lba;
+                if (errorField != 0 && c2IgnoresErrorField) ok.transferred = size_t(count) * cdr::kSectorBytes;
+                return ok;
+            }
+            if (selection == 0) ++discReads;
+            if (lba != head_) {
+                const int64_t distance = std::abs(int64_t(lba) - int64_t(head_));
+                simulatedMicros += distance > int64_t(seekDistance) ? seekMicros : accessMicros;
+            }
+            simulatedMicros += uint64_t(count) * discSectorMicros;
+            head_ = lba + count;
+
             for (uint32_t s = lba; s < lba + count; ++s) {
                 auto it = failuresBySector.find(s);
                 if (it != failuresBySector.end() && it->second != 0) {
@@ -286,19 +347,22 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
                 }
                 if (selection != 0) subQ(s, selection, sector + (userData ? cdr::kSectorBytes : 0));
                 if (selection != 0 || !userData) continue;
-                uint8_t* c2 = c2Bytes ? sector + cdr::kSectorBytes : nullptr;
-                if (c2) std::memset(c2, 0, c2Bytes);
+                uint8_t full[cdr::kSectorBytes + 296] = {};  // audio + C2 bits as error field 10b returns them
                 auto it = c2Faults.find(s);
-                if (it == c2Faults.end() || it->second.reads == 0) continue;
-                C2Fault& f = it->second;
-                if (f.reads > 0) --f.reads;
-                const uint8_t noise = f.varying ? uint8_t(++c2Counter_ % 255 + 1) : uint8_t(0x55);
-                const size_t end = std::min(size_t(cdr::kSectorBytes), f.firstByte + f.byteCount);
-                for (size_t b = f.firstByte; b < end; ++b) {
-                    if (f.corrupt) sector[b] ^= noise;
-                    if (c2 && f.flagged) c2[b >> 3] |= uint8_t(0x80 >> (b & 7));
+                if (it != c2Faults.end() && it->second.reads != 0) {
+                    C2Fault& f = it->second;
+                    if (f.reads > 0) --f.reads;
+                    const uint8_t noise = f.varying ? uint8_t(++c2Counter_ % 255 + 1) : uint8_t(0x55);
+                    const size_t end = std::min(size_t(cdr::kSectorBytes), f.firstByte + f.byteCount);
+                    for (size_t b = f.firstByte; b < end; ++b) {
+                        if (f.corrupt) sector[b] ^= noise;
+                        if (f.flagged) full[cdr::kSectorBytes + (b >> 3)] |= uint8_t(0x80 >> (b & 7));
+                    }
+                    if (f.flagged) full[cdr::kSectorBytes + 294] = 0xFF;  // block error byte
                 }
-                if (c2 && f.flagged && c2Bytes == 296) c2[294] = 0xFF;  // block error byte
+                std::memcpy(full, sector, cdr::kSectorBytes);
+                if (c2Bytes) std::memcpy(sector + cdr::kSectorBytes, full + cdr::kSectorBytes, c2Bytes);
+                if (cacheable) cacheStore(s, full);
             }
             lastReadLba_ = lba;
             if (errorField != 0 && c2IgnoresErrorField) ok.transferred = size_t(count) * cdr::kSectorBytes;

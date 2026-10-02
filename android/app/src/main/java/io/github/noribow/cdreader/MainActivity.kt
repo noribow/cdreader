@@ -53,6 +53,7 @@ class MainActivity : Activity() {
         const val PREF_CDDB = "cddb"
         const val PREF_ACCURATERIP = "accurateRip"
         const val PREF_C2 = "useC2"
+        const val PREF_CACHE = "cacheMode"
         const val PREF_ADVANCED = "advancedOpen"
         const val MAX_RETRIES = 5
         const val READY_WAIT_SECONDS = 30
@@ -77,6 +78,7 @@ class MainActivity : Activity() {
     private lateinit var editOffset: EditText
     private lateinit var checkVerify: CheckBox
     private lateinit var checkC2: CheckBox
+    private lateinit var spinnerCache: Spinner
     private lateinit var textAdvanced: TextView
     private lateinit var groupAdvanced: View
     private lateinit var checkCddb: CheckBox
@@ -145,6 +147,7 @@ class MainActivity : Activity() {
         editOffset = findViewById(R.id.editOffset)
         checkVerify = findViewById(R.id.checkVerify)
         checkC2 = findViewById(R.id.checkC2)
+        spinnerCache = findViewById(R.id.spinnerCache)
         textAdvanced = findViewById(R.id.textAdvanced)
         groupAdvanced = findViewById(R.id.groupAdvanced)
         checkCddb = findViewById(R.id.checkCddb)
@@ -173,6 +176,7 @@ class MainActivity : Activity() {
         checkCddb.isChecked = cddbEnabled
         checkAccurateRip.isChecked = prefs.getBoolean(PREF_ACCURATERIP, true)
         checkC2.isChecked = prefs.getBoolean(PREF_C2, true)
+        spinnerCache.setSelection(CacheMode.fromKey(prefs.getString(PREF_CACHE, null)).ordinal, false)
         showAdvanced(prefs.getBoolean(PREF_ADVANCED, false))
 
         buttonConnect.setOnClickListener { if (connection == null) connect() else reloadDisc() }
@@ -188,6 +192,13 @@ class MainActivity : Activity() {
         }
         checkC2.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(PREF_C2, checked).apply()
+        }
+        spinnerCache.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                prefs.edit().putString(PREF_CACHE, selectedCacheMode().key).apply()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
         textAdvanced.setOnClickListener {
             val open = groupAdvanced.visibility != View.VISIBLE
@@ -419,6 +430,7 @@ class MainActivity : Activity() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(PREF_OFFSET, offset).apply()
         val verify = checkVerify.isChecked
         val useC2 = checkC2.isChecked
+        val cacheMode = selectedCacheMode()
         val format = selectedFormat()
         val accurateRip = checkAccurateRip.isChecked
 
@@ -436,7 +448,8 @@ class MainActivity : Activity() {
             var message: String
             var results: String? = null
             try {
-                s.beginRip(format, offset, MAX_RETRIES, verify, useC2)
+                if (cacheMode == CacheMode.AUTO) runOnUiThread { setStatus("ドライブのキャッシュを確認しています…") }
+                s.beginRip(format, offset, MAX_RETRIES, verify, useC2, cacheMode)
                 val ripped = mutableListOf<Pair<Int, RipResult>>()
                 val dir = createDocument(treeDocument(tree), DocumentsContract.Document.MIME_TYPE_DIR, s.albumFolderName())
                 var problems = 0
@@ -459,7 +472,8 @@ class MainActivity : Activity() {
                 val summary = s.checkAccurateRip(accurateRip, http)
                 val log = s.ripLog()
                 writeText(createDocument(dir, "application/octet-stream", "rip.log"), log)
-                results = describeC2(s.c2Status(), ripped) + "\n" + describeAccurateRip(summary)
+                results = describeC2(s.c2Status(), ripped) + "\n" + describeCache(s.cacheStatus(), ripped) + "\n" +
+                    describeAccurateRip(summary)
                 message = if (problems == 0) "完了しました (${selected.size} トラック)"
                 else "完了しましたが、$problems トラックに読めないセクタまたは疑わしい位置がありました (rip.log を参照)"
             } catch (e: CancellationException) {
@@ -526,6 +540,32 @@ class MainActivity : Activity() {
             }
         }
         return lines.joinToString("\n")
+    }
+
+    private fun selectedCacheMode(): CacheMode =
+        CacheMode.entries.getOrElse(spinnerCache.selectedItemPosition) { CacheMode.AUTO }
+
+    // Drive cache defeat (#34): what the test found, what the rip did before re-reads.
+    private fun describeCache(status: CacheStatus, results: List<Pair<Int, RipResult>>): String {
+        val size = if (status.cacheKb > 0) " (%d KB)".format(status.cacheKb) else ""
+        val found = when (status.result) {
+            CacheResult.NOT_TESTED -> ""
+            CacheResult.NO_CACHE -> "音声データをキャッシュしないドライブです"
+            CacheResult.FUA_WORKS -> "キャッシュあり、FUA が有効です"
+            CacheResult.FUA_IGNORED -> "キャッシュあり、FUA は効きません"
+            CacheResult.FUA_REJECTED -> "ドライブが FUA を受け付けません"
+            CacheResult.UNKNOWN -> "判定できませんでした"
+        }
+        val method = when (status.method) {
+            CacheMethod.NONE -> "対策なし"
+            CacheMethod.FUA -> "FUA"
+            CacheMethod.FLUSH -> "追い出し"
+        }
+        val defeats = results.sumOf { it.second.cacheDefeats }
+        var line = "キャッシュ$size: " + (if (found.isEmpty()) "" else "$found → ") + method
+        if (defeats > 0) line += ", 再読込前の対策 %d 回".format(defeats)
+        if (status.fuaGivenUp) line += "\nキャッシュ: ドライブが FUA を受け付けないため、途中から追い出しにしました"
+        return line
     }
 
     // e.g. "Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2"
@@ -653,6 +693,7 @@ class MainActivity : Activity() {
         editOffset.isEnabled = !busy
         checkVerify.isEnabled = !busy
         checkC2.isEnabled = !busy
+        spinnerCache.isEnabled = !busy
         checkCddb.isEnabled = !busy
         checkAccurateRip.isEnabled = !busy
         for ((_, radio) in formatButtons()) radio.isEnabled = !busy

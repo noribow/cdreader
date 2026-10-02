@@ -92,6 +92,18 @@ ScsiResult CdDrive::readAudioWithSubChannel(uint32_t lba, uint32_t count, SubCha
                   kSectorBytes + subChannelBytesPerSector(selection), out);
 }
 
+ScsiResult CdDrive::forceUnitAccess(uint32_t lba) {
+    // READ(12): byte 1 bit 3 = FUA, bytes 2..5 the LBA, bytes 6..9 the
+    // transfer length (0: no blocks, no data phase).
+    const uint8_t cdb[12] = {
+        0xA8, 0x08,
+        uint8_t(lba >> 24), uint8_t(lba >> 16), uint8_t(lba >> 8), uint8_t(lba),
+        0, 0, 0, 0,
+        0, 0,
+    };
+    return transport_.execute(cdb, sizeof cdb, nullptr, 0, DataDirection::None, kReadTimeout);
+}
+
 DriveCapabilities DriveCapabilities::parse(const uint8_t* data, size_t length) {
     DriveCapabilities caps;
     if (length < 8) {
@@ -112,6 +124,9 @@ DriveCapabilities DriveCapabilities::parse(const uint8_t* data, size_t length) {
     }
     caps.valid = true;
     caps.c2Pointers = (data[page + 5] & 0x10) != 0;
+    // Bytes 12..13: buffer size in KB, when the page (length byte + 2) and
+    // the response reach that far.
+    if (data[page + 1] >= 12 && page + 14 <= end) caps.bufferKB = uint32_t(data[page + 12]) << 8 | data[page + 13];
     return caps;
 }
 
