@@ -27,6 +27,7 @@
 #include "cdreader/ogg_flac_writer.h"
 #include "cdreader/toc.h"
 #include "test_signals.h"
+#include "test_temp.h"
 
 namespace fs = std::filesystem;
 
@@ -279,7 +280,7 @@ int main(int argc, char** argv) {
                                      {"ffprobe", c.tools.ffprobe}})
         if (path.empty()) std::printf("%s not available - its checks are skipped\n", name);
 
-    c.dir = fs::temp_directory_path() / "cdreader_ogg_flac_check";
+    c.dir = cdr_test::testTempDir() / "cdreader_ogg_flac_check";
     fs::create_directories(c.dir);
     checkSignals(c);
     checkImage(c, false);

@@ -23,6 +23,7 @@
 #include "cdreader/flac_writer.h"
 #include "cdreader/gaps.h"
 #include "cdreader/wav_writer.h"
+#include "test_temp.h"
 
 namespace fs = std::filesystem;
 
@@ -78,7 +79,7 @@ int main(int argc, char** argv) {
     }
     const std::string flac = quote(fs::u8path(argv[1]));
     const std::string metaflac = quote(fs::u8path(argv[2]));
-    const fs::path dir = fs::temp_directory_path() / "cdreader_flac_cuesheet";
+    const fs::path dir = cdr_test::testTempDir() / "cdreader_flac_cuesheet";
     fs::create_directories(dir);
     const fs::path image = dir / "image.flac";
     const fs::path copy = dir / "reimported.flac";

@@ -27,6 +27,7 @@
 #include "cdreader/resampler.h"
 #include "cdreader/toc.h"
 #include "test_signals.h"
+#include "test_temp.h"
 
 namespace fs = std::filesystem;
 
@@ -348,7 +349,7 @@ int main(int argc, char** argv) {
     if (c.tools.ffmpeg.empty()) std::printf("ffmpeg not available - the decoding checks are skipped\n");
     if (c.tools.ffprobe.empty()) std::printf("ffprobe not available - the tag / chapter checks are skipped\n");
 
-    c.dir = fs::temp_directory_path() / "cdreader_mka_check";
+    c.dir = cdr_test::testTempDir() / "cdreader_mka_check";
     fs::create_directories(c.dir);
     const std::vector<std::string> formats = cdr::audioFormats();
     for (const char* format : {"mka", "mka-pcm", "mka-opus", "mka-vorbis"}) {

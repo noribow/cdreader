@@ -26,6 +26,7 @@
 #include "cdreader/alac_writer.h"
 #include "cdreader/flac_writer.h"
 #include "test_signals.h"
+#include "test_temp.h"
 
 namespace fs = std::filesystem;
 
@@ -148,7 +149,7 @@ int main(int argc, char** argv) {
         return 77;
     }
     const std::string ffmpegCmd = quote(fs::u8path(ffmpeg)) + " -v error -nostdin -y";
-    const fs::path dir = fs::temp_directory_path() / "cdreader_alac_ffmpeg_check";
+    const fs::path dir = cdr_test::testTempDir() / "cdreader_alac_ffmpeg_check";
     fs::create_directories(dir);
 
     std::vector<testsig::Signal> signals = testsig::all();

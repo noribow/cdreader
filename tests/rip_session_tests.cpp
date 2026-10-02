@@ -26,6 +26,7 @@
 #include "fake_usb_device.h"
 #include "flac_decoder.h"
 #include "rip_session.h"
+#include "test_temp.h"
 
 namespace fs = std::filesystem;
 
@@ -198,7 +199,7 @@ struct TempDir {
     fs::path path;
     TempDir() {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        path = fs::temp_directory_path() / ("cdreader_rip_session_" + std::to_string(stamp));
+        path = cdr_test::testTempDir() / ("cdreader_rip_session_" + std::to_string(stamp));
         fs::create_directories(path);
     }
     ~TempDir() {
