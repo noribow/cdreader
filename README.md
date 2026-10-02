@@ -102,12 +102,19 @@ Android 版では USB ホスト API 経由の USB Mass Storage (Bulk-Only Transp
 
 ## 今後の予定
 
-- [ ] Android 版 (USB 外付け CD ドライブ、NDK + Kotlin UI)
+- [ ] Android 版 (USB 外付け CD ドライブ、NDK + Kotlin UI) — [#9](https://github.com/noribow/cdreader/issues/9)
 - [ ] オフセット値の自動検出 (AccurateRip データベースとの照合)、リードイン/リードアウトのオーバーリード
-- [ ] AccurateRip / MusicBrainz ディスク ID 対応
-- [ ] FLAC 出力、CD-TEXT・メタデータ取得によるファイル名付け
+- [ ] AccurateRip 対応 — [#5](https://github.com/noribow/cdreader/issues/5)
+- [ ] CDDB 対応 (ディスク情報の取得) — [#6](https://github.com/noribow/cdreader/issues/6)
+- [ ] オーディオコーデック対応 (FLAC など) — [#7](https://github.com/noribow/cdreader/issues/7)
+- [ ] コンテナフォーマット対応・タグ付け — [#8](https://github.com/noribow/cdreader/issues/8)
 - [ ] セキュアモードでのドライブキャッシュ回避 (現状の `--verify` はキャッシュされたデータを再読込する可能性があります)
 - [ ] Windows GUI
+
+## 開発の進め方
+
+要求・機能は [GitHub issue](https://github.com/noribow/cdreader/issues) で管理し、PR には対応する issue を記載します (`Closes #番号`)。
+詳しくは [CLAUDE.md](CLAUDE.md) を参照してください。
 
 ## ライセンス
 
