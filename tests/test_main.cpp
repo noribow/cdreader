@@ -25,6 +25,7 @@
 #include "cdreader/cddb.h"
 #include "cdreader/crc32.h"
 #include "cdreader/cue_sheet.h"
+#include "cdreader/drive_cache.h"
 #include "cdreader/file_naming.h"
 #include "cdreader/flac_encoder.h"
 #include "cdreader/flac_writer.h"
@@ -4827,6 +4828,503 @@ TEST(suspicious_position_formatting) {
     r.unreadableSectors = 2;
     r.suspiciousSectors = {1, 2, 3};
     CHECK(r.status() == "2 unreadable sector(s), 3 suspicious sector(s)");
+}
+
+// --- Drive cache defeat (#34) ------------------------------------------------
+
+namespace {
+
+// makeAudioDisc() (750 sectors) with a 100-sector read cache and a reported
+// buffer of 200 KB: a flush reads 114 sectors.
+FakeDrive makeCacheDisc(bool fuaHonoured = true) {
+    FakeDrive fake = makeAudioDisc();
+    fake.cacheSectors = 100;
+    fake.bufferKB = 200;
+    fake.fuaHonoured = fuaHonoured;
+    return fake;
+}
+
+cdr::RipOptions cacheOptions(cdr::CacheDefeat method, int retries = 3, bool verify = false) {
+    cdr::RipOptions o;
+    o.maxRetries = retries;
+    o.verify = verify;
+    o.cacheDefeat = method;
+    o.flushSectors = cdr::flushSectorsForCache(200);
+    return o;
+}
+
+struct CacheRip {
+    cdr::TrackRipResult result;
+    std::vector<uint8_t> bytes;
+    cdr::CacheDefeat method = cdr::CacheDefeat::None;  // at the end
+    std::string fallback;
+};
+
+CacheRip ripCached(FakeDrive& fake, int track, const cdr::RipOptions& options) {
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    fake.commandLog.clear();
+    cdr::Ripper ripper(drive, toc, options);
+    CacheRip out;
+    out.result = ripper.ripTrack(*toc.findTrack(track), [&](const uint8_t* p, size_t n) {
+        out.bytes.insert(out.bytes.end(), p, p + n);
+    });
+    out.method = ripper.cacheDefeat();
+    out.fallback = ripper.cacheFallbackReason();
+    return out;
+}
+
+// READ CD commands (0xBE) of sectors that a READ CD inside [begin, end)
+// requested before: each must directly follow READ(12) FUA of its LBA.
+bool fuaBeforeEveryReread(const std::vector<FakeDrive::Command>& log, uint32_t begin, uint32_t end) {
+    std::set<uint32_t> seen;
+    for (size_t i = 0; i < log.size(); ++i) {
+        const FakeDrive::Command& c = log[i];
+        if (c.opcode != 0xBE || c.lba < begin || c.lba >= end) continue;
+        bool reread = false;
+        for (uint32_t s = c.lba; s < c.lba + c.count; ++s) reread |= seen.count(s) != 0;
+        if (reread && (i == 0 || log[i - 1].opcode != 0xA8 || log[i - 1].lba != c.lba)) return false;
+        for (uint32_t s = c.lba; s < c.lba + c.count; ++s) seen.insert(s);
+    }
+    return true;
+}
+
+int countOpcode(const std::vector<FakeDrive::Command>& log, uint8_t opcode) {
+    return int(std::count_if(log.begin(), log.end(), [&](const FakeDrive::Command& c) { return c.opcode == opcode; }));
+}
+
+bool readsWithin(const std::vector<FakeDrive::Command>& log, uint32_t begin, uint32_t end) {
+    return std::all_of(log.begin(), log.end(), [&](const FakeDrive::Command& c) {
+        return c.opcode != 0xBE || (c.lba >= begin && c.lba + c.count <= end);
+    });
+}
+
+cdr::DriveCacheCheck detectOn(FakeDrive& fake, cdr::CacheSetting setting = cdr::CacheSetting::Auto) {
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    fake.commandLog.clear();
+    return cdr::checkDriveCache(drive, toc, setting, fake);
+}
+
+}  // namespace
+
+TEST(cache_fua_command_cdb) {
+    FakeDrive fake = makeCacheDisc();
+    cdr::CdDrive drive(fake);
+    std::vector<uint8_t> buf(cdr::kSectorBytes);
+    CHECK(drive.readAudio(0x0123, 1, buf.data()).ok());
+    CHECK(fake.cached(0x0123));
+    CHECK(drive.forceUnitAccess(0x0123).ok());
+    // READ(12), FUA (byte 1 bit 3), LBA, transfer length 0: no data phase.
+    CHECK(fake.lastRead12Cdb == (std::vector<uint8_t>{0xA8, 0x08, 0x00, 0x00, 0x01, 0x23, 0, 0, 0, 0, 0, 0}));
+    CHECK(!fake.cached(0x0123));
+    fake.fuaSupported = false;
+    const cdr::ScsiResult r = drive.forceUnitAccess(5);
+    CHECK(!r.ok());
+    CHECK_EQ(r.sense.key, 0x5);
+    CHECK_EQ(r.sense.asc, 0x64);
+    CHECK_EQ(fake.fuaCommands, 2);
+}
+
+TEST(cache_fake_drive_returns_cached_data) {
+    FakeDrive fake = makeCacheDisc();
+    fake.unstableSectors[10] = true;
+    cdr::CdDrive drive(fake);
+    std::vector<uint8_t> a(cdr::kSectorBytes), b(cdr::kSectorBytes);
+    const uint64_t t0 = fake.nowMicros();
+    CHECK(drive.readAudio(10, 1, a.data()).ok());
+    const uint64_t t1 = fake.nowMicros();
+    CHECK(drive.readAudio(10, 1, b.data()).ok());
+    const uint64_t t2 = fake.nowMicros();
+    CHECK(a == b);  // from the cache: the same data, fast
+    CHECK(t2 - t1 < t1 - t0);
+    CHECK_EQ(fake.cacheHits, 1);
+    CHECK(drive.forceUnitAccess(10).ok());
+    CHECK(drive.readAudio(10, 1, b.data()).ok());
+    CHECK(a != b);  // from the disc again
+    fake.fuaHonoured = false;
+    CHECK(drive.forceUnitAccess(10).ok());
+    CHECK(drive.readAudio(10, 1, a.data()).ok());
+    CHECK(a == b);
+    // Least recently used sectors leave the cache.
+    std::vector<uint8_t> big(size_t(26) * cdr::kSectorBytes);
+    for (uint32_t lba = 100; lba < 200; lba += 25) CHECK(drive.readAudio(lba, 25, big.data()).ok());
+    CHECK(!fake.cached(10));
+    CHECK(fake.cached(100) && fake.cached(199));
+}
+
+TEST(cache_mode_sense_buffer_size) {
+    FakeDrive fake = makeCacheDisc();
+    fake.bufferKB = 2048;
+    cdr::CdDrive drive(fake);
+    CHECK_EQ(drive.readCapabilities().bufferKB, 2048u);
+    fake.bufferKB = 0;
+    CHECK_EQ(drive.readCapabilities().bufferKB, 0u);
+
+    // Page 2Ah after a block descriptor; bytes 12..13 of the page.
+    uint8_t data[8 + 8 + 20] = {};
+    data[1] = sizeof data - 2;
+    data[7] = 8;
+    data[16] = 0x2A;
+    data[17] = 18;
+    data[16 + 12] = 0x01;
+    data[16 + 13] = 0x00;
+    cdr::DriveCapabilities caps = cdr::DriveCapabilities::parse(data, sizeof data);
+    CHECK(caps.valid);
+    CHECK_EQ(caps.bufferKB, 256u);
+    CHECK_EQ(cdr::DriveCapabilities::parse(data, 16 + 13).bufferKB, 0u);  // response cut off before byte 13
+    data[17] = 6;  // a short page (MMC-1 style) has no buffer size
+    caps = cdr::DriveCapabilities::parse(data, sizeof data);
+    CHECK(caps.valid);
+    CHECK_EQ(caps.bufferKB, 0u);
+}
+
+TEST(cache_settings_and_flush_size) {
+    cdr::CacheSetting s = cdr::CacheSetting::None;
+    CHECK(cdr::parseCacheSetting("auto", s) && s == cdr::CacheSetting::Auto);
+    CHECK(cdr::parseCacheSetting("fua", s) && s == cdr::CacheSetting::Fua);
+    CHECK(cdr::parseCacheSetting("flush", s) && s == cdr::CacheSetting::Flush);
+    CHECK(cdr::parseCacheSetting("none", s) && s == cdr::CacheSetting::None);
+    CHECK(!cdr::parseCacheSetting("FUA", s) && !cdr::parseCacheSetting("", s));
+    CHECK(std::string(cdr::cacheSettingName(cdr::CacheSetting::Auto)) == "auto");
+    CHECK(std::string(cdr::cacheDefeatName(cdr::CacheDefeat::Flush)) == "flush");
+
+    // Cache size plus 10%, at least one read command more.
+    CHECK_EQ(cdr::flushSectorsForCache(2048), 892u + 89u);
+    CHECK_EQ(cdr::flushSectorsForCache(200), 88u + 26u);
+    CHECK_EQ(cdr::flushSectorsForCache(0), cdr::flushSectorsForCache(cdr::kDefaultCacheKB));
+    CHECK_EQ(cdr::flushSectorsForCache(0), 1784u + 178u);
+    CHECK_EQ(cdr::flushSectorsForCache(65535), cdr::flushSectorsForCache(cdr::kMaxCacheKB));
+    CHECK_EQ(cdr::flushSectorsForCache(1), 1u + 26u);
+}
+
+TEST(cache_flush_region_selection) {
+    using R = cdr::Toc::LbaRange;
+    auto check = [](const cdr::FlushRegion& f, uint32_t lba, uint32_t count, bool complete) {
+        return f.lba == lba && f.count == count && f.complete == complete;
+    };
+    // After the target, ending at the end of the audio run.
+    CHECK(check(cdr::selectFlushRegion(R{0, 750}, 300, 26, 114), 636, 114, true));
+    CHECK(check(cdr::selectFlushRegion(R{0, 750}, 0, 26, 114), 636, 114, true));
+    // Near the end: from the start of the run.
+    CHECK(check(cdr::selectFlushRegion(R{0, 750}, 700, 26, 114), 0, 114, true));
+    CHECK(check(cdr::selectFlushRegion(R{0, 750}, 749, 1, 114), 0, 114, true));
+    CHECK(check(cdr::selectFlushRegion(R{300, 750}, 650, 26, 114), 300, 114, true));
+    // Exactly enough room after the target.
+    CHECK(check(cdr::selectFlushRegion(R{0, 750}, 610, 26, 114), 636, 114, true));
+    // A short run: the larger side, whole.
+    CHECK(check(cdr::selectFlushRegion(R{100, 250}, 150, 10, 114), 160, 90, false));
+    CHECK(check(cdr::selectFlushRegion(R{100, 250}, 200, 10, 114), 100, 100, false));
+    // No room at all.
+    CHECK_EQ(cdr::selectFlushRegion(R{0, 26}, 0, 26, 114).count, 0u);
+    CHECK_EQ(cdr::selectFlushRegion(R{0, 750}, 300, 26, 0).count, 0u);
+    // Never outside the run, wherever the target is.
+    for (uint32_t target = 300; target < 750; target += 7) {
+        const cdr::FlushRegion f = cdr::selectFlushRegion(R{300, 750}, target, 26, 200);
+        CHECK(f.lba >= 300 && f.lba + f.count <= 750);
+        CHECK(f.lba + f.count <= target || f.lba >= std::min(target + 26, 750u));
+    }
+}
+
+TEST(cache_detection_outcomes) {
+    struct Case {
+        const char* name;
+        std::function<void(FakeDrive&)> setup;
+        cdr::DriveCacheCheck::Result result;
+        cdr::CacheDefeat method;
+        std::string line;
+    };
+    using Result = cdr::DriveCacheCheck::Result;
+    using M = cdr::CacheDefeat;
+    const std::string rejected = "SCSI status 0x02, sense ILLEGAL REQUEST (key 5, ASC 64, ASCQ 00)";
+    const std::vector<Case> cases = {
+        {"no cache", [](FakeDrive& f) { f.cacheSectors = 0; }, Result::NoCache, M::None,
+         "Drive cache: 200 KB, no audio caching detected (method: none)"},
+        {"no cache, no FUA", [](FakeDrive& f) { f.cacheSectors = 0; f.fuaSupported = false; }, Result::NoCache,
+         M::None, "Drive cache: 200 KB, no audio caching detected (method: none)"},
+        {"FUA works", [](FakeDrive&) {}, Result::FuaWorks, M::Fua,
+         "Drive cache: 200 KB, caches audio, FUA works (method: fua)"},
+        {"FUA ignored", [](FakeDrive& f) { f.fuaHonoured = false; }, Result::FuaIgnored, M::Flush,
+         "Drive cache: 200 KB, caches audio, FUA ignored (method: flush, 114 sectors per flush)"},
+        {"FUA rejected", [](FakeDrive& f) { f.fuaSupported = false; }, Result::FuaRejected, M::Flush,
+         "Drive cache: 200 KB, caches audio, FUA rejected by the drive (" + rejected +
+             ") (method: flush, 114 sectors per flush)"},
+        {"cache larger than the flush", [](FakeDrive& f) { f.cacheSectors = 400; }, Result::Unknown, M::Flush,
+         "Drive cache: 200 KB, detection inconclusive: reads after a flush of 114 sectors were too fast for the "
+         "disc (larger cache?) (method: flush, 114 sectors per flush)"},
+        {"slow bus", [](FakeDrive& f) { f.cachedSectorMicros = 600; }, Result::Unknown, M::Flush,
+         "Drive cache: 200 KB, detection inconclusive: ambiguous timings (method: flush, 114 sectors per flush)"},
+        {"read errors", [](FakeDrive& f) { f.failuresBySector[174] = f.failuresBySector[349] = -1; }, Result::Unknown,
+         M::Flush,
+         "Drive cache: 200 KB, detection inconclusive: test read at LBA 174 failed: SCSI status 0x02, sense MEDIUM "
+         "ERROR (key 3, ASC 11, ASCQ 05) (method: flush, 114 sectors per flush)"},
+        {"no MODE SENSE, disc too short", [](FakeDrive& f) { f.modeSenseSupported = false; }, Result::Unknown,
+         M::Flush,
+         "Drive cache: size unknown (assuming 4096 KB), detection inconclusive: the audio area is too short for the "
+         "test (method: flush, 1962 sectors per flush)"},
+    };
+    for (const Case& c : cases) {
+        FakeDrive fake = makeCacheDisc();
+        c.setup(fake);
+        const cdr::DriveCacheCheck check = detectOn(fake);
+        const bool ok = check.result == c.result && check.method == c.method && check.logLine() == c.line;
+        if (!ok) std::fprintf(stderr, "  %s: %s\n", c.name, check.logLine().c_str());
+        CHECK(ok);
+        CHECK(readsWithin(fake.commandLog, 0, 750));
+        CHECK_EQ(check.flushSectors, c.method == M::Flush && fake.modeSenseSupported ? 114u : check.flushSectors);
+    }
+
+    // The timings behind it, in rip.log; the same again (deterministic).
+    for (int i = 0; i < 2; ++i) {
+        FakeDrive fake = makeCacheDisc();
+        const cdr::DriveCacheCheck check = detectOn(fake);
+        const std::vector<std::string> lines = check.logLines();
+        CHECK_EQ(lines.size(), size_t(2));
+        CHECK(lines[1] == "Cache test (26 sectors): re-read 1.0 ms, after flush 32.2 ms, after FUA 32.2 ms");
+        CHECK_EQ(fake.fuaCommands, 3);
+        // MODE SENSE, then per round: prime, re-read, FUA, read, flush, position, read.
+        CHECK_EQ(fake.commandLog.front().opcode, 0x5A);
+    }
+}
+
+TEST(cache_forced_settings) {
+    using S = cdr::CacheSetting;
+    {
+        FakeDrive fake = makeCacheDisc();
+        const cdr::DriveCacheCheck c = detectOn(fake, S::None);
+        CHECK(c.method == cdr::CacheDefeat::None);
+        CHECK(fake.commandLog.empty());  // not even MODE SENSE
+        CHECK(c.logLine() == "Drive cache: method: none (disabled)");
+        CHECK_EQ(c.logLines().size(), size_t(1));
+        cdr::CdDrive drive(fake);
+        const cdr::DriveCapabilities caps = drive.readCapabilities();
+        const cdr::Toc toc = drive.readToc();
+        CHECK(cdr::checkDriveCache(drive, toc, S::None, fake, &caps).logLine() ==
+              "Drive cache: 200 KB, method: none (disabled)");
+    }
+    {
+        FakeDrive fake = makeCacheDisc();
+        const cdr::DriveCacheCheck c = detectOn(fake, S::Flush);
+        CHECK(c.method == cdr::CacheDefeat::Flush);
+        CHECK_EQ(fake.commandLog.size(), size_t(1));  // MODE SENSE
+        CHECK(c.logLine() == "Drive cache: 200 KB, method: flush (forced), 114 sectors per flush");
+        fake.bufferKB = 0;
+        CHECK(detectOn(fake, S::Flush).logLine() ==
+              "Drive cache: size not reported (assuming 4096 KB), method: flush (forced), 1962 sectors per flush");
+        fake.bufferKB = 16384;
+        CHECK(detectOn(fake, S::Flush).logLine() ==
+              "Drive cache: 16384 KB (flush capped at 8192 KB), method: flush (forced), 3923 sectors per flush");
+    }
+    {
+        FakeDrive fake = makeCacheDisc();
+        const cdr::DriveCacheCheck c = detectOn(fake, S::Fua);
+        CHECK(c.method == cdr::CacheDefeat::Fua);
+        CHECK_EQ(fake.fuaCommands, 1);
+        CHECK_EQ(countOpcode(fake.commandLog, 0xBE), 0);  // no timing test
+        CHECK(c.logLine() == "Drive cache: 200 KB, method: fua (forced)");
+        fake.fuaSupported = false;
+        const cdr::DriveCacheCheck r = detectOn(fake, S::Fua);
+        CHECK(r.result == cdr::DriveCacheCheck::Result::FuaRejected);
+        CHECK(r.method == cdr::CacheDefeat::Flush);
+        CHECK(r.logLine() ==
+              "Drive cache: 200 KB, FUA rejected by the drive (SCSI status 0x02, sense ILLEGAL REQUEST (key 5, ASC 64, "
+              "ASCQ 00)) (method: flush, 114 sectors per flush)");
+    }
+}
+
+// The reason for it all: a transient error that verify mode "confirms" from
+// the cache without cache defeat, and catches with it.
+TEST(cache_verify_reread_reads_the_disc) {
+    auto faulty = [](FakeDrive& fake) {
+        FakeDrive::C2Fault f;  // silently wrong on the first read only
+        f.reads = 1;
+        f.flagged = false;
+        fake.c2Faults[310] = f;
+    };
+    const std::vector<uint8_t> good = expectedTrackData(300, 150);
+
+    FakeDrive noCache = makeAudioDisc();
+    faulty(noCache);
+    const CacheRip a = ripCached(noCache, 2, cacheOptions(cdr::CacheDefeat::None, 3, true));
+    CHECK(a.bytes == good);
+    CHECK_EQ(a.result.retries, 1u);
+
+    FakeDrive cached = makeCacheDisc();
+    faulty(cached);
+    const CacheRip b = ripCached(cached, 2, cacheOptions(cdr::CacheDefeat::None, 3, true));
+    CHECK(b.bytes != good);  // confirmed from the cache
+    CHECK(b.result.clean());
+    CHECK_EQ(b.result.retries, 0u);
+    CHECK(cached.cacheHits > 0);
+    CHECK_EQ(b.result.cacheDefeats, 0u);
+    CHECK(cdr::cacheLogLines(b.result).empty());
+
+    FakeDrive fua = makeCacheDisc();
+    faulty(fua);
+    const CacheRip c = ripCached(fua, 2, cacheOptions(cdr::CacheDefeat::Fua, 3, true));
+    CHECK(c.bytes == good);
+    CHECK_EQ(c.result.retries, 1u);
+    CHECK_EQ(fua.cacheHits, 0);
+    CHECK(fuaBeforeEveryReread(fua.commandLog, 0, 750));
+    const int blocks = int((150 + cdr::kMaxSectorsPerRead - 1) / cdr::kMaxSectorsPerRead);
+    CHECK_EQ(int(c.result.cacheDefeats), blocks + 2);  // every verify read, both reads of the retry
+    CHECK_EQ(fua.fuaCommands, blocks + 2);
+    CHECK(c.result.cacheDefeat == cdr::CacheDefeat::Fua);
+    CHECK(cdr::cacheLogLines(c.result) == std::vector<std::string>{"  Cache defeat: " + std::to_string(blocks + 2) +
+                                                                   " FUA command(s)"});
+
+    FakeDrive flush = makeCacheDisc(false);  // FUA would not help
+    faulty(flush);
+    const CacheRip d = ripCached(flush, 2, cacheOptions(cdr::CacheDefeat::Flush, 3, true));
+    CHECK(d.bytes == good);
+    CHECK_EQ(d.result.retries, 1u);
+    CHECK_EQ(flush.fuaCommands, 0);
+    CHECK_EQ(int(d.result.cacheDefeats), blocks + 2);
+    CHECK_EQ(d.result.flushSectorsRead, d.result.cacheDefeats * 114u);
+    CHECK(readsWithin(flush.commandLog, 0, 750));
+    CHECK(cdr::cacheLogLines(d.result) ==
+          std::vector<std::string>{"  Cache defeat: " + std::to_string(blocks + 2) + " flush(es), " +
+                                   std::to_string(d.result.flushSectorsRead) + " sectors read"});
+
+    // FUA on a drive that ignores it: confirmed from the cache again.
+    FakeDrive ignored = makeCacheDisc(false);
+    faulty(ignored);
+    CHECK(ripCached(ignored, 2, cacheOptions(cdr::CacheDefeat::Fua, 3, true)).bytes != good);
+}
+
+// A C2 re-read from the cache returns the same flagged data: without cache
+// defeat two "identical reads" accept the wrong data.
+TEST(cache_c2_reread_reads_the_disc) {
+    for (cdr::CacheDefeat method : {cdr::CacheDefeat::None, cdr::CacheDefeat::Fua, cdr::CacheDefeat::Flush}) {
+        FakeDrive fake = makeCacheDisc();
+        fake.c2Supported = true;
+        FakeDrive::C2Fault f;
+        f.reads = 1;
+        fake.c2Faults[310] = f;
+        cdr::RipOptions o = cacheOptions(method);
+        o.useC2 = true;
+        const CacheRip r = ripCached(fake, 2, o);
+        CHECK_EQ(r.result.c2ErrorSectors, 1u);
+        if (method == cdr::CacheDefeat::None) {
+            CHECK(r.bytes != expectedTrackData(300, 150));
+            CHECK_EQ(r.result.c2Matched, 1u);
+        } else {
+            CHECK(r.bytes == expectedTrackData(300, 150));
+            CHECK_EQ(r.result.c2Recovered, 1u);
+            CHECK_EQ(r.result.c2Rereads, 1u);
+            CHECK_EQ(r.result.cacheDefeats, 1u);
+            CHECK(fuaBeforeEveryReread(fake.commandLog, 0, 750) == (method == cdr::CacheDefeat::Fua));
+        }
+        CHECK(r.result.clean());
+    }
+}
+
+// Retries after read errors and the sector-by-sector fallback re-read too.
+TEST(cache_retries_and_sector_fallback_defeat_cache) {
+    for (cdr::CacheDefeat method : {cdr::CacheDefeat::Fua, cdr::CacheDefeat::Flush}) {
+        FakeDrive fake = makeCacheDisc();
+        fake.failuresBySector[310] = 3;  // the block fails all 3 attempts, the sector read works
+        const CacheRip r = ripCached(fake, 2, cacheOptions(method, 2));
+        CHECK(r.bytes == expectedTrackData(300, 150));
+        CHECK(r.result.clean());
+        CHECK_EQ(r.result.retries, 2u);
+        CHECK_EQ(r.result.cacheDefeats, 2u + 26u);  // two retries, 26 single-sector reads
+        if (method == cdr::CacheDefeat::Fua) CHECK(fuaBeforeEveryReread(fake.commandLog, 0, 750));
+        else CHECK(readsWithin(fake.commandLog, 0, 750));
+    }
+}
+
+// No cache defeat: the command sequence of #33. A drive found without cache
+// rips with exactly the commands of a rip without cache handling, and
+// clean reads give the same bytes with every method.
+TEST(cache_none_keeps_the_command_sequence) {
+    auto setup = [](FakeDrive& fake) {
+        fake.c2Supported = true;
+        fake.failuresBySector[310] = 1;
+        FakeDrive::C2Fault f;
+        f.reads = 2;
+        fake.c2Faults[400] = f;
+    };
+    cdr::RipOptions base;  // as before #34
+    base.maxRetries = 3;
+    base.verify = true;
+    base.useC2 = true;
+    FakeDrive reference = makeAudioDisc();
+    setup(reference);
+    const CacheRip ref = ripCached(reference, 2, base);
+    FakeDrive cachedReference = makeCacheDisc();
+    setup(cachedReference);
+    ripCached(cachedReference, 2, base);
+
+    FakeDrive cached = makeCacheDisc();
+    setup(cached);
+    cdr::RipOptions none = base;
+    none.cacheDefeat = cdr::CacheDefeat::None;
+    none.flushSectors = 114;
+    ripCached(cached, 2, none);
+    CHECK(cached.commandLog == cachedReference.commandLog);
+    CHECK_EQ(countOpcode(cached.commandLog, 0xA8), 0);
+
+    FakeDrive auto_ = makeAudioDisc();  // no cache: detection picks none
+    auto_.bufferKB = 200;
+    setup(auto_);
+    cdr::CdDrive drive(auto_);
+    const cdr::Toc toc = drive.readToc();
+    const cdr::DriveCacheCheck check = cdr::checkDriveCache(drive, toc, cdr::CacheSetting::Auto, auto_);
+    CHECK(check.method == cdr::CacheDefeat::None);
+    cdr::RipOptions detected = base;
+    detected.cacheDefeat = check.method;
+    detected.flushSectors = check.flushSectors;
+    const CacheRip b = ripCached(auto_, 2, detected);
+    CHECK(auto_.commandLog == reference.commandLog);
+    CHECK(b.bytes == ref.bytes);
+    CHECK_EQ(b.result.crc32, ref.result.crc32);
+
+    // Clean disc: the same output with every method, FUA before every verify read.
+    for (cdr::CacheDefeat method : {cdr::CacheDefeat::None, cdr::CacheDefeat::Fua, cdr::CacheDefeat::Flush}) {
+        FakeDrive fake = makeCacheDisc();
+        const CacheRip r = ripCached(fake, 3, cacheOptions(method, 3, true));
+        CHECK(r.bytes == expectedTrackData(450, 300));
+        CHECK(r.result.clean());
+        CHECK_EQ(r.result.retries, 0u);
+        const int blocks = int((300 + cdr::kMaxSectorsPerRead - 1) / cdr::kMaxSectorsPerRead);
+        CHECK_EQ(int(r.result.cacheDefeats), method == cdr::CacheDefeat::None ? 0 : blocks);
+    }
+}
+
+TEST(cache_fua_rejected_during_rip_switches_to_flush) {
+    FakeDrive fake = makeCacheDisc();
+    fake.fuaSupported = false;
+    FakeDrive::C2Fault f;
+    f.reads = 1;
+    f.flagged = false;
+    fake.c2Faults[310] = f;
+    const CacheRip r = ripCached(fake, 2, cacheOptions(cdr::CacheDefeat::Fua, 3, true));
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK(r.method == cdr::CacheDefeat::Flush);
+    CHECK(r.result.cacheDefeat == cdr::CacheDefeat::Fua);
+    CHECK_EQ(fake.fuaCommands, 1);
+    CHECK(r.result.flushSectorsRead > 0);
+    CHECK(r.result.cacheFallback.find("READ(12) with FUA rejected at LBA 300 (SCSI status 0x02, sense ILLEGAL REQUEST") == 0);
+    CHECK(r.fallback == r.result.cacheFallback);
+    const std::vector<std::string> lines = cdr::cacheLogLines(r.result);
+    CHECK_EQ(lines.size(), size_t(2));
+    CHECK(lines[1] == "  FUA given up: " + r.result.cacheFallback);
+}
+
+// Flushes read inside the audio run of the track only: here after a data
+// track 1, so never before LBA 300, and never past the lead-out.
+TEST(cache_flush_stays_inside_the_audio_run) {
+    FakeDrive fake({{0, true}, {300, false}, {450, false}}, 750);
+    fake.cacheSectors = 100;
+    fake.bufferKB = 200;
+    for (int track : {2, 3}) {
+        fake.commandLog.clear();
+        const CacheRip r = ripCached(fake, track, cacheOptions(cdr::CacheDefeat::Flush, 3, true));
+        CHECK(r.result.clean());
+        CHECK(r.result.flushSectorsRead > 0);
+        CHECK(readsWithin(fake.commandLog, 300, 750));
+    }
 }
 
 int main() {

@@ -24,6 +24,9 @@ constexpr uint32_t kMaxSectorsPerC2Read = 24;
 struct DriveCapabilities {
     bool valid = false;       // the page was read and parsed
     bool c2Pointers = false;  // "C2 Pointers are supported" (page byte 5, bit 4)
+    // "Buffer Size Supported by Logical Unit" in KB (MMC page 2Ah bytes
+    // 12..13, #34); 0 when the page is too short or the drive reports none.
+    uint32_t bufferKB = 0;
     std::string error;        // why the page could not be read (valid == false)
 
     // Parses a MODE SENSE(10) response (8-byte header, block descriptors, page).
@@ -66,6 +69,14 @@ public:
     // bytes of C2 bits. Does not throw; a drive without C2 support answers
     // ILLEGAL REQUEST or transfers less (shortRead).
     ScsiResult readAudioWithC2(uint32_t lba, uint32_t count, uint8_t* out);
+
+    // READ(12) with FUA (Force Unit Access, byte 1 bit 3) and a transfer
+    // length of 0 (#34): no data phase, so the block size / sector type of
+    // the audio sector does not matter; drives that implement it (Plextor
+    // style) invalidate their read cache. Does not throw; drives that do not
+    // accept READ(12) on audio answer ILLEGAL REQUEST, others may accept it
+    // and do nothing (see drive_cache.h for the detection).
+    ScsiResult forceUnitAccess(uint32_t lba);
 
     // MODE SENSE(10), page 2Ah. Never throws: a failure means "unknown"
     // (valid false), which callers treat as "no C2 pointers".

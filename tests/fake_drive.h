@@ -1,15 +1,19 @@
 #pragma once
 
 #include <cstddef>
+#include <deque>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "cdreader/clock.h"
 #include "cdreader/scsi.h"
 #include "cdreader/toc.h"
 
-// In-memory CD drive speaking just enough MMC for the core library.
-class FakeDrive : public cdr::ScsiTransport {
+// In-memory CD drive speaking just enough MMC for the core library. It is
+// also the clock of the cache detection tests: every command advances a
+// simulated time (#34).
+class FakeDrive : public cdr::ScsiTransport, public cdr::Clock {
 public:
     struct FakeTrack {
         uint32_t startLba;
@@ -48,6 +52,47 @@ public:
     std::map<uint32_t, C2Fault> c2Faults;  // by LBA; plain reads get the corrupt data as well
     int c2ReadCommands = 0;
     std::vector<uint8_t> lastAudioCdb;  // last READ CD without sub-channel data
+
+    // Read cache (#34). With cacheSectors > 0, READ CD of audio without
+    // sub-channel data keeps what it returned (audio and C2 bits, faults
+    // included) for the last cacheSectors sectors read (LRU); a request whose
+    // sectors are all cached is answered from the cache: the same data
+    // again, no faults counted, and fast. READ(12) with FUA (transfer length
+    // 0) empties the cache when fuaHonoured.
+    uint32_t cacheSectors = 0;
+    bool fuaSupported = true;   // false: READ(12) answers ILLEGAL REQUEST (illegal mode for this track)
+    bool fuaHonoured = true;    // false: READ(12) with FUA is accepted and ignored
+    uint16_t bufferKB = 0;      // MODE SENSE page 2Ah bytes 12..13
+    int fuaCommands = 0;        // READ(12) commands received
+    int discReads = 0;          // READ CD of audio served from the disc
+    int cacheHits = 0;          // ... served from the cache
+    // Simulated time in microseconds (nowMicros()): every command costs
+    // commandMicros; a disc read additionally accessMicros (short) or
+    // seekMicros (more than seekDistance sectors away) unless it continues
+    // where the last disc read ended, plus discSectorMicros per sector
+    // (about 13x); a cache hit cachedSectorMicros per sector.
+    uint64_t simulatedMicros = 0;
+    uint64_t commandMicros = 200;
+    uint64_t accessMicros = 6000;
+    uint64_t seekMicros = 80000;
+    uint32_t seekDistance = 1000;
+    uint64_t discSectorMicros = 1000;
+    uint64_t cachedSectorMicros = 30;
+    uint64_t nowMicros() override { return simulatedMicros; }
+    // Every command: opcode, LBA and sector count (READ CD / READ(12); 0 otherwise).
+    struct Command {
+        uint8_t opcode;
+        uint32_t lba;
+        uint32_t count;
+        bool operator==(const Command& o) const { return opcode == o.opcode && lba == o.lba && count == o.count; }
+    };
+    std::vector<Command> commandLog;
+    std::vector<uint8_t> lastRead12Cdb;
+    void clearCache() {
+        cache_.clear();
+        cacheOrder_.clear();
+    }
+    bool cached(uint32_t lba) const { return cache_.count(lba) != 0; }
 
     // READ SUB-CHANNEL (42h), formats 02h / 03h. A code that is set is
     // returned with MCVal / TCVal = 1 as is (up to 13 / 12 bytes, so that
@@ -97,6 +142,10 @@ private:
     uint32_t unstableCounter_ = 0;
     uint32_t c2Counter_ = 0;
     uint32_t lastReadLba_ = 0;
+    uint32_t head_ = 0;  // where the last disc read ended
+    std::map<uint32_t, std::vector<uint8_t>> cache_;  // audio + 296 bytes of C2 bits per sector
+    std::deque<uint32_t> cacheOrder_;                 // least recently used first
+    void cacheStore(uint32_t lba, const uint8_t* sector);
 
     int trackAt(uint32_t lba) const;  // index into tracks_
     void subQ(uint32_t lba, uint8_t selection, uint8_t* out);

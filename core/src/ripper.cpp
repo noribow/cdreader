@@ -49,9 +49,13 @@ std::string C2Availability::logLine() const {
 }
 
 C2Availability checkC2(CdDrive& drive, bool wanted) {
+    if (!wanted) return {};
+    return checkC2(drive.readCapabilities(), true);
+}
+
+C2Availability checkC2(const DriveCapabilities& caps, bool wanted) {
     C2Availability a;
     if (!wanted) return a;
-    const DriveCapabilities caps = drive.readCapabilities();
     a.mode = caps.c2Pointers ? C2Availability::Mode::Supported : C2Availability::Mode::NotSupported;
     if (!caps.valid) a.detail = caps.error;
     return a;
@@ -103,6 +107,19 @@ std::vector<std::string> c2LogLines(const TrackRipResult& r) {
     return lines;
 }
 
+std::vector<std::string> cacheLogLines(const TrackRipResult& r) {
+    std::vector<std::string> lines;
+    if (r.cacheDefeats > 0) {
+        if (r.flushSectorsRead > 0)
+            lines.push_back("  Cache defeat: " + std::to_string(r.cacheDefeats) + " flush(es), " +
+                            std::to_string(r.flushSectorsRead) + " sectors read");
+        else
+            lines.push_back("  Cache defeat: " + std::to_string(r.cacheDefeats) + " FUA command(s)");
+    }
+    if (!r.cacheFallback.empty()) lines.push_back("  FUA given up: " + r.cacheFallback);
+    return lines;
+}
+
 // --- Ripper ------------------------------------------------------------------
 
 // With a read offset the track's samples no longer start on a sector
@@ -116,8 +133,11 @@ TrackRipResult Ripper::ripTrack(const Track& track, const SampleSink& sink, cons
     result.track = track.number;
     result.sectors = track.lengthSectors;
     result.c2 = c2Active_;
+    result.cacheDefeat = cacheDefeat_;
+    const std::string cacheFallbackBefore = cacheFallbackReason_;
 
     const Toc::LbaRange readable = toc_.audioRange(track);
+    readable_ = readable;
     const int64_t firstSample = int64_t(track.startLba) * kSamplesPerSector + options_.readOffsetSamples;
     const int64_t firstSector = floorDiv(firstSample, kSamplesPerSector);
     size_t skipBytes = size_t(firstSample - firstSector * kSamplesPerSector) * kBytesPerSample;
@@ -155,7 +175,7 @@ TrackRipResult Ripper::ripTrack(const Track& track, const SampleSink& sink, cons
         // READ CD with C2 bits moves 2646 bytes per sector: fewer per command.
         const uint32_t blockSectors = c2Active_ ? kMaxSectorsPerC2Read : kMaxSectorsPerRead;
         const uint32_t count = std::min(blockSectors, sectorsToRead - sectorsDone);
-        readSpan(firstSector + sectorsDone, count, readable, buffer.data(), result);
+        readSpan(firstSector + sectorsDone, count, buffer.data(), result);
         mapUnresolved();
         sectorsDone += count;
 
@@ -170,26 +190,53 @@ TrackRipResult Ripper::ripTrack(const Track& track, const SampleSink& sink, cons
     result.crc32 = crc.value();
     result.suspiciousSectors.assign(suspicious.begin(), suspicious.end());
     if (result.c2 && !c2Active_) result.c2Fallback = c2FallbackReason_;
+    if (cacheFallbackReason_ != cacheFallbackBefore) result.cacheFallback = cacheFallbackReason_;
     return result;
 }
 
 // Fills `count` sectors starting at `lba` (which may be negative): sectors
-// inside `readable` come from the drive, the rest are silence.
-void Ripper::readSpan(int64_t lba, uint32_t count, const Toc::LbaRange& readable, uint8_t* out,
-                      TrackRipResult& result) {
-    const int64_t begin = std::max<int64_t>(lba, readable.begin);
-    const int64_t end = std::min<int64_t>(lba + count, readable.end);
+// inside the track's audio run come from the drive, the rest are silence.
+void Ripper::readSpan(int64_t lba, uint32_t count, uint8_t* out, TrackRipResult& result) {
+    const int64_t begin = std::max<int64_t>(lba, readable_.begin);
+    const int64_t end = std::min<int64_t>(lba + count, readable_.end);
     std::memset(out, 0, size_t(count) * kSectorBytes);
     if (begin < end)
-        readRange(uint32_t(begin), uint32_t(end - begin), out + size_t(begin - lba) * kSectorBytes, result);
+        readRange(uint32_t(begin), uint32_t(end - begin), out + size_t(begin - lba) * kSectorBytes, false, result);
+}
+
+// Makes the drive read [lba, lba + count) from the disc on the next read
+// instead of answering from its cache (#34).
+void Ripper::defeatCache(uint32_t lba, uint32_t count, TrackRipResult& result) {
+    if (cacheDefeat_ == CacheDefeat::Fua) {
+        const ScsiResult r = drive_.forceUnitAccess(lba);
+        if (!(r.transportOk && r.status == 0x02 && r.sense.key == 0x5)) {
+            // Other failures (a medium error, ...) do not mean that the
+            // drive cannot do it: keep FUA.
+            ++result.cacheDefeats;
+            return;
+        }
+        cacheDefeat_ = CacheDefeat::Flush;
+        cacheFallbackReason_ = "READ(12) with FUA rejected at LBA " + std::to_string(lba) + " (" + r.describe() +
+                               "), flush from there on";
+    }
+    if (cacheDefeat_ != CacheDefeat::Flush) return;
+    const uint32_t sectors = options_.flushSectors ? options_.flushSectors : flushSectorsForCache(0);
+    const FlushRegion region = selectFlushRegion(readable_, lba, count, sectors);
+    if (region.count == 0) return;
+    flushCache(drive_, region, flushBuffer_);
+    ++result.cacheDefeats;
+    result.flushSectorsRead += region.count;
 }
 
 // One READ CD of `count` sectors into `out`, with the C2 bits into `c2`
 // (count * kC2BytesPerSector bytes, all zero when C2 pointers are not used).
+// `reread`: these sectors were read before, defeat the drive cache first.
 // A drive that rejects the C2 read (ILLEGAL REQUEST, or less data) while a
 // plain read of the same sectors works cannot deliver C2 bits: plain reads
 // from then on, for the rest of the disc.
-bool Ripper::readOnce(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2) {
+bool Ripper::readOnce(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, bool reread,
+                      TrackRipResult& result) {
+    if (reread && cacheDefeat_ != CacheDefeat::None) defeatCache(lba, count, result);
     std::memset(c2, 0, size_t(count) * kC2BytesPerSector);
     if (!c2Active_) return drive_.readAudio(lba, count, out).ok();
 
@@ -213,7 +260,9 @@ bool Ripper::readOnce(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2) {
 
 // Reads a block with retries; in verify mode a block only counts once two
 // consecutive reads return identical data (their C2 bits are combined).
-bool Ripper::readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, TrackRipResult& result) {
+// Every read but the first (unless `reread`) defeats the drive cache.
+bool Ripper::readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, bool reread,
+                       TrackRipResult& result) {
     const size_t bytes = size_t(count) * kSectorBytes;
     std::vector<uint8_t> check, checkC2;
     if (options_.verify) {
@@ -223,9 +272,9 @@ bool Ripper::readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, 
 
     for (int attempt = 0; attempt <= options_.maxRetries; ++attempt) {
         if (attempt > 0) ++result.retries;
-        if (!readOnce(lba, count, out, c2)) continue;
+        if (!readOnce(lba, count, out, c2, reread || attempt > 0, result)) continue;
         if (!options_.verify) return true;
-        if (!readOnce(lba, count, check.data(), checkC2.data())) continue;
+        if (!readOnce(lba, count, check.data(), checkC2.data(), true, result)) continue;
         if (std::memcmp(out, check.data(), bytes) == 0) {
             for (size_t i = 0; i < checkC2.size(); ++i) c2[i] |= checkC2[i];
             return true;
@@ -237,9 +286,11 @@ bool Ripper::readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, 
 // Falls back to sector-by-sector reads when a multi-sector block keeps
 // failing, so that a single bad sector does not silence its neighbours.
 // Sectors of a successful read that carry C2 errors are re-read one by one.
-void Ripper::readRange(uint32_t lba, uint32_t count, uint8_t* out, TrackRipResult& result) {
+// `reread`: the sectors were read before (the fallback), so even the first
+// read defeats the drive cache.
+void Ripper::readRange(uint32_t lba, uint32_t count, uint8_t* out, bool reread, TrackRipResult& result) {
     std::vector<uint8_t> c2(size_t(count) * kC2BytesPerSector);
-    if (readBlock(lba, count, out, c2.data(), result)) {
+    if (readBlock(lba, count, out, c2.data(), reread, result)) {
         for (uint32_t i = 0; i < count; ++i) {
             const uint8_t* bits = c2.data() + size_t(i) * kC2BytesPerSector;
             if (!anyBit(bits)) continue;
@@ -253,7 +304,7 @@ void Ripper::readRange(uint32_t lba, uint32_t count, uint8_t* out, TrackRipResul
         ++result.unreadableSectors;
         return;
     }
-    for (uint32_t i = 0; i < count; ++i) readRange(lba + i, 1, out + size_t(i) * kSectorBytes, result);
+    for (uint32_t i = 0; i < count; ++i) readRange(lba + i, 1, out + size_t(i) * kSectorBytes, true, result);
 }
 
 // Re-reads a sector the drive flagged with C2 errors, up to maxRetries
@@ -277,7 +328,7 @@ void Ripper::rereadC2Sector(uint32_t lba, uint8_t* out, const uint8_t* c2, Track
 
     for (int k = 0; k < options_.maxRetries && c2Active_; ++k) {
         ++result.c2Rereads;
-        if (!readOnce(lba, 1, cur.data(), curC2.data())) {
+        if (!readOnce(lba, 1, cur.data(), curC2.data(), true, result)) {
             prevValid = false;
             continue;
         }
