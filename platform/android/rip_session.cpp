@@ -175,6 +175,10 @@ void RipSession::beginRip(const RipSettings& settings) {
         throw std::invalid_argument("read offset out of range");
     if (settings.options.maxRetries < 0) throw std::invalid_argument("negative retry count");
     settings_ = settings;
+    // MODE SENSE on every rip: cheap, and the drive may have been swapped.
+    c2_ = checkC2(drive_, settings.useC2);
+    settings_.options.useC2 = c2_.usable();
+    c2Fallback_.clear();
     ripped_.clear();
     accurateRip_ = {};
     accurateRipChecked_ = false;
@@ -214,6 +218,11 @@ const RippedTrack& RipSession::ripTrack(int number, const std::filesystem::path&
             if (progress) progress(done, total);
         });
     writer->close();
+    if (ripped.result.c2 && !ripper.c2Active()) {
+        // The drive rejected C2 reads: plain reads for the rest of the disc.
+        settings_.options.useC2 = false;
+        c2Fallback_ = ripper.c2FallbackReason();
+    }
     ripped.accurateRipV1 = ar.v1();
     ripped.accurateRipV2 = ar.v2();
 
@@ -277,6 +286,7 @@ std::string RipSession::ripLog() {
     std::ostringstream log;
     log << "cdreader " << CDREADER_VERSION << " (Android) rip log\n"
         << "Drive: " << driveName() << "\n"
+        << c2_.logLine() << "\n"
         << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
         << "Read offset correction: " << (options.readOffsetSamples > 0 ? "+" : "") << options.readOffsetSamples
@@ -321,12 +331,12 @@ std::string RipSession::ripLog() {
 
     log << "Folder: " << albumDirectoryName() << "\n";
     for (const RippedTrack& r : ripped_) {
-        const std::string status =
-            r.result.clean() ? "OK" : std::to_string(r.result.unreadableSectors) + " unreadable sector(s)";
-        log << r.fileName << "  CRC32 " << hex32(r.result.crc32) << "  retries " << r.result.retries << "  " << status;
+        log << r.fileName << "  CRC32 " << hex32(r.result.crc32) << "  retries " << r.result.retries << "  "
+            << r.result.status();
         if (r.result.paddedSamples)
             log << "  (" << r.result.paddedSamples << " samples outside the disc padded with silence)";
         log << "\n";
+        for (const std::string& l : c2LogLines(r.result)) log << l << "\n";
     }
 
     if (accurateRipChecked_) {

@@ -24,6 +24,8 @@
   CUE シート・FLAC の `CUESHEET`・`rip.log` に反映 (HTOA はシングルファイルのイメージに含め、`--htoa` でトラック 00 としても保存)
 - 読み取りエラー時のリトライ、失敗したブロックはセクタ単位で再読込し、読めないセクタだけを無音で補完
 - `--verify` で 2 回読みして一致を確認 (セキュアモード)
+- 対応ドライブでは **C2 エラーポインタ**で訂正しきれなかったセクタを検出して再読込し、解決しなかった位置を
+  「疑わしい位置」(Suspicious position) として `rip.log` に記録 (既定で有効、`--no-c2` で無効)
 - ドライブの読み取りオフセット補正 (`--offset`、EAC / AccurateRip と同じ値)
 - トラックごとの CRC32 と `rip.log` (TOC・結果) を出力
 - [AccurateRip](https://www.accuraterip.com/) データベースとの照合 (チェックサム v1 / v2、confidence を表示)
@@ -35,12 +37,13 @@
 ## 使い方 (Windows)
 
 ```
-cdreader drives                     光学ドライブの一覧
+cdreader drives                     光学ドライブの一覧 (C2 エラーポインタ対応の有無も表示)
 cdreader toc D:                     TOC (トラック一覧)、MCN / ISRC と CDDB のディスク情報を表示
 cdreader rip D:                     全オーディオトラックを "アーティスト - アルバム"\ に保存
 cdreader rip D: -t 1,3-5 -o out     トラック 1,3,4,5 を out\ に保存
 cdreader rip D: --verify -r 10      2 回読み比較、リトライ 10 回
 cdreader rip D: --offset 6          読み取りオフセット +6 サンプルで補正
+cdreader rip D: --no-c2             C2 エラーポインタを使わずに読み取る
 cdreader rip D: --single-file       全トラックを 1 つの WAV と CUE シートに保存
 cdreader rip D: -f flac             FLAC で保存
 cdreader rip D: -f oggflac          Ogg FLAC (.oga) で保存
@@ -67,8 +70,9 @@ cdreader offset D:                  読み取りオフセットを AccurateRip �
 | `-b, --bitrate <kbps>` | 非可逆フォーマットの目標ビットレート (kbit/s、VBR)。`opus` / `mka-opus`: 6〜510 (既定 160)、`vorbis` / `mka-vorbis`: 45〜500 (平均ビットレート、`--quality` の代わり) |
 | `-q, --quality <q>` | `vorbis` / `mka-vorbis` の VBR 品質 (oggenc と同じ -1〜10、小数可。既定 5 ≒ 160 kbit/s)。Opus には指定できません |
 | `-t, --tracks <list>` | リッピングするトラック (例: `1,3-5`)。既定は全オーディオトラック |
-| `-r, --retries <n>` | 読み取り失敗時のリトライ回数 (既定: 5) |
+| `-r, --retries <n>` | 読み取り失敗時のリトライ回数 (既定: 5)。C2 エラーのあるセクタの再読込回数の上限も兼ねます |
 | `--verify` | 全ブロックを 2 回読みして比較 (低速) |
+| `--no-c2` | C2 エラーポインタを使わない (既定では対応ドライブなら使います。「C2 エラーポインタ」の節を参照) |
 | `--offset <n>` | 読み取りオフセット補正 (サンプル単位、負の値も可。既定: 0) |
 | `--single-file` | 選択したトラックを 1 つのファイルにつなげて保存 (ディスクイメージ + CUE シート。FLAC / Ogg FLAC ではファイル内にも CUE シートを埋め込み、MKA ではトラックごとのチャプターを記録) |
 | `--no-cue-file` | 外部の `.cue` ファイルを書かない |
@@ -86,7 +90,7 @@ CDDB のオプション (`rip` と `toc` の両方で使えます):
 | `--cddb-match <n>` | 候補が複数あるときに使う候補の番号 (1 から。既定: 1) |
 | `--cddb-hello <user@host>` | CDDB の hello に送るユーザー名とホスト名 (既定: `cdreader@localhost`。実際のユーザー名は送りません) |
 
-終了コード: `0` 成功 / `1` エラー / `2` 読めないセクタがあった。
+終了コード: `0` 成功 / `1` エラー / `2` 読めないセクタ、または疑わしい位置 (C2) があった。
 
 ### CDDB とファイル名
 
@@ -119,6 +123,52 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - 1 サンプル = 4 バイト (16 bit ステレオ)。`+N` の場合、各トラックはドライブが返すデータの N サンプル後ろから切り出されます。
 - 補正によってディスクの先頭より前・リードアウトより後 (CD-Extra ではデータセッションとの間) にはみ出した部分は、
   多くのドライブで読めないため無音で埋めます。その数は `rip.log` に記録されます。
+
+### C2 エラーポインタ
+
+CD のデータは CIRC (C1 / C2 の 2 段の誤り訂正) で守られていますが、傷などで C2 段でも訂正しきれないと、
+ドライブは前後のサンプルから補間した値を返します。対応ドライブは、どのバイトが訂正できなかったかを
+**C2 エラーポインタ** (1 バイトにつき 1 ビット) として報告できます ([#33](https://github.com/noribow/cdreader/issues/33))。
+
+- リッピング開始時に `MODE SENSE` (CD 機能ページ 2Ah の "C2 Pointers are supported" ビット) で対応を確認します。
+  `MODE SENSE` に応答しないドライブは非対応として扱います。対応していれば既定で有効です (`--no-c2` で無効)。
+  `cdreader drives` / `cdreader toc` にも対応状況を表示します。
+- 読み取りは `READ CD` のエラーフィールド 01b (C2 エラーブロックデータ、1 セクタあたり 2352 + 294 バイト) を使います。
+  10b (ブロックエラーバイトとパッドを加えた 296 バイト) は使わない情報が増えるだけで、対応していないドライブもあるためです。
+  転送量が増えるので、1 コマンドあたりのセクタ数を 26 から 24 に減らしています (64 KiB 未満。SPTI のバッファ・USB ブリッジ向け)。
+- C2 エラーのあるセクタは 1 セクタずつ再読込します (最大 `-r` 回)。次のどちらかで終わります:
+  - C2 エラーなしで読めた (`--verify` では同じ内容をもう一度読めた場合のみ) → 「回復」
+  - 連続する 2 回の読み取りが同じ内容だった (C2 エラーは残ったまま) → 「一致」。ドライブが毎回同じ補間値を返す、または
+    誤って C2 を報告しているので、それ以上読んでも変わらないと判断します。`--verify` では再読込の 2 回が一致した場合のみ
+    (最初の読み取りは数えません)、それ以外では C2 を報告した最初の読み取りも数えます。
+- 上限まで読んでも解決しなかったセクタは、C2 エラーの最も少なかった読み取りを使い、そのバイトを含む出力側のセクタを
+  **疑わしい位置**として記録します。位置は出力トラックの先頭からの時間 (EAC と同じ `時:分:秒`) とセクタ番号で、
+  読み取りオフセット補正後の位置です (補正でずれたバイトが隣のセクタ・隣のトラックに入る場合もその位置になります)。
+  疑わしい位置のあるトラックはエラー扱いです (終了コード `2`、`Finished with errors`)。
+- `rip.log` の例:
+
+  ```
+  Drive: PLEXTOR DVDR PX-760A (1.07)
+  C2 pointers: supported
+  ...
+  03 - Song.flac  CRC32 1A2B3C4D  retries 0  2 suspicious sector(s)
+    C2 errors: 5 sector(s), 13 re-read(s) (3 recovered, 1 identical re-reads with C2, 1 unresolved)
+    Suspicious position 0:01:23 - 0:01:23 (sectors 6230-6231)
+  ```
+
+- C2 付きの読み取りを ILLEGAL REQUEST で拒否する、またはエラーフィールドを無視してデータが足りないドライブでは、
+  同じセクタを通常の読み取りで読めることを確かめたうえで、そのディスクの残りを通常の読み取りに切り替え、`rip.log` に記録します
+  (`C2 reads given up: ...`)。
+- C2 を使わない場合 (`--no-c2`・非対応ドライブ) の読み取りは従来とまったく同じです (同じコマンド・同じ出力)。
+- プリギャップ・HTOA の検出 (サブチャンネルの読み取り) には C2 を使いません。HTOA をトラック 00 として保存する場合の音声の読み取りには使います。
+
+注意:
+
+- **C2 の精度はドライブ依存です。** 報告の漏れ・誤報告・ビット順序の違うドライブもあります。C2 は再読込する箇所の絞り込みに使うもので、
+  最終的な正しさは AccurateRip の照合や `--verify` で確認してください。C2 を報告せずに誤ったデータを返す場合は C2 では検出できません
+  (毎回違うデータなら `--verify` で、毎回同じなら AccurateRip でのみ分かります)。
+- ドライブのキャッシュにより、再読込でも同じデータが返る場合があります (キャッシュ回避は今後の課題)。
+- 実機での動作確認はこれからです。
 
 ### FLAC 出力
 
@@ -482,9 +532,14 @@ SCSI/MMC コマンドを送ります)。
    アーティスト・アルバム名・曲名を表示します。候補が複数あるときは一覧の上の選択欄で切り替えられます。
    ディスクを入れ替えたら「TOC を再読込」を押します。
 3. 「保存先フォルダ」で保存先を選びます (Storage Access Framework。選んだフォルダは次回以降も使われます)。
-4. 形式 (FLAC (既定) / Ogg FLAC / ALAC (M4A) / WAV / Opus / Vorbis / MKA (FLAC)。Opus は VBR 160 kbit/s、Vorbis は品質 5 の固定設定)、必要に応じて読み取りオフセット (Windows 版の `--offset` と同じ値)、「2 回読みして比較」、
+4. 形式 (FLAC (既定) / Ogg FLAC / ALAC (M4A) / WAV / Opus / Vorbis / MKA (FLAC)。Opus は VBR 160 kbit/s、Vorbis は品質 5 の固定設定)、
    「AccurateRip で照合」(既定でオン) を設定し、保存するトラックにチェックを付けて「リッピング」を押します。
-5. リッピング後、AccurateRip の結果がトラックごとに表示されます
+   必要に応じて「▶ 詳細設定」をタップして開き、次を設定します (開閉状態と設定は次回以降も使われます):
+   - 読み取りオフセット (Windows 版の `--offset` と同じ値)
+   - 「2 回読みして比較 (低速)」(Windows 版の `--verify`)
+   - 「C2 エラーポインタを使う (対応ドライブのみ)」(既定でオン。オフにすると Windows 版の `--no-c2` と同じ。「C2 エラーポインタ」の節を参照)
+5. リッピング後、C2 の結果 (使ったかどうか、C2 エラーのセクタ数・再読込回数・疑わしい位置のあるトラック) と
+   AccurateRip の結果がトラックごとに表示されます
    (例: `Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2` — 一致したチェックサムの版、v2 / v1 それぞれの一致件数、
    登録件数の合計、一致したプレス数 / そのトラックの登録があるプレス数)。1 トラックも一致しない場合は読み取りオフセットを確認してください。
 
@@ -492,8 +547,8 @@ SCSI/MMC コマンドを送ります)。
 ファイルにはタグ (曲名・アーティスト・アルバム・年・ジャンル・トラック番号・CDDB ID、ディスクに記録されていれば ISRC と MCN) が書き込まれます。
 MCN / ISRC はリッピング開始時にディスクごとに 1 回読み取り、`rip.log` にも記録します。
 プリギャップ・HTOA もリッピング開始時にディスクごとに 1 回検出し、`rip.log` に記録します (Android 版はまだ CUE シート・シングルファイルを書かないため記録のみ。HTOA は保存しません)。
-`rip.log` には Windows 版と同じく、ドライブ・設定・TOC・CDDB の結果・トラックごとの CRC32 / リトライ回数 / 読めなかったセクタ数・
-AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
+`rip.log` には Windows 版と同じく、ドライブ・C2 対応状況・設定・TOC・CDDB の結果・トラックごとの CRC32 / リトライ回数 / 読めなかったセクタ数・
+C2 エラーの集計と疑わしい位置・AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
 読み取り中は「キャンセル」で中断できます。リトライ回数は 5 回固定です。
 CDDB や AccurateRip に接続できなかった場合も、リッピングはそのまま行われます (ファイル名は `TrackNN`、結果は `rip.log` に記録)。
 AccurateRip のデータベースは HTTP でしか提供されていないため、`www.accuraterip.com` に限って平文通信を許可しています
@@ -547,6 +602,13 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 テストは仮想ドライブ (`tests/fake_drive.*`) を使い、TOC 解析・リトライ・不良セクタ処理・2 回読み比較・オフセット補正・WAV 出力・
 タグ・CUE シート・Ogg ページを検証します。
+C2 エラーポインタは、仮想ドライブが `MODE SENSE` ページ 2Ah (対応・非対応・コマンド自体が非対応) と、エラーフィールド付きの `READ CD`
+(C2 ビットマップ) を返し、セクタごとに筋書きを指定した C2 エラー (ずっと続く・再読込で消える・C2 を報告するがデータは正しい・
+毎回同じ誤データ・C2 を報告しない誤データ) と、C2 付きの読み取りを拒否する / データが足りないドライブを再現します。
+CDB のバイト列、`MODE SENSE` 応答の解析、C2 ビットマップから出力セクタへの対応 (読み取りオフセットでセクタ境界・トラック境界をまたぐ場合)、
+再読込の終了条件と回数 (`--verify` あり・なし、リトライ 0 回)、読み取りエラー・セクタ単位の再読込との組み合わせ、
+通常の読み取りへの切り替え、疑わしい位置の書式、C2 無効・非対応時に出力とコマンド数が従来と同じであること、
+C2 を報告しない誤データは `--verify` か AccurateRip でしか分からないこと、プリギャップ検出で C2 を使わないことを検証します。
 環境変数 `CDREADER_TEST_OUTPUT` にディレクトリを指定すると、テストで作ったサンプル (タグ付き WAV、CUE、Ogg) をそこに残すので、
 ffprobe / MediaInfo / ExifTool / ogginfo などの外部ツールで確認できます。
 テストの一時ファイルは、テストプログラムごとにシステムの一時ディレクトリの下に作る専用のディレクトリ (`cdreader_test_<乱数>`) に書き、
@@ -593,9 +655,10 @@ Matroska (`cdreader_mka_tests`) は、EBML の可変長整数・各要素の符�
 `ffmpeg` で FLAC / PCM の MKA をデコードすると入力とビット単位で一致し、Opus / Vorbis の MKA は長さがちょうど一致して SNR が十分であること、
 `ffprobe` でタグとチャプター (CUE の位置) が読めることを確認するテスト (`mka_check`) も実行されます (無い場合はスキップ)。
 `cdreader_usb_tests` は仮想 USB デバイス (`tests/fake_usb_device.*`) を使って Android 版の USB Bulk-Only Transport
-(CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング) を検証します。
+(CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング、
+C2 付き読み取りの転送サイズ 24 × 2646 バイト) を検証します。
 `cdreader_rip_session_tests` は Android 版のリッピング処理 (`platform/android/rip_session.*`) を仮想 USB デバイスと偽の `HttpClient` で検証します
-(FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`)。
+(FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`、C2 の有効・無効・非対応・切り替えと `rip.log` の C2 の行)。
 
 ### Android アプリ
 
@@ -625,14 +688,14 @@ cmake -S . -B build -DCDREADER_BUILD_JNI=ON && cmake --build build
 ```
 core/       プラットフォーム非依存のコア (Windows / Android で共有)
   scsi      ScsiTransport インターフェース、センスデータ解析
-  cd_drive  MMC コマンド (INQUIRY, TEST UNIT READY, READ TOC, READ CD, READ SUB-CHANNEL)
+  cd_drive  MMC コマンド (INQUIRY, TEST UNIT READY, READ TOC, READ CD, READ SUB-CHANNEL, MODE SENSE)
   subchannel  サブチャンネル Q の MCN / ISRC 応答の解析・検証、ディスク全体の読み取り (DiscCodes)、セクタごとの Q フレームの解析
   gaps      プリギャップ (INDEX 00)・INDEX 02 以降・HTOA の検出 (Q の二分探索)
   toc       TOC 解析、CDDB ID
   cddb      CDDB の問い合わせ・応答解析 (HttpClient 経由)
   file_naming  メタデータからのファイル名・フォルダ名・アルバム単位のファイル名 (使えない文字の置換)
   accuraterip  AccurateRip ディスク ID・チェックサム v1/v2・データベース応答の解析と照合・オフセット検出
-  ripper    リトライ・セクタ分割・verify を含むトラック読み取り
+  ripper    リトライ・セクタ分割・verify・C2 エラーの再読込を含むトラック読み取り、C2 の rip.log 行
   audio_writer  出力フォーマットの共通インターフェース (WAV など。コーデック・コンテナはここに追加)、エンコーダ設定
   metadata  アルバム / トラック情報 (タグ付け・ファイル名用)
   tags      RIFF INFO / ID3v2.4 / Vorbis コメントの生成
@@ -691,6 +754,8 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
   - [x] MKA (Matroska。FLAC / PCM / Opus / Vorbis、タグ、シングルファイルのチャプター) — [#23](https://github.com/noribow/cdreader/issues/23)
   - [x] プリギャップ (`INDEX 00`) と HTOA の検出 (サブチャンネル Q の読み取り) — [#25](https://github.com/noribow/cdreader/issues/25)
     (実装済み・実機での動作確認待ち)
+- [x] C2 エラーポインタを使った読み取りエラーの検出と再読込 (`--no-c2`、Android は詳細設定) — [#33](https://github.com/noribow/cdreader/issues/33)
+  (実装済み・実機での動作確認待ち)
 - [ ] セキュアモードでのドライブキャッシュ回避 (現状の `--verify` はキャッシュされたデータを再読込する可能性があります)
 - [ ] Windows GUI
 

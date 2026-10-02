@@ -52,6 +52,8 @@ class MainActivity : Activity() {
         const val PREF_FORMAT = "format"
         const val PREF_CDDB = "cddb"
         const val PREF_ACCURATERIP = "accurateRip"
+        const val PREF_C2 = "useC2"
+        const val PREF_ADVANCED = "advancedOpen"
         const val MAX_RETRIES = 5
         const val READY_WAIT_SECONDS = 30
         const val USER_AGENT = "cdreader/0.1.0 (Android)"
@@ -74,6 +76,9 @@ class MainActivity : Activity() {
     private lateinit var spinnerMatch: Spinner
     private lateinit var editOffset: EditText
     private lateinit var checkVerify: CheckBox
+    private lateinit var checkC2: CheckBox
+    private lateinit var textAdvanced: TextView
+    private lateinit var groupAdvanced: View
     private lateinit var checkCddb: CheckBox
     private lateinit var checkAccurateRip: CheckBox
     private lateinit var groupFormat: RadioGroup
@@ -139,6 +144,9 @@ class MainActivity : Activity() {
         spinnerMatch = findViewById(R.id.spinnerMatch)
         editOffset = findViewById(R.id.editOffset)
         checkVerify = findViewById(R.id.checkVerify)
+        checkC2 = findViewById(R.id.checkC2)
+        textAdvanced = findViewById(R.id.textAdvanced)
+        groupAdvanced = findViewById(R.id.groupAdvanced)
         checkCddb = findViewById(R.id.checkCddb)
         checkAccurateRip = findViewById(R.id.checkAccurateRip)
         groupFormat = findViewById(R.id.groupFormat)
@@ -164,6 +172,8 @@ class MainActivity : Activity() {
         cddbEnabled = prefs.getBoolean(PREF_CDDB, true)
         checkCddb.isChecked = cddbEnabled
         checkAccurateRip.isChecked = prefs.getBoolean(PREF_ACCURATERIP, true)
+        checkC2.isChecked = prefs.getBoolean(PREF_C2, true)
+        showAdvanced(prefs.getBoolean(PREF_ADVANCED, false))
 
         buttonConnect.setOnClickListener { if (connection == null) connect() else reloadDisc() }
         buttonFolder.setOnClickListener {
@@ -175,6 +185,14 @@ class MainActivity : Activity() {
         }
         checkAccurateRip.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(PREF_ACCURATERIP, checked).apply()
+        }
+        checkC2.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(PREF_C2, checked).apply()
+        }
+        textAdvanced.setOnClickListener {
+            val open = groupAdvanced.visibility != View.VISIBLE
+            showAdvanced(open)
+            prefs.edit().putBoolean(PREF_ADVANCED, open).apply()
         }
         checkCddb.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(PREF_CDDB, checked).apply()
@@ -394,9 +412,13 @@ class MainActivity : Activity() {
         val selected = disc.tracks.filterIndexed { i, t -> t.isAudio && listTracks.isItemChecked(i) }
         if (selected.isEmpty()) return setStatus("トラックを選択してください")
         val offset = editOffset.text.toString().trim().toIntOrNull()
-            ?: return setStatus("読み取りオフセットは整数で指定してください")
+        if (offset == null) {
+            showAdvanced(true)  // the field is in 詳細設定
+            return setStatus("読み取りオフセットは整数で指定してください")
+        }
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(PREF_OFFSET, offset).apply()
         val verify = checkVerify.isChecked
+        val useC2 = checkC2.isChecked
         val format = selectedFormat()
         val accurateRip = checkAccurateRip.isChecked
 
@@ -414,7 +436,8 @@ class MainActivity : Activity() {
             var message: String
             var results: String? = null
             try {
-                s.beginRip(format, offset, MAX_RETRIES, verify)
+                s.beginRip(format, offset, MAX_RETRIES, verify, useC2)
+                val ripped = mutableListOf<Pair<Int, RipResult>>()
                 val dir = createDocument(treeDocument(tree), DocumentsContract.Document.MIME_TYPE_DIR, s.albumFolderName())
                 var problems = 0
                 for ((index, track) in selected.withIndex()) {
@@ -429,15 +452,16 @@ class MainActivity : Activity() {
                         }
                     }
                     copyToDocument(temp, createDocument(dir, mimeType(format), s.trackFileName(track.number, format)))
+                    ripped += track.number to r
                     if (!r.clean) problems++
                 }
                 if (accurateRip) runOnUiThread { setStatus("AccurateRip データベースを照会しています…") }
                 val summary = s.checkAccurateRip(accurateRip, http)
                 val log = s.ripLog()
                 writeText(createDocument(dir, "application/octet-stream", "rip.log"), log)
-                results = describeAccurateRip(summary)
+                results = describeC2(s.c2Status(), ripped) + "\n" + describeAccurateRip(summary)
                 message = if (problems == 0) "完了しました (${selected.size} トラック)"
-                else "完了しましたが、$problems トラックに読めないセクタがありました (rip.log を参照)"
+                else "完了しましたが、$problems トラックに読めないセクタまたは疑わしい位置がありました (rip.log を参照)"
             } catch (e: CancellationException) {
                 message = "キャンセルしました"
             } catch (e: Exception) {
@@ -477,6 +501,31 @@ class MainActivity : Activity() {
         "opus" -> "application/octet-stream"
         "mka" -> "audio/x-matroska"
         else -> "audio/x-wav"
+    }
+
+    // C2 error pointers of the rip: whether they were used, then the tracks with C2 errors.
+    private fun describeC2(status: C2Status, results: List<Pair<Int, RipResult>>): String {
+        val lines = mutableListOf<String>()
+        when (status) {
+            C2Status.DISABLED -> lines += "C2: 使用しませんでした"
+            C2Status.NOT_SUPPORTED -> lines += "C2: このドライブは C2 エラーポインタに対応していません"
+            C2Status.USED, C2Status.GIVEN_UP -> {
+                val errors = results.sumOf { it.second.c2ErrorSectors }
+                val rereads = results.sumOf { it.second.c2Rereads }
+                val suspicious = results.count { it.second.suspiciousSectors > 0 }
+                lines += if (errors == 0) "C2: エラーなし"
+                else "C2: エラー %d セクタ, 再読込 %d 回, 疑わしい位置のあるトラック %d".format(errors, rereads, suspicious)
+                if (status == C2Status.GIVEN_UP)
+                    lines += "C2: ドライブが C2 付きの読み取りを受け付けないため、途中から通常の読み取りにしました"
+                for ((number, r) in results) {
+                    if (r.c2ErrorSectors == 0) continue
+                    lines += "Track %02d: C2 エラー %d セクタ / 再読込 %d 回 / 未解決 %d / 疑わしいセクタ %d".format(
+                        number, r.c2ErrorSectors, r.c2Rereads, r.c2Unresolved, r.suspiciousSectors
+                    )
+                }
+            }
+        }
+        return lines.joinToString("\n")
     }
 
     // e.g. "Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2"
@@ -603,6 +652,7 @@ class MainActivity : Activity() {
         buttonFolder.isEnabled = !busy
         editOffset.isEnabled = !busy
         checkVerify.isEnabled = !busy
+        checkC2.isEnabled = !busy
         checkCddb.isEnabled = !busy
         checkAccurateRip.isEnabled = !busy
         for ((_, radio) in formatButtons()) radio.isEnabled = !busy
@@ -613,6 +663,11 @@ class MainActivity : Activity() {
 
     private fun updateRipButton(busy: Boolean = false) {
         buttonRip.isEnabled = ripping || (!busy && toc != null && outputTree != null)
+    }
+
+    private fun showAdvanced(open: Boolean) {
+        groupAdvanced.visibility = if (open) View.VISIBLE else View.GONE
+        textAdvanced.text = getString(if (open) R.string.advanced_expanded else R.string.advanced_collapsed)
     }
 
     private fun setStatus(text: String) {

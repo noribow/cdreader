@@ -52,7 +52,7 @@ void printUsage() {
         "cdreader %s - CD audio ripper\n"
         "\n"
         "Usage:\n"
-        "  cdreader drives                       List optical drives\n"
+        "  cdreader drives                       List optical drives (and C2 pointer support)\n"
         "  cdreader toc <drive> [options]        Show the table of contents and disc info\n"
         "                        (CDDB options, --no-isrc and --no-gaps)\n"
         "  cdreader rip <drive> [options]        Rip audio tracks (see --format)\n"
@@ -79,6 +79,10 @@ void printUsage() {
         "      --offset <n>      Drive read offset correction in samples, e.g. 6 or -472\n"
         "                        (same value as EAC / AccurateRip; default: 0)\n"
         "      --verify          Read everything twice and compare (slower)\n"
+        "      --no-c2           Do not use C2 error pointers. By default drives that\n"
+        "                        report them (MODE SENSE) read with C2 bits, and\n"
+        "                        sectors with C2 errors are re-read (up to --retries\n"
+        "                        times); unresolved ones are logged as suspicious\n"
         "      --no-accuraterip  Do not look up the AccurateRip database after ripping\n"
         "      --single-file     Rip the tracks into one file (an image of the disc);\n"
         "                        the CUE sheet then marks the track positions. FLAC\n"
@@ -334,7 +338,8 @@ int cmdDrives() {
     for (char letter : letters) {
         try {
             OpenedDrive d = openDrive(letter);
-            std::printf("%c:  %s\n", letter, d.info.displayName().c_str());
+            std::printf("%c:  %s  [%s]\n", letter, d.info.displayName().c_str(),
+                        cdr::checkC2(*d.drive, true).logLine().c_str());
         } catch (const std::exception& e) {
             std::printf("%c:  (%s)\n", letter, e.what());
         }
@@ -356,6 +361,7 @@ int cmdToc(const std::vector<std::string>& args) {
 
     OpenedDrive d = openDrive(letter);
     std::printf("Drive: %s\n", d.info.displayName().c_str());
+    std::printf("%s\n", cdr::checkC2(*d.drive, true).logLine().c_str());
     const cdr::Toc toc = readTocOrExplain(*d.drive);
     const cdr::DiscCodes codes = readDiscCodes(*d.drive, toc.tracks, discCodes);
     const cdr::DiscGaps gaps = detectGaps(*d.drive, toc, gapDetection);
@@ -453,6 +459,7 @@ int cmdRip(const std::vector<std::string>& args) {
     bool discCodes = true;
     bool gapDetection = true;
     bool ripHtoa = false;
+    bool useC2 = true;
     cdr::EncoderSettings encoder;
 
     for (size_t i = 2; i < args.size(); ++i) {
@@ -473,6 +480,7 @@ int cmdRip(const std::vector<std::string>& args) {
         else if (a == "--no-gaps") gapDetection = false;
         else if (a == "--htoa") ripHtoa = true;
         else if (a == "--verify") options.verify = true;
+        else if (a == "--no-c2") useC2 = false;
         else if (parseCddbOption(args, i, cddb)) continue;
         else if (a == "--no-accuraterip") accurateRip = false;
         else if (a == "--single-file") singleFile = true;
@@ -512,6 +520,12 @@ int cmdRip(const std::vector<std::string>& args) {
         throw UsageError("read offset out of range");
 
     std::printf("Drive: %s\n", d.info.displayName().c_str());
+
+    // C2 error pointers (#33): only for drives that report them.
+    const cdr::C2Availability c2 = cdr::checkC2(*d.drive, useC2);
+    options.useC2 = c2.usable();
+    const std::string c2Line = c2.logLine() + (useC2 ? "" : " (--no-c2)");
+    std::printf("%s\n", c2Line.c_str());
 
     // MCN / ISRC are optional too: a drive that cannot read them only means
     // no CATALOG / ISRC lines and tags.
@@ -578,6 +592,7 @@ int cmdRip(const std::vector<std::string>& args) {
     std::ofstream log(dir / "rip.log");
     log << "cdreader " << kVersion << " rip log\n"
         << "Drive: " << d.info.displayName() << "\n"
+        << c2Line << "\n"
         << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
         << "Read offset correction: " << (options.readOffsetSamples > 0 ? "+" : "") << options.readOffsetSamples
@@ -686,12 +701,18 @@ int cmdRip(const std::vector<std::string>& args) {
             });
         if (!singleFile) writer->close();
 
-        const std::string status = r.clean() ? "OK" : std::to_string(r.unreadableSectors) + " unreadable sector(s)";
-        std::printf("  CRC32 %s  %s%s\n", hex32(r.crc32).c_str(), status.c_str(),
-                    r.retries ? ("  (" + std::to_string(r.retries) + " retries)").c_str() : "");
+        const std::string status = r.status();
+        std::string notes;
+        if (r.retries) notes += "  (" + std::to_string(r.retries) + " retries)";
+        if (r.c2ErrorSectors)
+            notes += "  (C2 errors in " + std::to_string(r.c2ErrorSectors) + " sector(s), " +
+                     std::to_string(r.c2Rereads) + " re-reads)";
+        std::printf("  CRC32 %s  %s%s\n", hex32(r.crc32).c_str(), status.c_str(), notes.c_str());
+        if (!r.c2Fallback.empty()) std::printf("  C2 reads given up: %s\n", r.c2Fallback.c_str());
         log << name << "  CRC32 " << hex32(r.crc32) << "  retries " << r.retries << "  " << status;
         if (r.paddedSamples) log << "  (" << r.paddedSamples << " samples outside the disc padded with silence)";
         log << "\n";
+        for (const std::string& l : cdr::c2LogLines(r)) log << l << "\n";
         if (!r.clean()) ++problems;
         if (!htoa) arTracks.push_back({t, ar.v1(), ar.v2()});
     }
