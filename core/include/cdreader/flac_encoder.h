@@ -1,11 +1,14 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "cdreader/cue_sheet.h"
+#include "cdreader/md5.h"
 #include "cdreader/metadata.h"
 #include "cdreader/tags.h"
 
@@ -71,6 +74,44 @@ private:
     std::vector<int32_t> mid_, side_, shifted_;
     std::vector<uint32_t> residual_, bestResidual_;
     std::vector<double> window_, windowed_;
+};
+
+// A whole FLAC stream without its container: CD-DA PCM bytes in, frames of
+// kBlockSize samples out (the last one shorter), plus the STREAMINFO values.
+// Shared by FlacWriter (native FLAC) and MkaWriter (FLAC in Matroska).
+class StreamEncoder {
+public:
+    // Receives each frame and the number of samples per channel in it.
+    using FrameSink = std::function<void(const std::vector<uint8_t>& frame, unsigned samples)>;
+
+    explicit StreamEncoder(EncoderOptions options = {});
+
+    void reset();  // starts a new stream
+    // Accepts any number of bytes, also parts of a sample.
+    void write(const uint8_t* pcm, size_t bytes, const FrameSink& sink);
+    // Encodes the last (short) frame. Throws std::runtime_error when the
+    // input ended in the middle of a sample or the stream is too long.
+    void finish(const FrameSink& sink);
+
+    uint64_t totalSamples() const { return totalSamples_; }
+    uint32_t frames() const { return frames_; }
+    bool hasPartialSample() const { return pending_.size() % 4 != 0; }
+
+    // Body of the STREAMINFO block (34 bytes, without the block header).
+    // Complete after finish(); before, a placeholder of the right size.
+    std::vector<uint8_t> streamInfo() const;
+
+private:
+    void encodeBlock(const uint8_t* pcm, unsigned samples, const FrameSink& sink);
+
+    FrameEncoder encoder_;
+    std::vector<uint8_t> pending_;  // PCM bytes not yet encoded (less than one block)
+    std::vector<int32_t> left_, right_;
+    Md5 md5_;
+    std::array<uint8_t, 16> digest_{};
+    uint64_t totalSamples_ = 0;
+    uint32_t frames_ = 0;
+    uint32_t minFrameBytes_ = 0, maxFrameBytes_ = 0;
 };
 
 // Body of a VORBIS_COMMENT metadata block (without the 4-byte block header),

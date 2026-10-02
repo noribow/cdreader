@@ -49,7 +49,9 @@ struct EncoderSettings {
     bool empty() const { return !bitrateKbps && !quality; }
 };
 
-// Names accepted by createAudioWriter(), e.g. {"wav", "flac", "opus", "vorbis"}.
+// Names accepted by createAudioWriter(), e.g. {"wav", "flac", "opus", "vorbis",
+// "mka", "mka-pcm", "mka-opus", "mka-vorbis"}. Matroska (.mka) formats name
+// the codec inside: "mka" is FLAC ("mka-flac" is accepted as well).
 // The lossy formats are only listed when the codec library was built in
 // (CMake options CDREADER_WITH_OPUS / CDREADER_WITH_VORBIS).
 std::vector<std::string> audioFormats();

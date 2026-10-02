@@ -601,4 +601,80 @@ std::vector<uint8_t> cueSheet(const EmbeddedCueSheet& cue, uint64_t leadOutSampl
     return v;
 }
 
+// --- StreamEncoder ----------------------------------------------------------
+
+namespace {
+
+constexpr uint32_t kStreamSampleRate = 44100;
+constexpr unsigned kStreamBytesPerFrame = 4;  // one 16-bit stereo sample
+constexpr size_t kStreamBlockBytes = size_t(kBlockSize) * kStreamBytesPerFrame;
+
+}  // namespace
+
+StreamEncoder::StreamEncoder(EncoderOptions options) : encoder_(options) {}
+
+void StreamEncoder::reset() {
+    pending_.clear();
+    md5_ = Md5();
+    digest_ = {};
+    totalSamples_ = 0;
+    frames_ = 0;
+    minFrameBytes_ = maxFrameBytes_ = 0;
+}
+
+void StreamEncoder::write(const uint8_t* pcm, size_t bytes, const FrameSink& sink) {
+    size_t used = 0;
+    if (!pending_.empty()) {
+        used = std::min(bytes, kStreamBlockBytes - pending_.size());
+        pending_.insert(pending_.end(), pcm, pcm + used);
+        if (pending_.size() < kStreamBlockBytes) return;
+        encodeBlock(pending_.data(), kBlockSize, sink);
+        pending_.clear();
+    }
+    for (; bytes - used >= kStreamBlockBytes; used += kStreamBlockBytes) encodeBlock(pcm + used, kBlockSize, sink);
+    pending_.insert(pending_.end(), pcm + used, pcm + bytes);
+}
+
+void StreamEncoder::encodeBlock(const uint8_t* pcm, unsigned samples, const FrameSink& sink) {
+    md5_.update(pcm, size_t(samples) * kStreamBytesPerFrame);  // FLAC hashes the little-endian PCM
+    left_.resize(samples);
+    right_.resize(samples);
+    for (unsigned i = 0; i < samples; ++i) {
+        const uint8_t* p = pcm + size_t(i) * kStreamBytesPerFrame;
+        left_[i] = int16_t(uint16_t(p[0] | p[1] << 8));
+        right_[i] = int16_t(uint16_t(p[2] | p[3] << 8));
+    }
+    const std::vector<uint8_t> frame = encoder_.encode(left_.data(), right_.data(), samples, frames_);
+    const uint32_t size = uint32_t(frame.size());
+    minFrameBytes_ = frames_ == 0 ? size : std::min(minFrameBytes_, size);
+    maxFrameBytes_ = std::max(maxFrameBytes_, size);
+    ++frames_;
+    totalSamples_ += samples;
+    sink(frame, samples);
+}
+
+void StreamEncoder::finish(const FrameSink& sink) {
+    if (hasPartialSample()) throw std::runtime_error("FLAC input ends in the middle of a sample");
+    if (!pending_.empty()) encodeBlock(pending_.data(), unsigned(pending_.size() / kStreamBytesPerFrame), sink);
+    pending_.clear();
+    if (totalSamples_ >= (uint64_t(1) << 36)) throw std::runtime_error("FLAC stream too long");
+    digest_ = md5_.finish();
+}
+
+std::vector<uint8_t> StreamEncoder::streamInfo() const {
+    // The block size fields describe every block but the last one; a stream
+    // of a single short block reports that block's size (at least 16).
+    const uint64_t blockSize =
+        totalSamples_ > kBlockSize ? kBlockSize : std::max<uint64_t>(totalSamples_, 16);
+    std::vector<uint8_t> info;
+    putBigEndian(info, blockSize, 2);  // minimum block size
+    putBigEndian(info, blockSize, 2);  // maximum block size
+    putBigEndian(info, minFrameBytes_, 3);
+    putBigEndian(info, maxFrameBytes_, 3);
+    // sample rate (20 bits), channels - 1 (3), bits per sample - 1 (5), total samples (36)
+    putBigEndian(info, uint64_t(kStreamSampleRate) << 44 | uint64_t(1) << 41 | uint64_t(15) << 36 | totalSamples_, 8);
+    info.insert(info.end(), digest_.begin(), digest_.end());
+    return info;
+}
+
 }  // namespace cdr::flac

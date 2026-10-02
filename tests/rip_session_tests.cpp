@@ -343,6 +343,27 @@ TEST(flac_rip_carries_cddb_tags_and_exact_audio) {
     CHECK_EQ(rig.session.problemTracks(), 0);
 }
 
+TEST(mka_rip_writes_matroska_with_tags) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    rig.session.lookupCddb(&http, {});
+    rig.session.beginRip(settings("mka"));
+    TempDir dir;
+    const fs::path path = dir.path / "track1.mka";
+    const cdr::RippedTrack& r = rig.session.ripTrack(1, path);
+    CHECK(r.result.clean());
+    CHECK_STR(r.fileName, "01 - Opening.mka");
+    const std::vector<uint8_t> bytes = readFile(path);
+    const std::string text(bytes.begin(), bytes.end());
+    CHECK(text.compare(0, 4, "\x1A\x45\xDF\xA3") == 0);  // EBML header
+    CHECK(contains(text, "matroska"));
+    CHECK(contains(text, "A_FLAC"));
+    CHECK(contains(text, "Album: Live"));
+    CHECK(contains(text, "Opening"));
+    CHECK(contains(rig.session.ripLog(), "Format: mka\nEncoder: FLAC (built-in encoder) in Matroska"));
+}
+
 #if defined(CDREADER_HAVE_OPUS) || defined(CDREADER_HAVE_VORBIS)
 TEST(lossy_rips_carry_tags_and_log_the_encoder) {
     std::vector<std::string> formats;

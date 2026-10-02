@@ -420,7 +420,8 @@ TEST(audio_writer_factory) {
     CHECK(std::find(formats.begin(), formats.end(), "wav") != formats.end());
     for (const std::string& f : formats) {
         std::unique_ptr<cdr::AudioWriter> w = cdr::createAudioWriter(f);
-        CHECK(w != nullptr && w->extension() == (f == "vorbis" ? "ogg" : f));
+        const std::string extension = f == "vorbis" ? "ogg" : f.rfind("mka", 0) == 0 ? "mka" : f;
+        CHECK(w != nullptr && w->extension() == extension);
     }
     CHECK(cdr::createAudioWriter("no-such-format") == nullptr);
 }
