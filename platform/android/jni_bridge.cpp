@@ -22,6 +22,7 @@
 #include "cdreader/cd_drive.h"
 #include "cdreader/cddb.h"
 #include "cdreader/http.h"
+#include "cdreader/offset_detect.h"
 #include "rip_session.h"
 #include "usbdevfs_endpoints.h"
 
@@ -284,6 +285,20 @@ JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeInquiry
     }
 }
 
+// [vendor, product, revision, display name, key for the saved read offsets (#37)].
+JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeDriveInfo(JNIEnv* env, jclass,
+                                                                                       jlong handle) {
+    try {
+        cdr::RipSession& rip = session(handle)->rip;
+        const cdr::DriveInfo& info = rip.driveInfo();
+        return toJavaArray(env, std::vector<std::string>{info.vendor, info.product, info.revision, rip.driveName(),
+                                                         rip.driveOffsetKey()});
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+        return nullptr;
+    }
+}
+
 JNIEXPORT jboolean JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeIsReady(JNIEnv*, jclass,
                                                                                   jlong handle) {
     return session(handle)->drive.isReady() ? JNI_TRUE : JNI_FALSE;
@@ -382,13 +397,21 @@ JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTrackFi
 // `useC2`: read with C2 error pointers if the drive supports them (#33).
 // `cacheMode`: drive cache defeat for re-reads (#34): 0 auto (timing test,
 // once per disc), 1 FUA, 2 flush, 3 none.
-JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(JNIEnv* env, jclass, jlong handle,
-                                                                               jstring format, jint readOffset,
-                                                                               jint maxRetries, jboolean verify,
-                                                                               jboolean useC2, jint cacheMode) {
+// `offsetSource` (#37): where readOffset came from, for rip.log: 0 manual,
+// 1 saved for this drive, 2 auto-detected; `offsetDetail` the note
+// ("HL-DT-ST BD-RE BP71N (1.03); auto-detected: ..." / "2 of 2 tracks agreed, v2").
+JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(
+    JNIEnv* env, jclass, jlong handle, jstring format, jint readOffset, jint maxRetries, jboolean verify,
+    jboolean useC2, jint cacheMode, jint offsetSource, jstring offsetDetail) {
     try {
         cdr::RipSettings settings;
         if (!fromJava(env, format, settings.format)) return;
+        if (!fromJava(env, offsetDetail, settings.offsetSource.detail)) return;
+        switch (offsetSource) {
+            case 1: settings.offsetSource.kind = cdr::ReadOffsetSource::Kind::Saved; break;
+            case 2: settings.offsetSource.kind = cdr::ReadOffsetSource::Kind::Detected; break;
+            default: settings.offsetSource.kind = cdr::ReadOffsetSource::Kind::Manual; break;
+        }
         settings.options.readOffsetSamples = readOffset;
         settings.options.maxRetries = maxRetries;
         settings.options.verify = verify == JNI_TRUE;
@@ -444,6 +467,63 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTr
                                                   jint(r.result.cacheDefeats)});
     } catch (const cdr::RipCancelled&) {
         throwJava(env, "java/util/concurrent/CancellationException", "rip cancelled");
+    } catch (const JavaExceptionPending&) {
+        // propagate the listener's exception
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+    }
+    return nullptr;
+}
+
+// Detects the read offset with AccurateRip (#37), calling
+// listener.onProgress(step, steps, track, doneSectors, totalSectors).
+// Returns [status (0 detected, 1 disc not in database, 2 lookup failed,
+// 3 no track with database entries, 4 no match, 5 too few tracks agree,
+// 6 tracks disagree, 7 cancelled), offset (the best candidate), agreeing
+// tracks, tracks read, confidence, matched version ("v1" / "v2" / "v1+v2"),
+// single track ("1" / "0"), usable tracks, competing offsets
+// ("+6,-1164"), English summary, agreement ("2 of 2 tracks agreed, v2"),
+// error]. Throws IOException on errors outside the reads.
+JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeDetectOffset(JNIEnv* env, jclass,
+                                                                                          jlong handle,
+                                                                                          jobject httpGet,
+                                                                                          jobject listener) {
+    jmethodID onProgress = nullptr;
+    if (listener != nullptr) {
+        jclass cls = env->GetObjectClass(listener);
+        onProgress = env->GetMethodID(cls, "onProgress", "(IIIII)V");
+        if (onProgress == nullptr) return nullptr;  // NoSuchMethodError pending
+    }
+    try {
+        JavaHttpClient http(env, httpGet);
+        cdr::OffsetDetectOptions options;
+        options.progress = [&](const cdr::OffsetDetectProgress& p) {
+            if (onProgress == nullptr) return;
+            env->CallVoidMethod(listener, onProgress, jint(p.step), jint(p.steps), jint(p.track),
+                                jint(p.doneSectors), jint(p.totalSectors));
+            if (env->ExceptionCheck()) throw JavaExceptionPending{};
+        };
+        const cdr::OffsetDetection& d =
+            session(handle)->rip.detectReadOffset(httpGet != nullptr ? &http : nullptr, options);
+        using Status = cdr::OffsetDetection::Status;
+        int status = 4;
+        switch (d.status) {
+            case Status::Detected: status = 0; break;
+            case Status::NotInDatabase: status = 1; break;
+            case Status::LookupFailed: status = 2; break;
+            case Status::NoUsableTracks: status = 3; break;
+            case Status::NoMatch: status = 4; break;
+            case Status::NotEnough: status = 5; break;
+            case Status::Conflict: status = 6; break;
+            case Status::Cancelled: status = 7; break;
+        }
+        std::string candidates;
+        for (int o : d.candidates) candidates += (candidates.empty() ? "" : ",") + std::to_string(o);
+        return toJavaArray(env, std::vector<std::string>{
+                                    std::to_string(status), std::to_string(d.offset), std::to_string(d.agreeingTracks),
+                                    std::to_string(d.testedTracks()), std::to_string(d.confidence()),
+                                    d.matchedVersion(), d.singleTrack ? "1" : "0", std::to_string(d.usableTracks),
+                                    candidates, d.summary(), d.agreement(), d.error});
     } catch (const JavaExceptionPending&) {
         // propagate the listener's exception
     } catch (const std::exception& e) {

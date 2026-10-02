@@ -35,6 +35,7 @@
 #include "cdreader/metadata.h"
 #include "cdreader/mp4.h"
 #include "cdreader/ogg.h"
+#include "cdreader/offset_detect.h"
 #include "cdreader/ogg_flac_writer.h"
 #include "cdreader/resampler.h"
 #include "cdreader/ripper.h"
@@ -1155,6 +1156,29 @@ TEST(accuraterip_offset_scan_matches_direct_checksums) {
     }
 }
 
+TEST(accuraterip_offset_scan_full_range_at_disc_edges) {
+    // With the default range (3000 samples, more than the 2940 samples
+    // AccurateRip skips) the first and last track must still be read up to
+    // the edges of the disc: the scan starts 3000 samples early (#37).
+    const uint32_t maxOffset = 3000;
+    for (int number : {1, 3}) {
+        FakeDrive fake = makeAudioDisc();
+        cdr::CdDrive drive(fake);
+        cdr::Toc toc = drive.readToc();
+        const cdr::Track& track = *toc.findTrack(number);
+        const cdr::AccurateRipOffsetScan scan = cdr::scanReadOffsets(drive, toc, track, maxOffset, {});
+        const std::vector<uint32_t> sums = scan.checksums();
+        for (int offset : {-3000, -1164, -30, 0, 6, 667, 2939, 3000}) {
+            FakeDrive again = makeAudioDisc();
+            OffsetRip rip = ripWithOffset(again, number, offset);
+            cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, track);
+            ar.update(rip.bytes.data(), rip.bytes.size());
+            CHECK_EQ(sums[size_t(offset + int(maxOffset))], ar.v1());
+            CHECK_EQ(scan.v2Checksum(offset), ar.v2());
+        }
+    }
+}
+
 TEST(accuraterip_offset_detection) {
     FakeDrive fake = makeAudioDisc();
     cdr::CdDrive drive(fake);
@@ -1265,6 +1289,336 @@ TEST(accuraterip_offset_detection_with_v2) {
     pressings.erase(pressings.begin() + 1);
     const std::vector<cdr::AccurateRipOffsetMatch> v2Only = cdr::findAccurateRipOffsets(scan, pressings, 1);
     CHECK(!v2Only.empty() && v2Only[0].offset == 48 && v2Only[0].v1Confidence == 0);
+}
+
+
+// --- Read offset auto-detection (#37) --------------------------------------------
+
+namespace {
+
+// Five audio tracks (200, 150, 150, 200, 200 sectors): three inside the disc.
+FakeDrive makeOffsetDisc() {
+    return FakeDrive({{0, false}, {200, false}, {350, false}, {500, false}, {700, false}}, 900);
+}
+
+// v1 / v2 of a track ripped from a fresh drive of `make` with `offset`.
+template <typename Make>
+cdr::AccurateRipChecksum checksumOf(Make make, int number, int offset) {
+    FakeDrive fake = make();
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    OffsetRip rip = ripWithOffset(fake, number, offset);
+    cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, *toc.findTrack(number));
+    ar.update(rip.bytes.data(), rip.bytes.size());
+    return ar;
+}
+
+// One pressing whose submissions were ripped at offsets[track] (0: no
+// entry; INT32_MIN: a checksum that matches no offset).
+constexpr int kGarbage = -100000;
+template <typename Make>
+cdr::AccurateRipPressing pressingAt(Make make, const std::vector<int>& offsets, const std::vector<uint8_t>& confidence,
+                                    bool v2 = true) {
+    cdr::AccurateRipPressing p;
+    FakeDrive fake = make();
+    cdr::CdDrive drive(fake);
+    p.id = cdr::AccurateRipDiscId::fromToc(drive.readToc());
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        cdr::AccurateRipEntry e;
+        e.confidence = confidence[i];
+        if (offsets[i] == kGarbage) {
+            e.checksum = 0x12345678u + uint32_t(i);
+        } else {
+            const cdr::AccurateRipChecksum ar = checksumOf(make, int(i) + 1, offsets[i]);
+            e.checksum = v2 ? ar.v2() : ar.v1();
+        }
+        p.tracks.push_back(e);
+    }
+    return p;
+}
+
+cdr::OffsetDetectOptions shortTrackOptions() {
+    cdr::OffsetDetectOptions o;
+    o.minTrackSectors = 0;  // the fake tracks are a few seconds long
+    return o;
+}
+
+cdr::OffsetDetection detectOn(FakeDrive& fake, const std::vector<cdr::AccurateRipPressing>& pressings,
+                              const cdr::OffsetDetectOptions& options = shortTrackOptions()) {
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    return cdr::detectReadOffset(drive, toc, pressings, options);
+}
+
+std::string dbarBody(const std::vector<cdr::AccurateRipPressing>& pressings) {
+    std::string out;
+    auto le32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) out.push_back(char(uint8_t(v >> (8 * i))));
+    };
+    for (const cdr::AccurateRipPressing& p : pressings) {
+        out.push_back(char(uint8_t(p.id.audioTracks)));
+        le32(p.id.id1);
+        le32(p.id.id2);
+        le32(p.id.cddb);
+        for (const cdr::AccurateRipEntry& e : p.tracks) {
+            out.push_back(char(e.confidence));
+            le32(e.checksum);
+            le32(e.frame450Checksum);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(offset_detect_chooses_inner_tracks_by_confidence) {
+    FakeDrive fake = makeOffsetDisc();
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    std::vector<cdr::AccurateRipPressing> p = {pressingAt(makeOffsetDisc, {6, 6, 6, 6, 6}, {50, 3, 9, 5, 50})};
+    std::vector<const cdr::Track*> chosen = cdr::chooseOffsetTracks(toc, p, shortTrackOptions());
+    std::vector<int> order;
+    for (const cdr::Track* t : chosen) order.push_back(t->number);
+    // Inner tracks by confidence, then the edges.
+    CHECK((order == std::vector<int>{3, 4, 2, 1, 5}));
+
+    // Too short tracks (here: < 160 sectors) come after the edges of the right length.
+    cdr::OffsetDetectOptions o = shortTrackOptions();
+    o.minTrackSectors = 160;
+    order.clear();
+    for (const cdr::Track* t : cdr::chooseOffsetTracks(toc, p, o)) order.push_back(t->number);
+    CHECK((order == std::vector<int>{4, 1, 5, 3, 2}));
+
+    // Tracks without database entries are never read; -t picks them in order.
+    p[0].tracks[2].confidence = 0;
+    o = shortTrackOptions();
+    o.tracks = {5, 3, 2};
+    order.clear();
+    for (const cdr::Track* t : cdr::chooseOffsetTracks(toc, p, o)) order.push_back(t->number);
+    CHECK((order == std::vector<int>{5, 2}));
+}
+
+TEST(offset_detect_positive_offsets) {
+    for (int offset : {6, 667}) {
+        std::vector<cdr::AccurateRipPressing> p = {
+            pressingAt(makeOffsetDisc, {offset, offset, offset, offset, offset}, {20, 12, 15, 9, 20})};
+        FakeDrive fake = makeOffsetDisc();
+        const cdr::OffsetDetection d = detectOn(fake, p);
+        CHECK(d.status == cdr::OffsetDetection::Status::Detected);
+        CHECK(d.detected());
+        CHECK_EQ(d.offset, offset);
+        // Stops once two tracks agree: tracks 3 and 2 (inside the disc, highest confidence).
+        CHECK_EQ(d.agreeingTracks, 2);
+        CHECK_EQ(d.testedTracks(), 2);
+        CHECK_EQ(d.tracks[0].track, 3);
+        CHECK_EQ(d.tracks[1].track, 2);
+        CHECK_EQ(d.confidence(), 27);
+        CHECK(d.matchedVersion() == "v2");
+        CHECK(!d.singleTrack);
+        CHECK(d.agreement() == "2 of 2 tracks agreed, v2");
+        CHECK(d.summary() == "Read offset " + std::string(offset > 0 ? "+" : "") + std::to_string(offset) +
+                                 " (2 of 2 tracks agreed, v2, confidence 27)");
+        const std::vector<std::string> lines = d.logLines();
+        CHECK_EQ(lines.size(), 4u);
+        CHECK(lines[1].find("  Track 03 (15 submissions): +") == 0);
+    }
+}
+
+TEST(offset_detect_negative_offsets) {
+    for (int offset : {-1164, -472}) {
+        std::vector<cdr::AccurateRipPressing> p = {
+            pressingAt(makeOffsetDisc, {offset, offset, offset, offset, offset}, {5, 5, 5, 5, 5}, false)};
+        FakeDrive fake = makeOffsetDisc();
+        const cdr::OffsetDetection d = detectOn(fake, p);
+        CHECK(d.detected());
+        CHECK_EQ(d.offset, offset);
+        CHECK(d.matchedVersion() == "v1");
+        CHECK_EQ(d.v1Confidence, 10);
+    }
+}
+
+TEST(offset_detect_conflicting_tracks) {
+    // Every inner track matches at another offset.
+    std::vector<cdr::AccurateRipPressing> p = {pressingAt(makeOffsetDisc, {6, 6, 667, -1164, 6}, {9, 9, 8, 7, 9})};
+    FakeDrive fake = makeOffsetDisc();
+    const cdr::OffsetDetection d = detectOn(fake, p);
+    CHECK(d.status == cdr::OffsetDetection::Status::Conflict);
+    CHECK(!d.detected());
+    CHECK_EQ(d.testedTracks(), 2);  // a disagreement cannot be undone by more tracks
+    CHECK((d.candidates == std::vector<int>{667, 6}) || (d.candidates == std::vector<int>{6, 667}));
+    CHECK(d.summary().find("different offsets") != std::string::npos);
+}
+
+TEST(offset_detect_shifted_pressings) {
+    // Track 3 matches two pressings at different offsets, track 2 only the
+    // first: the offset all tracks share wins.
+    std::vector<cdr::AccurateRipPressing> p = {
+        pressingAt(makeOffsetDisc, {6, 6, 6, 6, 6}, {20, 20, 20, 20, 20}),
+        pressingAt(makeOffsetDisc, {kGarbage, kGarbage, 30, kGarbage, kGarbage}, {1, 1, 25, 1, 1})};
+    FakeDrive fake = makeOffsetDisc();
+    cdr::OffsetDetection d = detectOn(fake, p);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 6);
+    CHECK_EQ(d.testedTracks(), 2);
+
+    // Every track matches both: undecidable.
+    p[1] = pressingAt(makeOffsetDisc, {30, 30, 30, 30, 30}, {2, 2, 2, 2, 2});
+    FakeDrive again = makeOffsetDisc();
+    d = detectOn(again, p);
+    CHECK(d.status == cdr::OffsetDetection::Status::Conflict);
+    CHECK_EQ(d.testedTracks(), 3);
+    CHECK_EQ(d.candidates.size(), 2u);
+}
+
+TEST(offset_detect_single_matching_track_is_not_enough) {
+    std::vector<cdr::AccurateRipPressing> p = {
+        pressingAt(makeOffsetDisc, {kGarbage, kGarbage, 667, kGarbage, kGarbage}, {9, 9, 40, 9, 9})};
+    FakeDrive fake = makeOffsetDisc();
+    const cdr::OffsetDetection d = detectOn(fake, p);
+    CHECK(d.status == cdr::OffsetDetection::Status::NotEnough);
+    CHECK_EQ(d.offset, 667);
+    CHECK_EQ(d.agreeingTracks, 1);
+    CHECK_EQ(d.testedTracks(), 3);  // maxTracks
+    CHECK(d.summary().find("only 1 of 3") != std::string::npos);
+
+    // No match at all.
+    p = {pressingAt(makeOffsetDisc, {kGarbage, kGarbage, kGarbage, kGarbage, kGarbage}, {9, 9, 9, 9, 9})};
+    FakeDrive none = makeOffsetDisc();
+    const cdr::OffsetDetection n = detectOn(none, p);
+    CHECK(n.status == cdr::OffsetDetection::Status::NoMatch);
+    CHECK_EQ(n.testedTracks(), 3);
+    // No entries at all.
+    for (cdr::AccurateRipEntry& e : p[0].tracks) e.confidence = 0;
+    FakeDrive empty = makeOffsetDisc();
+    CHECK(detectOn(empty, p).status == cdr::OffsetDetection::Status::NoUsableTracks);
+    CHECK_EQ(empty.readCommands, 0);
+}
+
+TEST(offset_detect_single_track_disc_needs_confidence) {
+    auto single = [] { return FakeDrive({{0, false}}, 300); };
+    std::vector<cdr::AccurateRipPressing> p = {pressingAt(single, {-1164}, {12})};
+    FakeDrive fake = single();
+    cdr::OffsetDetection d = detectOn(fake, p);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, -1164);
+    CHECK(d.singleTrack);
+    CHECK(d.agreement() == "1 of 1 track agreed, v2, only one track in database");
+
+    p[0].tracks[0].confidence = 3;
+    FakeDrive weak = single();
+    d = detectOn(weak, p);
+    CHECK(d.status == cdr::OffsetDetection::Status::NotEnough);
+    CHECK(!d.singleTrack);
+    CHECK(d.summary().find("too few submissions") != std::string::npos);
+}
+
+TEST(offset_detect_lookup_failures) {
+    std::vector<cdr::AccurateRipPressing> p = {pressingAt(makeOffsetDisc, {6, 6, 6, 6, 6}, {9, 9, 9, 9, 9})};
+    CannedHttp http;
+    http.response = httpReply(404, "<html>Not Found</html>");
+    FakeDrive fake = makeOffsetDisc();
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::OffsetDetection d = cdr::detectReadOffset(drive, toc, http, shortTrackOptions());
+    CHECK(d.status == cdr::OffsetDetection::Status::NotInDatabase);
+    CHECK(d.summary().find("not in the AccurateRip database") != std::string::npos);
+    CHECK_EQ(fake.readCommands, 0);
+
+    http.response = cdr::HttpResponse{};
+    http.response.error = "no network";
+    d = cdr::detectReadOffset(drive, toc, http, shortTrackOptions());
+    CHECK(d.status == cdr::OffsetDetection::Status::LookupFailed);
+    CHECK(d.summary() == "AccurateRip lookup failed: no network");
+    CHECK_EQ(fake.readCommands, 0);
+
+    http.response = httpReply(200, dbarBody(p));
+    d = cdr::detectReadOffset(drive, toc, http, shortTrackOptions());
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 6);
+    CHECK_EQ(d.pressings, 1u);
+    CHECK(http.requests.back() == cdr::AccurateRipDiscId::fromToc(toc).url());
+}
+
+TEST(offset_detect_cancel_and_progress) {
+    std::vector<cdr::AccurateRipPressing> p = {pressingAt(makeOffsetDisc, {6, 6, 6, 6, 6}, {9, 9, 9, 9, 9})};
+    FakeDrive fake = makeOffsetDisc();
+    cdr::OffsetDetectOptions o = shortTrackOptions();
+    bool cancel = false;
+    std::vector<cdr::OffsetDetectProgress> seen;
+    o.progress = [&](const cdr::OffsetDetectProgress& progress) {
+        seen.push_back(progress);
+        cancel = true;  // as if the user pressed the button now
+    };
+    o.cancelled = [&] { return cancel; };
+    cdr::OffsetDetection d = detectOn(fake, p, o);
+    CHECK(d.status == cdr::OffsetDetection::Status::Cancelled);
+    CHECK_EQ(seen.size(), 1u);
+    CHECK(!seen.empty() && seen[0].step == 1 && seen[0].steps == 3 && seen[0].track == 2);
+    CHECK(d.summary() == "Offset detection cancelled.");
+
+    // Progress of a full run, and a throwing callback propagates.
+    o.cancelled = nullptr;
+    seen.clear();
+    FakeDrive again = makeOffsetDisc();
+    d = detectOn(again, p, o);
+    CHECK(d.detected());
+    CHECK(!seen.empty() && seen.back().step == 2 && seen.back().doneSectors == seen.back().totalSectors);
+    o.progress = [](const cdr::OffsetDetectProgress&) { throw std::logic_error("stop"); };
+    FakeDrive third = makeOffsetDisc();
+    bool thrown = false;
+    try {
+        detectOn(third, p, o);
+    } catch (const std::logic_error&) {
+        thrown = true;
+    }
+    CHECK(thrown);
+}
+
+TEST(offset_source_log_lines) {
+    cdr::ReadOffsetSource s;
+    CHECK(cdr::readOffsetLogLine(0, s) == "Read offset correction: 0 samples (manual)");
+    s.kind = cdr::ReadOffsetSource::Kind::Saved;
+    s.detail = "HL-DT-ST BD-RE BP71N (1.03); auto-detected: 2 of 2 tracks agreed, v2";
+    CHECK(cdr::readOffsetLogLine(6, s) ==
+          "Read offset correction: +6 samples (saved for drive HL-DT-ST BD-RE BP71N (1.03); auto-detected: 2 of 2 "
+          "tracks agreed, v2)");
+    s.kind = cdr::ReadOffsetSource::Kind::Detected;
+    s.detail = "3 of 3 tracks agreed, v1+v2";
+    CHECK(cdr::readOffsetLogLine(-1164, s) ==
+          "Read offset correction: -1164 samples (auto-detected: 3 of 3 tracks agreed, v1+v2)");
+}
+
+TEST(drive_offset_store_round_trip) {
+    const std::string key = cdr::driveOffsetKey({"HL-DT-ST", "BD-RE BP71N", "1.03"});
+    CHECK(key == "HL-DT-ST|BD-RE BP71N|1.03");
+    CHECK(cdr::driveOffsetKey({"A|B", "C\tD", "E\nF"}) == "A B|C D|E F");
+
+    cdr::DriveOffsetStore store;
+    store.set(key, {6, "auto-detected: 2 of 2 tracks agreed, v2"});
+    store.set("PLEXTOR|DVDR   PX-716A|1.11", {30, ""});
+    store.set("X|Y|Z", {-1164, "note\twith tab"});
+    const std::string text = store.serialize();
+    const cdr::DriveOffsetStore back = cdr::DriveOffsetStore::parse(text);
+    CHECK_EQ(back.entries().size(), 3u);
+    const cdr::SavedDriveOffset* s = back.find(key);
+    CHECK(s && s->offset == 6 && s->note == "auto-detected: 2 of 2 tracks agreed, v2");
+    s = back.find("X|Y|Z");
+    CHECK(s && s->offset == -1164 && s->note == "note with tab");
+    CHECK(back.find("PLEXTOR|DVDR   PX-716A|1.11") && back.find("PLEXTOR|DVDR   PX-716A|1.11")->offset == 30);
+    CHECK(back.find("nope") == nullptr);
+    CHECK(back.serialize() == text);
+
+    // Damaged lines are skipped, CRLF and comments are fine, the last entry wins.
+    const cdr::DriveOffsetStore parsed = cdr::DriveOffsetStore::parse(
+        "# comment\r\n6\tA|B|C\tok\r\nabc\tD|E|F\tx\n\n99999999\tG|H|I\n12\n+48\tJ|K|L\n7\tA|B|C\n");
+    CHECK_EQ(parsed.entries().size(), 2u);
+    CHECK(parsed.find("A|B|C") && parsed.find("A|B|C")->offset == 7 && parsed.find("A|B|C")->note.empty());
+    CHECK(parsed.find("J|K|L") && parsed.find("J|K|L")->offset == 48);
+
+    cdr::DriveOffsetStore edit = back;
+    CHECK(edit.erase(key));
+    CHECK(!edit.erase(key));
+    CHECK_EQ(edit.entries().size(), 2u);
 }
 
 

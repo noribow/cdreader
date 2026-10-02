@@ -326,15 +326,17 @@ uint32_t AccurateRipOffsetScan::v2Checksum(int offset) const {
 }
 
 // The track is read starting maxOffset samples early and extended by
-// 2 * maxOffset samples, but never past the end of its audio session, which
-// most drives cannot read (the scan treats the missing tail as silence).
+// 2 * maxOffset samples. The ripper does not read past the end of the audio
+// session (most drives cannot), it fills that part with silence, as a rip
+// with such an offset does. (The span must be extended even for the last
+// track: it starts maxOffset samples early, so without the extension the
+// last maxOffset readable samples would be missing, #37.)
 AccurateRipOffsetScan scanReadOffsets(CdDrive& drive, const Toc& toc, const Track& track, uint32_t maxOffset,
                                       RipOptions options, const Ripper::Progress& progress) {
     AccurateRipOffsetScan scan = AccurateRipOffsetScan::forTrack(toc, track, maxOffset);
-    const uint32_t readableEnd = toc.audioRange(track).end;
     const uint32_t wanted = (2 * maxOffset + kSamplesPerSector - 1) / kSamplesPerSector;
     Track span = track;
-    span.lengthSectors += std::min(wanted, readableEnd - track.endLba());
+    span.lengthSectors += wanted;
     options.readOffsetSamples = -int(maxOffset);
     Ripper ripper(drive, toc, options);
     ripper.ripTrack(span, [&](const uint8_t* pcm, size_t bytes) { scan.update(pcm, bytes); }, progress);

@@ -49,6 +49,7 @@ add_library(cdreader_core STATIC
   core/src/metadata.cpp
   core/src/mka_writer.cpp
   core/src/mp4.cpp
+  core/src/offset_detect.cpp
   core/src/ogg.cpp
   core/src/ogg_flac_writer.cpp
   core/src/resampler.cpp

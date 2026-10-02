@@ -24,6 +24,7 @@
 #include "cdreader/gaps.h"
 #include "cdreader/http.h"
 #include "cdreader/metadata.h"
+#include "cdreader/offset_detect.h"
 #include "cdreader/ripper.h"
 #include "cdreader/subchannel.h"
 #include "cdreader/toc.h"
@@ -58,6 +59,8 @@ struct RipSettings {
     // Drive cache defeat for re-reads (#34); beginRip() decides the method
     // (Auto: a timing test, once per disc) and sets options.cacheDefeat.
     CacheSetting cache = CacheSetting::Auto;
+    // Where options.readOffsetSamples came from (#37), for rip.log.
+    ReadOffsetSource offsetSource;
 };
 
 struct RippedTrack {
@@ -96,8 +99,11 @@ public:
     // the fake drive's simulated time. `clock` must outlive the session.
     void setClock(Clock& clock) { clock_ = &clock; }
 
-    // INQUIRY display name (cached after the first call).
+    // INQUIRY strings / display name (cached after the first call).
+    const DriveInfo& driveInfo();
     const std::string& driveName();
+    // Key of the drive model for the saved read offsets (#37).
+    std::string driveOffsetKey() { return cdr::driveOffsetKey(driveInfo()); }
 
     // Reads the TOC (again) and forgets the metadata, the cache detection and
     // the rip results of the previous disc.
@@ -161,7 +167,15 @@ public:
     const RippedTrack& ripTrack(int number, const std::filesystem::path& path, const Ripper::Progress& progress = {});
     const std::vector<RippedTrack>& rippedTracks() const { return ripped_; }
 
-    // Thread-safe: makes a running ripTrack() stop at the next block.
+    // Read offset auto-detection (#37): looks the disc up in AccurateRip
+    // (`http` null: status LookupFailed) and reads a few tracks. Clears a
+    // pending cancel first; cancel() makes it return status Cancelled.
+    // Never throws for network or read problems; exceptions thrown by
+    // options.progress propagate. The result stays until the next readToc().
+    const OffsetDetection& detectReadOffset(HttpClient* http, OffsetDetectOptions options = {});
+    const std::optional<OffsetDetection>& offsetDetection() const { return detection_; }
+
+    // Thread-safe: makes a running ripTrack() / detectReadOffset() stop at the next block.
     void cancel() { cancelled_ = true; }
     bool cancelled() const { return cancelled_; }
 
@@ -179,6 +193,7 @@ public:
 
 private:
     CdDrive& drive_;
+    std::optional<DriveInfo> driveInfo_;
     std::optional<std::string> driveName_;
     std::optional<Toc> toc_;
     CddbSettings cddbSettings_;
@@ -197,6 +212,7 @@ private:
     std::vector<RippedTrack> ripped_;
     AccurateRipReport accurateRip_;
     bool accurateRipChecked_ = false;
+    std::optional<OffsetDetection> detection_;
     std::atomic<bool> cancelled_{false};
 };
 
