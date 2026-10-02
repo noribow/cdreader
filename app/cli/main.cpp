@@ -36,6 +36,12 @@ struct UsageError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+std::string formatList() {
+    std::string list;
+    for (const std::string& f : cdr::audioFormats()) list += (list.empty() ? "" : ", ") + f;
+    return list;
+}
+
 void printUsage() {
     std::printf(
         "cdreader %s - CD audio ripper\n"
@@ -43,12 +49,13 @@ void printUsage() {
         "Usage:\n"
         "  cdreader drives                       List optical drives\n"
         "  cdreader toc <drive> [cddb options]   Show the table of contents and disc info\n"
-        "  cdreader rip <drive> [options]        Rip audio tracks to WAV\n"
+        "  cdreader rip <drive> [options]        Rip audio tracks (see --format)\n"
         "  cdreader offset <drive> [options]     Detect the drive read offset (AccurateRip)\n"
         "\n"
         "Rip options:\n"
         "  -o, --output <dir>    Output directory (default: \"Artist - Album\" from CDDB,\n"
         "                        otherwise cd_<CDDB id>)\n"
+        "  -f, --format <name>   Output format: %s (default: wav)\n"
         "  -t, --tracks <list>   Tracks to rip, e.g. 1,3-5 (default: all audio tracks)\n"
         "  -r, --retries <n>     Retries per failing read (default: 5)\n"
         "      --offset <n>      Drive read offset correction in samples, e.g. 6 or -472\n"
@@ -69,7 +76,7 @@ void printUsage() {
         "                        (default: cdreader@localhost)\n"
         "\n"
         "<drive> is a drive letter such as D or D:\n",
-        kVersion, cdr::kDefaultCddbServer);
+        kVersion, formatList().c_str(), cdr::kDefaultCddbServer);
 }
 
 std::vector<std::string> utf8Arguments() {
@@ -360,6 +367,7 @@ int cmdRip(const std::vector<std::string>& args) {
     if (args.size() < 2) throw UsageError("rip needs a drive argument");
     const char letter = parseDriveLetter(args[1]);
     std::string outputDir;
+    std::string format = "wav";
     std::set<int> wanted;
     cdr::RipOptions options;
     CddbSettings cddb;
@@ -372,6 +380,7 @@ int cmdRip(const std::vector<std::string>& args) {
             return args[++i];
         };
         if (a == "-o" || a == "--output") outputDir = value();
+        else if (a == "-f" || a == "--format") format = value();
         else if (a == "-t" || a == "--tracks") wanted = parseTrackList(value());
         else if (a == "-r" || a == "--retries") options.maxRetries = parseInt(value(), "retry count");
         else if (a == "--offset") options.readOffsetSamples = parseSignedInt(value(), "read offset");
@@ -380,6 +389,9 @@ int cmdRip(const std::vector<std::string>& args) {
         else if (a == "--no-accuraterip") accurateRip = false;
         else throw UsageError("unknown option '" + a + "'");
     }
+
+    if (!cdr::createAudioWriter(format))
+        throw UsageError("unknown format '" + format + "' (available: " + formatList() + ")");
 
     OpenedDrive d = openDrive(letter);
     const cdr::Toc toc = readTocOrExplain(*d.drive);
@@ -415,6 +427,7 @@ int cmdRip(const std::vector<std::string>& args) {
     fs::create_directories(dir);
 
     std::printf("Read offset correction: %+d samples\n", options.readOffsetSamples);
+    std::printf("Format: %s\n", format.c_str());
     std::printf("Output: %s\n\n", dir.u8string().c_str());
 
     std::ofstream log(dir / "rip.log");
@@ -423,7 +436,8 @@ int cmdRip(const std::vector<std::string>& args) {
         << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
         << "Read offset correction: " << (options.readOffsetSamples > 0 ? "+" : "") << options.readOffsetSamples
-        << " samples\n\n";
+        << " samples\n"
+        << "Format: " << format << "\n\n";
     {
         char line[256];
         log << "CDDB disc id: " << hex32(toc.cddbId()) << "\n";
@@ -452,7 +466,6 @@ int cmdRip(const std::vector<std::string>& args) {
             << "\nGenre: " << album.genre << "\n\n";
     }
 
-    const std::string format = "wav";
 
     cdr::Ripper ripper(*d.drive, toc, options);
     int problems = 0;

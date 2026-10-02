@@ -18,13 +18,18 @@
 #include "cdreader/cddb.h"
 #include "cdreader/crc32.h"
 #include "cdreader/file_naming.h"
+#include "cdreader/flac_encoder.h"
+#include "cdreader/flac_writer.h"
 #include "cdreader/http.h"
+#include "cdreader/md5.h"
 #include "cdreader/metadata.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
 #include "cdreader/toc.h"
 #include "cdreader/wav_writer.h"
 #include "fake_drive.h"
+#include "flac_decoder.h"
+#include "test_signals.h"
 
 namespace {
 
@@ -1231,6 +1236,278 @@ TEST(accuraterip_offset_detection_with_v2) {
     pressings.erase(pressings.begin() + 1);
     const std::vector<cdr::AccurateRipOffsetMatch> v2Only = cdr::findAccurateRipOffsets(scan, pressings, 1);
     CHECK(!v2Only.empty() && v2Only[0].offset == 48 && v2Only[0].v1Confidence == 0);
+}
+
+
+// --- FLAC (#7) ------------------------------------------------------------------
+
+namespace {
+
+std::string md5Hex(const std::string& text) {
+    cdr::Md5 md5;
+    md5.update(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+    const std::array<uint8_t, 16> d = md5.finish();
+    std::string hex;
+    char buf[3];
+    for (uint8_t b : d) {
+        std::snprintf(buf, sizeof buf, "%02x", b);
+        hex += buf;
+    }
+    return hex;
+}
+
+std::string bitString(const cdr::flac::BitWriter& w) {
+    std::string s;
+    for (uint8_t b : w.bytes())
+        for (int i = 7; i >= 0; --i) s += char('0' + ((b >> i) & 1));
+    return s;
+}
+
+std::vector<uint8_t> readAll(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// Encodes `pcm` with FlacWriter (in chunks of `chunk` bytes) and returns the file contents.
+std::vector<uint8_t> encodeFlac(const std::vector<uint8_t>& pcm, const cdr::TrackMetadata& meta = {},
+                                size_t chunk = cdr::kSectorBytes) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_test.flac";
+    {
+        cdr::FlacWriter flac;
+        flac.open(path, meta);
+        for (size_t pos = 0; pos < pcm.size(); pos += chunk)
+            flac.write(pcm.data() + pos, std::min(chunk, pcm.size() - pos));
+        flac.close();
+        CHECK_EQ(flac.totalSamples(), uint64_t(pcm.size() / 4));
+    }
+    std::vector<uint8_t> file = readAll(path);
+    std::filesystem::remove(path);
+    return file;
+}
+
+std::array<uint8_t, 16> md5Of(const std::vector<uint8_t>& data) {
+    cdr::Md5 md5;
+    md5.update(data.data(), data.size());
+    return md5.finish();
+}
+
+}  // namespace
+
+TEST(md5_known_vectors) {
+    CHECK(md5Hex("") == "d41d8cd98f00b204e9800998ecf8427e");
+    CHECK(md5Hex("abc") == "900150983cd24fb0d6963f7d28e17f72");
+    CHECK(md5Hex("message digest") == "f96b697d7cb7938d525a2f31aaf161d0");
+    CHECK(md5Hex("The quick brown fox jumps over the lazy dog") == "9e107d9d372bb6826bd81d3542a419d6");
+    CHECK(md5Hex("12345678901234567890123456789012345678901234567890123456789012345678901234567890") ==
+          "57edf4a22be3c955ac49da2e2107b67a");
+    // Incremental updates across the 64-byte block boundary give the same digest.
+    const std::string text(200, 'x');
+    for (size_t split : {size_t(1), size_t(55), size_t(56), size_t(63), size_t(64), size_t(65), size_t(130)}) {
+        cdr::Md5 a;
+        a.update(reinterpret_cast<const uint8_t*>(text.data()), split);
+        a.update(reinterpret_cast<const uint8_t*>(text.data()) + split, text.size() - split);
+        CHECK(a.finish() == md5Of(std::vector<uint8_t>(text.begin(), text.end())));
+    }
+}
+
+TEST(flac_crc_known_vectors) {
+    const uint8_t text[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    CHECK_EQ(cdr::flac::crc8(text, sizeof text), 0xF4);     // CRC-8 (poly 0x07)
+    CHECK_EQ(cdr::flac::crc16(text, sizeof text), 0xFEE8);  // CRC-16/BUYPASS (poly 0x8005)
+    CHECK_EQ(cdr::flac::crc8(text, 0), 0);
+}
+
+TEST(flac_bit_writer) {
+    cdr::flac::BitWriter w;
+    w.writeBits(0x5, 3);         // 101
+    w.writeSigned(-2, 4);        // 1110
+    w.writeUnary(3);             // 0001
+    w.writeBits(0xFFFFFFFFu, 32);
+    w.writeBits(0x1FF, 2);       // only the low bits are used: 11
+    CHECK_EQ(w.bitCount(), 45u);
+    w.alignToByte();
+    CHECK(bitString(w) == "101111000011111111111111111111111111111111111000");
+
+    cdr::flac::BitWriter a, b;
+    a.writeBits(1, 3);  // 001
+    b.writeBits(0x2D, 7);  // 0101101
+    b.writeUnary(40);
+    a.append(b);
+    CHECK_EQ(a.bitCount(), 3u + 7u + 41u);
+    a.alignToByte();
+    CHECK(bitString(a) == "0010101101" + std::string(40, '0') + "1" + "00000");
+}
+
+TEST(flac_utf8_frame_numbers) {
+    auto utf8 = [](uint32_t v) {
+        cdr::flac::BitWriter w;
+        w.writeUtf8(v);
+        return w.bytes();
+    };
+    CHECK(utf8(0) == std::vector<uint8_t>({0x00}));
+    CHECK(utf8(0x7F) == std::vector<uint8_t>({0x7F}));
+    CHECK(utf8(0x80) == std::vector<uint8_t>({0xC2, 0x80}));
+    CHECK(utf8(0x7FF) == std::vector<uint8_t>({0xDF, 0xBF}));
+    CHECK(utf8(0x800) == std::vector<uint8_t>({0xE0, 0xA0, 0x80}));
+    CHECK(utf8(0xFFFF) == std::vector<uint8_t>({0xEF, 0xBF, 0xBF}));
+    CHECK(utf8(0x10000) == std::vector<uint8_t>({0xF0, 0x90, 0x80, 0x80}));
+    CHECK(utf8(0x7FFFFFFF) == std::vector<uint8_t>({0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF}));
+}
+
+TEST(flac_rice_coding) {
+    CHECK_EQ(cdr::flac::zigzag(0), 0u);
+    CHECK_EQ(cdr::flac::zigzag(-1), 1u);
+    CHECK_EQ(cdr::flac::zigzag(1), 2u);
+    CHECK_EQ(cdr::flac::zigzag(-3), 5u);
+    CHECK_EQ(cdr::flac::zigzag(INT32_MIN), 0xFFFFFFFFu);
+    cdr::flac::BitWriter w;
+    w.writeRice(-3, 2);  // u = 5: quotient 1 -> "01", remainder "01"
+    w.writeRice(0, 0);   // "1"
+    w.writeRice(5, 1);   // u = 10: quotient 5 -> "000001", remainder "0"
+    w.writeRice(-1, 3);  // u = 1: "1" + "001"
+    w.alignToByte();
+    CHECK(bitString(w) == "0101" "1" "0000010" "1001");  // 16 bits, already aligned
+}
+
+TEST(flac_vorbis_comment) {
+    cdr::TrackMetadata m;
+    m.trackNumber = 3;
+    m.trackTotal = 12;
+    m.title = "曲名";
+    m.artist = "Artist";
+    m.discId = "0A0B0C03";
+    const std::vector<uint8_t> v = cdr::flac::vorbisComment(m, "vendor");
+    const std::vector<uint8_t> expected = [] {
+        std::vector<uint8_t> e;
+        auto str = [&](const std::string& s) {
+            for (int i = 0; i < 4; ++i) e.push_back(uint8_t(s.size() >> (8 * i)));
+            e.insert(e.end(), s.begin(), s.end());
+        };
+        str("vendor");
+        e.insert(e.end(), {5, 0, 0, 0});
+        for (const char* f : {"TITLE=曲名", "ARTIST=Artist", "TRACKNUMBER=3", "TRACKTOTAL=12", "CDDB=0A0B0C03"}) str(f);
+        return e;
+    }();
+    CHECK(v == expected);
+}
+
+TEST(flac_writer_produces_valid_stream) {
+    const testsig::Signal music = testsig::music(4096 * 25 + 1000);
+    cdr::TrackMetadata meta;
+    meta.title = "Song";
+    meta.artist = "Artist";
+    meta.album = "Album";
+    meta.albumArtist = "Album Artist";
+    meta.genre = "Rock";
+    meta.year = "1999";
+    meta.trackNumber = 2;
+    meta.trackTotal = 9;
+    meta.discId = "12345678";
+    const std::vector<uint8_t> file = encodeFlac(music.pcm, meta, 1000);  // chunks split samples
+    const DecodedFlac d = decodeFlac(file);
+
+    CHECK_EQ(d.minBlockSize, 4096u);
+    CHECK_EQ(d.maxBlockSize, 4096u);
+    CHECK_EQ(d.sampleRate, 44100u);
+    CHECK_EQ(d.channels, 2u);
+    CHECK_EQ(d.bitsPerSample, 16u);
+    CHECK_EQ(d.totalSamples, uint64_t(4096 * 25 + 1000));
+    CHECK(d.md5 == md5Of(music.pcm));
+    CHECK(d.pcm == music.pcm);
+    CHECK_EQ(d.frames, 26u);
+    // Frame size bounds match the actual frames.
+    std::vector<uint64_t> ends(d.frameOffsets.begin() + 1, d.frameOffsets.end());
+    ends.push_back(file.size() - d.firstFrame);
+    uint32_t minFrame = UINT32_MAX, maxFrame = 0;
+    for (size_t i = 0; i < ends.size(); ++i) {
+        const uint32_t size = uint32_t(ends[i] - d.frameOffsets[i]);
+        maxFrame = std::max(maxFrame, size);
+        if (i + 1 < ends.size()) minFrame = std::min(minFrame, size);  // the short last frame is smaller
+    }
+    CHECK_EQ(d.maxFrameSize, maxFrame);
+    CHECK(d.minFrameSize <= minFrame);
+
+    // STREAMINFO, VORBIS_COMMENT, SEEKTABLE, PADDING (last).
+    CHECK(d.blockTypes == std::vector<int>({0, 4, 3, 1}));
+    CHECK(d.vendor.rfind("cdreader ", 0) == 0);
+    CHECK(d.comments == std::vector<std::string>({"TITLE=Song", "ARTIST=Artist", "ALBUM=Album",
+                                                  "ALBUMARTIST=Album Artist", "TRACKNUMBER=2", "TRACKTOTAL=9",
+                                                  "DATE=1999", "GENRE=Rock", "CDDB=12345678"}));
+    // 2.4 s of audio: a seek point at 0 s only (one every 10 s), on the first frame.
+    CHECK_EQ(d.seekPoints.size(), 1u);
+    CHECK(d.seekPoints[0].sample == 0 && d.seekPoints[0].offset == 0 && d.seekPoints[0].samples == 4096);
+
+    // First frame header: sync, block size 4096 (code 12), 44.1 kHz (code 9), 16 bit, frame 0.
+    const uint8_t* h = file.data() + d.firstFrame;
+    CHECK(h[0] == 0xFF && h[1] == 0xF8 && h[2] == 0xC9 && (h[3] & 0x0F) == 0x08 && h[4] == 0x00);
+    CHECK_EQ(h[5], cdr::flac::crc8(h, 5));
+    // Last frame: 1000 samples, coded as a 16-bit "block size - 1" field.
+    const uint8_t* last = h + d.frameOffsets.back();
+    CHECK(last[0] == 0xFF && last[1] == 0xF8 && last[2] == 0x79 && last[4] == 25 && last[5] == 0x03 && last[6] == 0xE7);
+}
+
+TEST(flac_round_trip_synthetic_signals) {
+    for (const testsig::Signal& s : testsig::all()) {
+        const DecodedFlac d = decodeFlac(encodeFlac(s.pcm));
+        const bool ok = d.pcm == s.pcm && d.md5 == md5Of(s.pcm) && d.totalSamples == s.pcm.size() / 4;
+        if (!ok) std::fprintf(stderr, "  round trip failed: %s\n", s.name.c_str());
+        CHECK(ok);
+    }
+}
+
+TEST(flac_long_track_seek_table) {
+    // 25 s of audio: seek points at 0, 10 and 20 s, each on the frame containing that sample.
+    const testsig::Signal s = testsig::make("ramp", 44100 * 25, [](size_t i, int16_t& l, int16_t& r) {
+        l = int16_t(i % 2000);
+        r = int16_t(-int(i % 3001));
+    });
+    const DecodedFlac d = decodeFlac(encodeFlac(s.pcm, {}, 65536));
+    CHECK(d.pcm == s.pcm);
+    CHECK_EQ(d.seekPoints.size(), 3u);
+    for (size_t i = 0; i < d.seekPoints.size() && i < 3; ++i) {
+        const uint64_t frame = 441000 * i / 4096;
+        CHECK_EQ(d.seekPoints[i].sample, frame * 4096);
+        CHECK_EQ(d.seekPoints[i].offset, d.frameOffsets[size_t(frame)]);
+        CHECK_EQ(d.seekPoints[i].samples, 4096u);
+    }
+}
+
+TEST(flac_encoder_picks_cheap_representations) {
+    cdr::flac::FrameEncoder encoder;
+    std::vector<int32_t> zeros(4096, 0), ramp(4096), noise(4096);
+    testsig::Noise n(9);
+    for (size_t i = 0; i < 4096; ++i) {
+        ramp[i] = int32_t(i) - 2048;
+        noise[i] = int32_t(n.next() * 30000);
+    }
+    // Silence: two CONSTANT subframes -> 6 header bytes + 2 * 3 bytes + CRC-16.
+    std::vector<uint8_t> frame = encoder.encode(zeros.data(), zeros.data(), 4096, 0);
+    CHECK_EQ(frame.size(), 14u);
+    // A linear ramp is predicted exactly by FIXED order 2 (residual all zero).
+    frame = encoder.encode(ramp.data(), ramp.data(), 4096, 1);
+    CHECK(frame.size() < 40);
+    CHECK_EQ(frame[3] >> 4, 8);  // identical channels -> left/side (side is constant 0)
+    // Noise cannot be compressed: VERBATIM bounds the size.
+    frame = encoder.encode(noise.data(), zeros.data(), 4096, 2);
+    CHECK(frame.size() <= 4096u * 2 + 20);
+}
+
+TEST(flac_writer_rejects_partial_sample) {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "cdreader_partial.flac";
+    bool threw = false;
+    {
+        cdr::FlacWriter flac;
+        flac.open(path, {});
+        const uint8_t pcm[6] = {1, 2, 3, 4, 5, 6};
+        flac.write(pcm, sizeof pcm);
+        try {
+            flac.close();
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+    }
+    std::filesystem::remove(path);
+    CHECK(threw);
 }
 
 int main() {

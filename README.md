@@ -1,6 +1,6 @@
 # cdreader
 
-音楽 CD (CD-DA) をリッピングして WAV ファイルに保存するツールです。
+音楽 CD (CD-DA) をリッピングして WAV / FLAC ファイルに保存するツールです。
 対象環境は **Windows** と **Android** で、まずは Windows 版 (コマンドライン) から実装しています。
 
 > **このプロジェクトは [Claude Code](https://claude.com/claude-code) (Anthropic の AI コーディングエージェント) を利用して開発しています。**
@@ -9,7 +9,8 @@
 ## 特徴
 
 - SCSI/MMC コマンド (`READ TOC`, `READ CD`) でドライブから直接オーディオセクタを読み取り
-- 44.1 kHz / 16 bit / ステレオの WAV で保存 (トラックごとに `NN - 曲名.wav`、曲名が不明なら `TrackNN.wav`)
+- 44.1 kHz / 16 bit / ステレオの WAV、または可逆圧縮の FLAC で保存 (トラックごとに `NN - 曲名.wav` / `NN - 曲名.flac`、曲名が不明なら `TrackNN.wav`)
+- FLAC エンコーダは外部ライブラリを使わない自前実装 (Android でもそのままビルド可能)。MD5 署名・タグ・シークテーブル付き
 - 読み取りエラー時のリトライ、失敗したブロックはセクタ単位で再読込し、読めないセクタだけを無音で補完
 - `--verify` で 2 回読みして一致を確認 (セキュアモード)
 - ドライブの読み取りオフセット補正 (`--offset`、EAC / AccurateRip と同じ値)
@@ -29,6 +30,7 @@ cdreader rip D:                     全オーディオトラックを "アーテ
 cdreader rip D: -t 1,3-5 -o out     トラック 1,3,4,5 を out\ に保存
 cdreader rip D: --verify -r 10      2 回読み比較、リトライ 10 回
 cdreader rip D: --offset 6          読み取りオフセット +6 サンプルで補正
+cdreader rip D: -f flac             FLAC で保存
 cdreader rip D: --cddb-match 2      CDDB の候補が複数あるとき 2 番目を使う
 cdreader rip D: --no-cddb           CDDB に問い合わせない (cd_<CDDB ID>\TrackNN.wav)
 cdreader rip D: --no-accuraterip    AccurateRip の照合 (ネットワークアクセス) をしない
@@ -38,6 +40,7 @@ cdreader offset D:                  読み取りオフセットを AccurateRip �
 | オプション | 説明 |
 | --- | --- |
 | `-o, --output <dir>` | 出力先ディレクトリ (既定: `アーティスト - アルバム`。CDDB で見つからなければ `cd_<CDDB ID>`) |
+| `-f, --format <name>` | 出力フォーマット: `wav` / `flac` (既定: `wav`) |
 | `-t, --tracks <list>` | リッピングするトラック (例: `1,3-5`)。既定は全オーディオトラック |
 | `-r, --retries <n>` | 読み取り失敗時のリトライ回数 (既定: 5) |
 | `--verify` | 全ブロックを 2 回読みして比較 (低速) |
@@ -86,6 +89,19 @@ CD ドライブは機種ごとに、要求した位置から一定サンプル�
 - 1 サンプル = 4 バイト (16 bit ステレオ)。`+N` の場合、各トラックはドライブが返すデータの N サンプル後ろから切り出されます。
 - 補正によってディスクの先頭より前・リードアウトより後 (CD-Extra ではデータセッションとの間) にはみ出した部分は、
   多くのドライブで読めないため無音で埋めます。その数は `rip.log` に記録されます。
+
+### FLAC 出力
+
+`--format flac` を指定すると、各トラックを FLAC (可逆圧縮、[RFC 9639](https://www.rfc-editor.org/rfc/rfc9639)) で保存します。
+デコードすると元の PCM とビット単位で一致します。圧縮率は公式 `flac` コマンドの既定 (`-5`) とほぼ同等です。
+
+- エンコーダは `core/` 内の自前実装で、外部ライブラリに依存しません。
+  ブロックサイズ 4096 サンプル、サブフレームは CONSTANT / VERBATIM / FIXED (0〜4 次) / LPC (最大 8 次) から最小のものを選択、
+  ステレオ相関 (L/R・L/S・S/R・M/S) も最小のものを選択、Rice 符号のパーティション分割とパラメータ探索 (エスケープ符号を含む)、wasted bits に対応。
+- メタデータ: `STREAMINFO` (PCM の MD5 署名を含む)、`VORBIS_COMMENT`、`SEEKTABLE` (10 秒ごと)、`PADDING` (タグの後からの書き換え用)。
+- タグ (`VORBIS_COMMENT`): `TITLE`, `ARTIST`, `ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`, `TRACKTOTAL`, `DATE`, `GENRE`, `CDDB` (ディスク ID)。
+  曲名・アーティストなどは CDDB ([#6](https://github.com/noribow/cdreader/issues/6)) で取得できた場合に入ります。
+- `flac -t ファイル名` で CRC と MD5 を検証できます。
 
 ### AccurateRip による照合
 
@@ -175,6 +191,9 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
 テストは仮想ドライブ (`tests/fake_drive.*`) を使い、TOC 解析・リトライ・不良セクタ処理・2 回読み比較・オフセット補正・WAV 出力を検証します。
+FLAC は MD5 / CRC / ビット書き込み / Rice 符号の単体テストと、テスト用の簡易デコーダ (`tests/flac_decoder.*`) による往復テストに加え、
+公式 `flac` コマンドがインストールされていれば (`apt-get install flac` など)、さまざまな合成信号を `flac -t` で検証・`flac -d` でデコードして
+元の PCM と一致することを確認するテスト (`flac_roundtrip`) も実行されます (無い場合はスキップ)。
 CDDB は偽の `HttpClient` を使い (ネットワークには接続しません)、問い合わせコマンドの生成・応答コード・xmcd エントリの解析・ファイル名の変換を検証します。
 AccurateRip はネットワークに接続せず (偽の `HttpClient` を使用)、実在のディスクの ID・データベース応答と、独立した参照実装で求めたチェックサムで検証します。
 
@@ -193,6 +212,7 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   metadata  アルバム / トラック情報 (タグ付け・ファイル名用)
   http      オンライン照会用 HTTP インターフェース (実装はプラットフォーム側)
   wav_writer, crc32
+  flac_writer, flac_encoder, md5  FLAC エンコーダ (外部ライブラリなし)
 platform/windows/   SPTI による ScsiTransport 実装、ドライブ列挙、WinHTTP クライアント
 app/cli/            Windows 用コマンドラインツール
 tests/              仮想ドライブを使ったユニットテスト
@@ -209,7 +229,9 @@ Android 版では USB ホスト API 経由の USB Mass Storage (Bulk-Only Transp
 - [ ] リードイン/リードアウトのオーバーリード
 - [x] CDDB 対応 (ディスク情報の取得) — [#6](https://github.com/noribow/cdreader/issues/6)
 - [ ] MusicBrainz 対応、CD-TEXT の読み取り (CDDB に無いディスクの情報取得)
-- [ ] オーディオコーデック対応 (FLAC など) — [#7](https://github.com/noribow/cdreader/issues/7)
+- [x] オーディオコーデック対応: FLAC — [#7](https://github.com/noribow/cdreader/issues/7)
+- [ ] 非可逆コーデック (MP3 / AAC / Opus / Vorbis) — [#13](https://github.com/noribow/cdreader/issues/13)
+- [ ] FLAC の圧縮レベル指定 (`--compression` など。現状は `flac -5` 相当の固定設定)
 - [ ] コンテナフォーマット対応・タグ付け — [#8](https://github.com/noribow/cdreader/issues/8)
 - [ ] セキュアモードでのドライブキャッシュ回避 (現状の `--verify` はキャッシュされたデータを再読込する可能性があります)
 - [ ] Windows GUI
