@@ -803,8 +803,10 @@ class MainActivity : Activity() {
             setOffsetField(d.offset, OffsetSource.DETECTED, d.agreement, "(自動検出: $agreed)")
             saveOffset(info, d.offset, "auto-detected: ${d.agreement}")
             val single = if (d.singleTrack) " 登録トラックが 1 つだけのディスクのため、別の CD でも確認することをおすすめします。" else ""
-            setStatus("オフセット %+d を検出しました (%s)。ドライブ %s の値として保存しました。%s".format(
-                d.offset, agreed, info.product, single
+            val others = if (d.alternatives.isEmpty()) "" else
+                " 他のプレスの候補: ${d.alternatives.joinToString(", ") { "%+d".format(it.offset) }}"
+            setStatus("オフセット %+d を検出しました (%s)。ドライブ %s の値として保存しました。%s%s".format(
+                d.offset, agreed, info.product, single, others
             ))
             if (thenRip) startRip(askOffset = false)
             return
@@ -841,6 +843,13 @@ class MainActivity : Activity() {
             "トラックごとに一致するオフセットが異なるため確定できません (候補: %s)。別の CD で試してください"
                 .format(d.candidates.joinToString(", ") { "%+d".format(it) })
         OffsetDetectStatus.CANCELLED -> "オフセットの検出を中止しました"
+        OffsetDetectStatus.AMBIGUOUS ->
+            ("どのトラックも同じ複数のオフセットで一致しました (互いにずれた別プレスの登録)。" +
+                "登録件数に十分な差がないため確定できません (候補: %s)。別の CD で試してください")
+                .format(
+                    (listOf(OffsetAlternative(d.offset, d.confidence)) + d.alternatives)
+                        .joinToString(", ") { "%+d (%d 件)".format(it.offset, it.confidence) }
+                )
     }
 
     // --- CDDB settings (#38) ---------------------------------------------------

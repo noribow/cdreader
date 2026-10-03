@@ -1143,6 +1143,50 @@ TEST(offset_detection_over_usb_then_rip_matches) {
     CHECK(!rig.session.offsetDetection().has_value());
 }
 
+// The disc of the real-device report in #37: 5 pressings shifted against
+// each other; every track matches at +6, -145 and -658. The offset most
+// submissions agree on (+6: pressing 1 v2 and pressing 3 v1) wins.
+TEST(offset_detection_over_usb_shifted_pressings) {
+    Rig rig;
+    FakeHttp http;
+    const cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(rig.session.toc());
+    std::vector<std::vector<std::pair<uint8_t, uint32_t>>> pressings(5);
+    for (int n = 1; n <= 3; ++n) {
+        const Reference own = referenceRip(n, 6), p2 = referenceRip(n, -145), p4 = referenceRip(n, -658);
+        pressings[0].push_back({14, own.v2});
+        pressings[1].push_back({13, p2.v2});
+        pressings[2].push_back({7, own.v1});
+        pressings[3].push_back({4, p4.v2});
+        pressings[4].push_back({3, p4.v1});
+    }
+    http.accurateRip = reply(200, dbar(id, pressings));
+    cdr::OffsetDetectOptions options;
+    options.minTrackSectors = 0;
+    const cdr::OffsetDetection& d = rig.session.detectReadOffset(&http, options);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 6);
+    CHECK_EQ(d.pressings, 5u);
+    CHECK_STR(d.agreement(), "2 of 2 tracks agreed, v1+v2; also -145 (26), -658 (14): other pressings");
+
+    cdr::RipSettings s = settings("wav", d.offset);
+    s.offsetSource.kind = cdr::ReadOffsetSource::Kind::Detected;
+    s.offsetSource.detail = d.agreement();
+    rig.session.beginRip(s);
+    TempDir dir;
+    for (int n = 1; n <= 3; ++n) rig.session.ripTrack(n, dir.path / "t.wav");
+    CHECK_EQ(rig.session.checkAccurateRip(&http).accurateTracks(), 3);
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "\nRead offset correction: +6 samples (auto-detected: 2 of 2 tracks agreed, v1+v2; "
+                        "also -145 (26), -658 (14): other pressings)\n"));
+    CHECK(contains(log, "\n  Track 02 (41 submissions): +6 v1+v2 (confidence 21, pressings 1+3), -145 v2 "
+                        "(confidence 13, pressing 2), -658 v1+v2 (confidence 7, pressings 4+5)\n"));
+    CHECK(contains(log, "\n  Shifted pressings, summed per offset: +6 v1+v2 confidence 42 (2 tracks, pressings "
+                        "1+3), -145 v2 confidence 26 (2 tracks, pressing 2), -658 v1+v2 confidence 14 (2 tracks, "
+                        "pressings 4+5)\n"));
+    CHECK(contains(log, "\n  Result: Read offset +6 (2 of 2 tracks agreed, v1+v2, confidence 42; also -145 (26), "
+                        "-658 (14): other pressings)\n"));
+}
+
 TEST(offset_detection_over_usb_failures_and_cancel) {
     Rig rig;
     FakeHttp http;

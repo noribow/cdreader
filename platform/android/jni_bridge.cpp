@@ -622,11 +622,14 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipIm
 // listener.onProgress(step, steps, track, doneSectors, totalSectors).
 // Returns [status (0 detected, 1 disc not in database, 2 lookup failed,
 // 3 no track with database entries, 4 no match, 5 too few tracks agree,
-// 6 tracks disagree, 7 cancelled), offset (the best candidate), agreeing
-// tracks, tracks read, confidence, matched version ("v1" / "v2" / "v1+v2"),
-// single track ("1" / "0"), usable tracks, competing offsets
-// ("+6,-1164"), English summary, agreement ("2 of 2 tracks agreed, v2"),
-// error]. Throws IOException on errors outside the reads.
+// 6 tracks disagree, 7 cancelled, 8 shifted pressings without a clear
+// winner), offset (the best candidate), agreeing tracks, tracks read,
+// confidence, matched version ("v1" / "v2" / "v1+v2"), single track
+// ("1" / "0"), usable tracks, competing offsets ("6,-1164"), English
+// summary, agreement ("2 of 2 tracks agreed, v2"), error, other pressings'
+// offsets with their summed confidence ("-145:26,-658:14", highest first;
+// empty without shifted pressings)]. Throws IOException on errors outside
+// the reads.
 JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeDetectOffset(JNIEnv* env, jclass,
                                                                                           jlong handle,
                                                                                           jobject httpGet,
@@ -659,14 +662,20 @@ JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeDe
             case Status::NotEnough: status = 5; break;
             case Status::Conflict: status = 6; break;
             case Status::Cancelled: status = 7; break;
+            case Status::Ambiguous: status = 8; break;
         }
         std::string candidates;
         for (int o : d.candidates) candidates += (candidates.empty() ? "" : ",") + std::to_string(o);
+        std::string alternatives;
+        for (const cdr::OffsetCandidate& c : d.alternatives)
+            alternatives += (alternatives.empty() ? "" : ",") + std::to_string(c.offset) + ":" +
+                            std::to_string(c.score());
         return toJavaArray(env, std::vector<std::string>{
                                     std::to_string(status), std::to_string(d.offset), std::to_string(d.agreeingTracks),
                                     std::to_string(d.testedTracks()), std::to_string(d.confidence()),
                                     d.matchedVersion(), d.singleTrack ? "1" : "0", std::to_string(d.usableTracks),
-                                    candidates, d.summary(), d.agreement(), d.error});
+                                    candidates, d.summary(), d.agreement(), d.error,
+                                    alternatives});
     } catch (const JavaExceptionPending&) {
         // propagate the listener's exception
     } catch (const std::exception& e) {

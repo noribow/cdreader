@@ -200,6 +200,7 @@ struct AccurateRipOffsetMatch {
     int v1Confidence = 0;  // submissions whose checksum equals v1 at this offset
     int v2Confidence = 0;  // ... equals v2
     int pressings = 0;     // database records that match at this offset
+    std::vector<AccurateRipPressingMatch> hits;  // those records (version 1 or 2), in database order
 
     int confidence() const { return v1Confidence + v2Confidence; }
     std::string matchedVersion() const;  // "v1", "v2" or "v1+v2"
