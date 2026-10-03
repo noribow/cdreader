@@ -7,6 +7,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
@@ -14,6 +15,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.security.NetworkSecurityPolicy
 import android.text.Editable
 import android.text.TextWatcher
 import android.text.method.ScrollingMovementMethod
@@ -61,8 +63,12 @@ class MainActivity : Activity() {
         const val PREF_ADVANCED = "advancedOpen"
         // Single-file mode (#42): the whole selection as one file plus a .cue file.
         const val PREF_SINGLE_FILE = "singleFile"
-        // CDDB server URL and contact e-mail address (#38); "" = default server / anonymous greeting.
+        // CDDB server and contact e-mail address (#38); "" = default server / anonymous greeting.
+        // The server is a preset id ("gnudb", "japdb") or a custom URL (#46); earlier versions
+        // saved URLs only, see CddbSettings.server().
         const val PREF_CDDB_SERVER = "cddbServer"
+        // The text of the custom URL field, kept while a preset is chosen (#46).
+        const val PREF_CDDB_CUSTOM_SERVER = "cddbCustomServer"
         const val PREF_CDDB_EMAIL = "cddbEmail"
         // Detected read offsets per drive model (#37): key = DriveInfo.offsetKey.
         const val DRIVE_OFFSETS = "driveOffsets"
@@ -108,6 +114,8 @@ class MainActivity : Activity() {
     private lateinit var radioMka: RadioButton
     private lateinit var radioAlac: RadioButton
     private lateinit var progress: ProgressBar
+    private lateinit var spinnerCddbServer: Spinner
+    private lateinit var textCddbServerUrl: TextView
     private lateinit var editCddbServer: EditText
     private lateinit var editCddbEmail: EditText
     private lateinit var buttonCddbTest: Button
@@ -123,6 +131,7 @@ class MainActivity : Activity() {
     // Read by the worker when a disc is loaded.
     @Volatile private var cddbEnabled = true
     // The saved (valid) CDDB settings (#38); "" = default server / anonymous greeting.
+    // The server is a preset id or a custom URL (#46), passed to native code as it is.
     @Volatile private var cddbServer = ""
     @Volatile private var cddbEmail = ""
     // Set on the UI thread; stops a rip between tracks, even before it reached native code.
@@ -199,6 +208,8 @@ class MainActivity : Activity() {
         radioMka = findViewById(R.id.radioMka)
         radioAlac = findViewById(R.id.radioAlac)
         progress = findViewById(R.id.progress)
+        spinnerCddbServer = findViewById(R.id.spinnerCddbServer)
+        textCddbServerUrl = findViewById(R.id.textCddbServerUrl)
         editCddbServer = findViewById(R.id.editCddbServer)
         editCddbEmail = findViewById(R.id.editCddbEmail)
         buttonCddbTest = findViewById(R.id.buttonCddbTest)
@@ -221,10 +232,8 @@ class MainActivity : Activity() {
         spinnerCache.setSelection(CacheMode.fromKey(prefs.getString(PREF_CACHE, null)).ordinal, false)
         switchSingleFile.isChecked = prefs.getBoolean(PREF_SINGLE_FILE, false)
         showAdvanced(prefs.getBoolean(PREF_ADVANCED, false))
-        cddbServer = prefs.getString(PREF_CDDB_SERVER, "").orEmpty()
+        loadCddbServer(prefs)
         cddbEmail = prefs.getString(PREF_CDDB_EMAIL, "").orEmpty()
-        editCddbServer.hint = CddbSettings.DEFAULT_SERVER
-        editCddbServer.setText(cddbServer)
         editCddbEmail.setText(cddbEmail)
 
         buttonConnect.setOnClickListener { if (connection == null) connect() else reloadDisc() }
@@ -268,7 +277,20 @@ class MainActivity : Activity() {
             showAdvanced(open)
             prefs.edit().putBoolean(PREF_ADVANCED, open).apply()
         }
-        editCddbServer.addTextChangedListener(afterChange { saveCddbSettings() })
+        spinnerCddbServer.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                // Also called once for the initial selection: saving is a no-op then.
+                showCddbServerChoice()
+                saveCddbSettings()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        editCddbServer.addTextChangedListener(afterChange {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(PREF_CDDB_CUSTOM_SERVER, editCddbServer.text.toString().trim()).apply()
+            saveCddbSettings()
+        })
         editCddbEmail.addTextChangedListener(afterChange { saveCddbSettings() })
         buttonCddbTest.setOnClickListener { startCddbTest() }
         checkCddb.setOnCheckedChangeListener { _, checked ->
@@ -870,14 +892,76 @@ class MainActivity : Activity() {
         CddbSettingProblem.HELLO_CHARACTERS -> "使えない文字が含まれています"
     }
 
+    /**
+     * The server dropdown (#46): GNUDB / JAPDB / カスタム. Settings saved by earlier
+     * versions hold a URL: one of a preset becomes that preset, any other the custom URL.
+     */
+    private fun loadCddbServer(prefs: SharedPreferences) {
+        val saved = prefs.getString(PREF_CDDB_SERVER, "").orEmpty()
+        val setting = CddbSettings.server(saved)
+        var customUrl = prefs.getString(PREF_CDDB_CUSTOM_SERVER, null)
+        val edit = prefs.edit()
+        if (setting.choice == CddbSettings.CUSTOM && customUrl == null) {
+            customUrl = setting.value
+            edit.putString(PREF_CDDB_CUSTOM_SERVER, customUrl)
+        }
+        // "" (nothing saved) is the default preset.
+        cddbServer = if (setting.choice == CddbSettings.CUSTOM) setting.value else setting.choice
+        if (cddbServer != saved) edit.putString(PREF_CDDB_SERVER, cddbServer)
+        edit.apply()
+
+        val labels = CddbSettings.presets.map { it.label } + getString(R.string.cddb_server_custom)
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinnerCddbServer.adapter = adapter
+        val index = CddbSettings.presets.indexOfFirst { it.id == setting.choice }
+        spinnerCddbServer.setSelection(if (index >= 0) index else CddbSettings.presets.size, false)
+        editCddbServer.setText(if (setting.choice == CddbSettings.CUSTOM) setting.value else customUrl.orEmpty())
+        showCddbServerChoice()
+    }
+
+    /** The preset chosen in the dropdown, null for カスタム. */
+    private fun selectedCddbPreset(): CddbServerPreset? =
+        CddbSettings.presets.getOrNull(spinnerCddbServer.selectedItemPosition)
+
+    /** The URL field only for カスタム, the preset's URL below the dropdown otherwise. */
+    private fun showCddbServerChoice() {
+        val preset = selectedCddbPreset()
+        editCddbServer.visibility = if (preset == null) View.VISIBLE else View.GONE
+        textCddbServerUrl.visibility = if (preset == null) View.GONE else View.VISIBLE
+        textCddbServerUrl.text = preset?.url.orEmpty()
+    }
+
+    /** The server setting as chosen: a preset id or the custom URL as typed. */
+    private fun selectedCddbServer(): String = selectedCddbPreset()?.id ?: editCddbServer.text.toString().trim()
+
+    /**
+     * The custom URL is http:// and this app's network security config blocks plain
+     * HTTP to its host (only the JAPDB server and AccurateRip are allowed, #46).
+     */
+    private fun cleartextBlocked(url: String): Boolean {
+        if (!url.startsWith("http://", ignoreCase = true)) return false
+        val host = Uri.parse(url).host ?: return false
+        return !NetworkSecurityPolicy.getInstance().isCleartextTrafficPermitted(host)
+    }
+
+    /** Japanese text for a problem of the server setting as chosen, null if none. */
+    private fun cddbServerProblem(server: String, check: CddbSettingsCheck): String? = when {
+        selectedCddbPreset() != null -> null
+        server.isEmpty() -> getString(R.string.cddb_server_url_needed)
+        cddbProblemText(check.server) != null -> cddbProblemText(check.server)
+        cleartextBlocked(server) -> getString(R.string.cddb_cleartext_blocked)
+        else -> null
+    }
+
     /** Saves the fields when valid (the last valid values stay in use otherwise) and marks invalid ones. */
     private fun saveCddbSettings() {
-        val server = editCddbServer.text.toString().trim()
+        val server = selectedCddbServer()
         val email = editCddbEmail.text.toString().trim()
         val check = CddbSettings.check(server, email)
-        val serverProblem = cddbProblemText(check.server)
+        val serverProblem = cddbServerProblem(server, check)
         val emailProblem = cddbProblemText(check.email)
-        editCddbServer.error = serverProblem
+        editCddbServer.error = if (selectedCddbPreset() == null) serverProblem else null
         editCddbEmail.error = emailProblem
         val edit = getSharedPreferences(PREFS, MODE_PRIVATE).edit()
         if (serverProblem == null && server != cddbServer) {
@@ -896,10 +980,10 @@ class MainActivity : Activity() {
     /** Connection test with the values in the fields, on [cddbTestWorker]. */
     private fun startCddbTest() {
         if (testingCddb || busy) return
-        val server = editCddbServer.text.toString().trim()
+        val server = selectedCddbServer()
         val email = editCddbEmail.text.toString().trim()
         val check = CddbSettings.check(server, email)
-        val problem = cddbProblemText(check.server)?.let { "サーバー URL: $it" }
+        val problem = cddbServerProblem(server, check)?.let { getString(R.string.cddb_server_url) + ": $it" }
             ?: cddbProblemText(check.email)?.let { "連絡先メールアドレス: $it" }
         if (problem != null) {
             textCddbTest.text = problem
@@ -1185,6 +1269,7 @@ class MainActivity : Activity() {
         switchSingleFile.isEnabled = !busy
         checkCddb.isEnabled = !busy
         // CDDB settings (#38): not while ripping, detecting or looking up.
+        spinnerCddbServer.isEnabled = !busy
         editCddbServer.isEnabled = !busy
         editCddbEmail.isEnabled = !busy
         buttonCddbTest.isEnabled = !busy && !testingCddb

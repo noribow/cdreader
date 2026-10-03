@@ -1,8 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The AccurateRip database is only served over plain HTTP; everything else
-     (e.g. CDDB at gnudb.org) keeps the default HTTPS-only policy. -->
+<!-- Plain HTTP only where the server offers nothing else:
+     - the AccurateRip database;
+     - the JAPDB CDDB server preset (#46, http://freedbtest.dyndns.org:80/~cddb/cddb.cgi).
+     Everything else (e.g. CDDB at gnudb.org, custom CDDB servers) keeps the
+     default HTTPS-only policy; the app tells the user when a custom http://
+     server URL is blocked by this policy (MainActivity.cleartextBlocked). -->
 <network-security-config>
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">www.accuraterip.com</domain>
+        <domain includeSubdomains="false">freedbtest.dyndns.org</domain>
     </domain-config>
 </network-security-config>

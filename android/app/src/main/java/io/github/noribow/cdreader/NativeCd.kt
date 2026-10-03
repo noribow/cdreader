@@ -44,6 +44,8 @@ object NativeCd {
     ): Array<String>
     @JvmStatic external fun nativeCheckCddbSettings(server: String, email: String): IntArray
     @JvmStatic external fun nativeTestCddb(server: String, email: String, http: HttpGet?): Array<String>
+    @JvmStatic external fun nativeCddbServerPresets(): Array<String>
+    @JvmStatic external fun nativeCddbServerSetting(value: String): Array<String>
     @JvmStatic external fun nativeAlbumFolderName(handle: Long): String
     @JvmStatic external fun nativeTrackFileName(handle: Long, track: Int, format: String): String
     @JvmStatic external fun nativeBeginRip(
@@ -179,13 +181,40 @@ data class CddbTestResult(
     val missingEmail: Boolean,
 )
 
+/** A CDDB server the user can pick by name (#46, cdr::CddbServerPreset). */
+data class CddbServerPreset(val id: String, val label: String, val url: String)
+
+/** A saved server setting (#46): what to store, and which dropdown entry it is. */
+data class CddbServerSetting(
+    /** Preset id ("gnudb", "japdb"), a custom URL, or "" for the default server. */
+    val value: String,
+    /** A preset id, or [CddbSettings.CUSTOM] for any other URL. */
+    val choice: String,
+)
+
 /**
  * CDDB server and contact e-mail address (#38), as stored in the app's
- * settings: "" means the default server / the anonymous greeting.
+ * settings: the server is a preset id ("gnudb", "japdb", #46) or a custom
+ * URL; "" means the default server / the anonymous greeting.
  */
 object CddbSettings {
-    /** The default server (cdr::kDefaultCddbServer), shown as the hint of the URL field. */
-    const val DEFAULT_SERVER = "https://gnudb.gnudb.org/~cddb/cddb.cgi"
+    /** The dropdown entry for a server URL typed by the user (cdr::kCddbServerCustom). */
+    const val CUSTOM = "custom"
+
+    /** The presets, the default (gnudb) first. */
+    val presets: List<CddbServerPreset> by lazy {
+        NativeCd.nativeCddbServerPresets().toList().chunked(3).filter { it.size == 3 }
+            .map { CddbServerPreset(it[0], it[1], it[2]) }
+    }
+
+    /**
+     * The value to store and the dropdown entry for a saved server setting. A URL
+     * saved before #46 that names a preset becomes that preset (migration).
+     */
+    fun server(saved: String): CddbServerSetting {
+        val v = NativeCd.nativeCddbServerSetting(saved)
+        return CddbServerSetting(v[0], v[1])
+    }
 
     /** Validation only, no I/O: may be called on the UI thread. */
     fun check(server: String, email: String): CddbSettingsCheck {
