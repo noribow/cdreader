@@ -110,12 +110,26 @@ struct ConfigKey {
 
 std::vector<ConfigKey> configKeys() {
     return {
-        {cdr::kSettingCddbServer, "CDDB server (http:// or https:// CGI URL)", cdr::kDefaultCddbServer},
+        {cdr::kSettingCddbServer, "CDDB server (gnudb, japdb or an http:// / https:// CGI URL)",
+         cdr::cddbServerPresets().front().id + std::string(" (") +
+             cdr::cddbServerDisplayName(cdr::cddbServerPresets().front().id) + ")"},
         {cdr::kSettingCddbEmail, "contact e-mail address user@host sent in the CDDB hello",
          "none: anonymous hello cdreader@localhost"},
         {cdr::kSettingCddbAppName, "application name in the CDDB hello", "cdreader"},
         {cdr::kSettingCddbAppVersion, "application version in the CDDB hello", kVersion},
     };
+}
+
+// "  gnudb   GNUDB  https://... (default)" lines for the help (#46).
+std::string cddbPresetHelp() {
+    std::string text;
+    for (const cdr::CddbServerPreset& p : cdr::cddbServerPresets()) {
+        char line[256];
+        std::snprintf(line, sizeof line, "  %-8s %-6s %s%s\n", p.id, p.label, p.url,
+                      &p == &cdr::cddbServerPresets().front() ? "  (default)" : "");
+        text += line;
+    }
+    return text;
 }
 
 void printUsage() {
@@ -194,15 +208,19 @@ void printUsage() {
         "\n"
         "CDDB options (rip, toc and cddb-test; they override the saved settings):\n"
         "      --no-cddb         Do not look up the disc online\n"
-        "      --cddb-server <url>  CDDB HTTP server (default: cddb-server setting,\n"
-        "                        otherwise %s)\n"
+        "      --cddb-server <name|url>  CDDB server: a preset name (see CDDB servers)\n"
+        "                        or an http:// / https:// CGI URL (default: cddb-server\n"
+        "                        setting, otherwise gnudb)\n"
         "      --cddb-match <n>  Use the n-th match when there are several (default: 1)\n"
         "      --cddb-hello <user@host>  Contact e-mail address sent in the CDDB greeting\n"
         "                        (default: cddb-email setting, otherwise the anonymous\n"
         "                        cdreader@localhost)\n"
         "\n"
+        "CDDB servers (--cddb-server / cddb-server <name>):\n"
+        "%s"
+        "\n"
         "Settings (cdreader config <key> <value>; saved in %s):\n"
-        "  cddb-server <url>     CDDB server, http:// or https://\n"
+        "  cddb-server <name|url>  CDDB server: gnudb, japdb or an http(s):// CGI URL\n"
         "  cddb-email <user@host>  Contact e-mail address for the CDDB greeting. gnudb.org\n"
         "                        refuses anonymous requests (\"500 Unknown application,\n"
         "                        developer email ...\"); the address is sent to the server\n"
@@ -212,7 +230,7 @@ void printUsage() {
         "                        (default: cdreader %s)\n"
         "\n"
         "<drive> is a drive letter such as D or D:\n",
-        kVersion, formatList().c_str(), offsetStorePath().u8string().c_str(), cdr::kDefaultCddbServer,
+        kVersion, formatList().c_str(), offsetStorePath().u8string().c_str(), cddbPresetHelp().c_str(),
         settingsPath().u8string().c_str(), kVersion);
 }
 
@@ -312,12 +330,14 @@ bool parseCddbOption(const std::vector<std::string>& args, size_t& i, CddbSettin
     if (a == "--no-cddb") {
         cddb.enabled = false;
     } else if (a == "--cddb-server") {
+        // A preset name (gnudb, japdb) or a URL (#46).
         const std::string& url = value();
         const cdr::CddbConfigProblem problem = cdr::checkCddbServer(url);
         if (url.empty() || problem != cdr::CddbConfigProblem::None)
-            throw UsageError("--cddb-server: " + (url.empty() ? std::string("needs a URL")
-                                                               : cdr::describeCddbConfigProblem(problem)));
-        cddb.options.server = url;
+            throw UsageError("--cddb-server: " + (url.empty() ? std::string("needs a preset name or a URL")
+                                                               : cdr::describeCddbConfigProblem(problem) +
+                                                                     " (or a preset name: gnudb, japdb)"));
+        cddb.options.server = cdr::resolveCddbServer(url);
     } else if (a == "--cddb-hello") {
         // gnudb wants a contact address in the greeting (#38).
         if (!cdr::splitCddbEmail(value(), cddb.options.client.user, cddb.options.client.host))
@@ -339,7 +359,7 @@ cdr::CddbLookupResult lookupDisc(const cdr::Toc& toc, const CddbSettings& cddb) 
         result.error = "disabled (--no-cddb)";
         return result;
     }
-    std::printf("Looking up the disc on %s ...\n", cddb.options.server.c_str());
+    std::printf("Looking up the disc on %s ...\n", cdr::cddbServerDisplayName(cddb.options.server).c_str());
     std::fflush(stdout);
     try {
         cdr::win::WinHttpClient http(std::string("cdreader/") + kVersion);
@@ -1001,7 +1021,11 @@ int cmdConfig(const std::vector<std::string>& args) {
         std::printf("Settings (%s):\n", settingsPath().u8string().c_str());
         for (const ConfigKey& k : keys) {
             const std::string* v = store.find(k.key);
-            std::printf("  %-17s %s\n", k.key, v ? v->c_str() : ("(default: " + k.defaultValue + ")").c_str());
+            std::string shown = v ? *v : "(default: " + k.defaultValue + ")";
+            // The server: "japdb (JAPDB, http://...)" (#46).
+            if (v && k.key == std::string(cdr::kSettingCddbServer) && cdr::cddbServerDisplayName(*v) != *v)
+                shown += " (" + cdr::cddbServerDisplayName(*v) + ")";
+            std::printf("  %-17s %s\n", k.key, shown.c_str());
         }
         for (const auto& [key, value] : store.entries()) {
             bool known = false;
@@ -1023,11 +1047,17 @@ int cmdConfig(const std::vector<std::string>& args) {
     }
     if (args.size() == 2) {
         const std::string* v = store.find(key);
-        std::printf("%s\n", v ? v->c_str() : ("(default: " + entry->defaultValue + ")").c_str());
+        std::string shown = v ? *v : "(default: " + entry->defaultValue + ")";
+        if (v && key == cdr::kSettingCddbServer && cdr::cddbServerDisplayName(*v) != *v)
+            shown += " (" + cdr::cddbServerDisplayName(*v) + ")";
+        std::printf("%s\n", shown.c_str());
         return 0;
     }
     if (args.size() > 3) throw UsageError("config takes one value (quote values with spaces)");
-    const std::string value = args[2] == "--unset" ? std::string() : args[2];
+    std::string value = args[2] == "--unset" ? std::string() : args[2];
+    // Servers: the preset id for a preset name or URL (#46).
+    if (key == cdr::kSettingCddbServer && cdr::checkCddbServer(value) == cdr::CddbConfigProblem::None)
+        value = cdr::cddbServerSettingValue(value);
     cdr::CddbConfig config = cdr::cddbConfigFromSettings(store);
     if (key == cdr::kSettingCddbServer) config.server = value;
     else if (key == cdr::kSettingCddbEmail) config.email = value;
@@ -1041,6 +1071,8 @@ int cmdConfig(const std::vector<std::string>& args) {
     cdr::storeCddbConfig(store, config);
     writeTextFile(settingsPath(), store.serialize());
     if (value.empty()) std::printf("%s reset to the default (%s)\n", key.c_str(), entry->defaultValue.c_str());
+    else if (key == cdr::kSettingCddbServer && cdr::cddbServerDisplayName(value) != value)
+        std::printf("%s = %s (%s)\n", key.c_str(), value.c_str(), cdr::cddbServerDisplayName(value).c_str());
     else std::printf("%s = %s\n", key.c_str(), value.c_str());
     if (key == cdr::kSettingCddbEmail && !value.empty())
         std::printf("This address is sent to the CDDB server with every lookup (try it: cdreader cddb-test).\n");
@@ -1057,7 +1089,7 @@ int cmdCddbTest(const std::vector<std::string>& args) {
             throw UsageError("unknown option '" + a + "' (cddb-test takes --cddb-server and --cddb-hello)");
     }
     const cdr::CddbClientInfo& c = cddb.options.client;
-    std::printf("Server: %s\n", cddb.options.server.c_str());
+    std::printf("Server: %s\n", cdr::cddbServerDisplayName(cddb.options.server).c_str());
     std::printf("Hello:  %s %s %s %s%s\n", c.user.c_str(), c.host.c_str(), c.name.c_str(), c.version.c_str(),
                 c.anonymous() ? "  (anonymous: no contact e-mail address set)" : "");
     std::printf("Sending '%s' ...\n", cdr::kCddbTestCommand);

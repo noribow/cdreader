@@ -887,7 +887,8 @@ TEST(cddb_error_hint_mapping) {
     CHECK(r.error == std::string("query failed: ") + kGnudbHelloError);
     std::vector<std::string> log = cdr::cddbLookupLogLines(true, cdr::kDefaultCddbServer, r);
     CHECK(log.size() == 2u);
-    CHECK(log[0] == "CDDB lookup (" + std::string(cdr::kDefaultCddbServer) + "): query failed: " + kGnudbHelloError);
+    CHECK(log[0] == "CDDB lookup (GNUDB, " + std::string(cdr::kDefaultCddbServer) + "): query failed: " +
+                        kGnudbHelloError);
     CHECK(log.size() == 2u && log[1] == text);
 
     // The same text in an HTTP error page.
@@ -914,6 +915,121 @@ TEST(cddb_lookup_log_lines_for_a_match) {
     CHECK(cdr::cddbLookupLogLines(true, "https://s/cgi", r) ==
           (std::vector<std::string>{"CDDB lookup (https://s/cgi): 1 exact match(es)", "  * 1. rock/0c025803  A / B",
                                     "Artist: A", "Album: B", "Year: 1999", "Genre: Rock"}));
+}
+
+TEST(cddb_server_presets) {
+    // #46: the dropdown / --cddb-server names.
+    const std::vector<cdr::CddbServerPreset>& presets = cdr::cddbServerPresets();
+    CHECK(presets.size() == 2u);
+    CHECK(presets[0].id == std::string("gnudb") && presets[0].label == std::string("GNUDB") &&
+          presets[0].url == std::string(cdr::kDefaultCddbServer));
+    CHECK(presets[1].id == std::string("japdb") && presets[1].label == std::string("JAPDB") &&
+          presets[1].url == std::string("http://freedbtest.dyndns.org:80/~cddb/cddb.cgi"));
+
+    CHECK(cdr::findCddbServerPreset("gnudb") == &presets[0]);
+    CHECK(cdr::findCddbServerPreset("JAPDB") == &presets[1]);
+    CHECK(cdr::findCddbServerPreset(" JapDB ") == &presets[1]);
+    CHECK(cdr::findCddbServerPreset("custom") == nullptr);
+    CHECK(cdr::findCddbServerPreset("") == nullptr);
+    CHECK(cdr::findCddbServerPreset(cdr::kJapdbServer) == nullptr);
+
+    CHECK(cdr::resolveCddbServer("") == cdr::kDefaultCddbServer);
+    CHECK(cdr::resolveCddbServer("Gnudb") == cdr::kDefaultCddbServer);
+    CHECK(cdr::resolveCddbServer("japdb") == cdr::kJapdbServer);
+    CHECK(cdr::resolveCddbServer(" https://cddb.example/cgi ") == "https://cddb.example/cgi");
+
+    // Validation accepts the names (CLI: config cddb-server japdb).
+    CHECK(cdr::checkCddbServer("japdb") == cdr::CddbConfigProblem::None);
+    CHECK(cdr::checkCddbServer("GNUDB") == cdr::CddbConfigProblem::None);
+    CHECK(cdr::checkCddbServer("freedb") == cdr::CddbConfigProblem::ServerScheme);
+}
+
+TEST(cddb_server_url_identification) {
+    using cdr::normalizeCddbServerUrl;
+    CHECK(normalizeCddbServerUrl("HTTP://FreeDBTest.DynDNS.org:80/~cddb/cddb.cgi/") ==
+          "http://freedbtest.dyndns.org/~cddb/cddb.cgi");
+    CHECK(normalizeCddbServerUrl("https://gnudb.gnudb.org:443/~cddb/cddb.cgi") ==
+          "https://gnudb.gnudb.org/~cddb/cddb.cgi");
+    // Only the default port of the scheme goes; the path keeps its case.
+    CHECK(normalizeCddbServerUrl("https://h.example:80/Cgi//") == "https://h.example:80/Cgi");
+    CHECK(normalizeCddbServerUrl("http://h.example:8080/cgi?x=1") == "http://h.example:8080/cgi?x=1");
+    CHECK(normalizeCddbServerUrl("http://h.example/cgi/?x=/") == "http://h.example/cgi?x=/");
+    CHECK(normalizeCddbServerUrl("http://h.example:443/") == "http://h.example:443");
+    CHECK(normalizeCddbServerUrl("  japdb ") == "japdb");
+
+    const cdr::CddbServerPreset* gnudb = &cdr::cddbServerPresets()[0];
+    const cdr::CddbServerPreset* japdb = &cdr::cddbServerPresets()[1];
+    CHECK(cdr::cddbServerPresetForUrl(cdr::kDefaultCddbServer) == gnudb);
+    CHECK(cdr::cddbServerPresetForUrl("https://GNUDB.gnudb.org:443/~cddb/cddb.cgi/") == gnudb);
+    CHECK(cdr::cddbServerPresetForUrl("http://freedbtest.dyndns.org/~cddb/cddb.cgi") == japdb);
+    CHECK(cdr::cddbServerPresetForUrl("HTTP://freedbtest.dyndns.org:80/~cddb/cddb.cgi/") == japdb);
+    // Another scheme, port or path is another server.
+    CHECK(cdr::cddbServerPresetForUrl("https://freedbtest.dyndns.org/~cddb/cddb.cgi") == nullptr);
+    CHECK(cdr::cddbServerPresetForUrl("http://gnudb.gnudb.org/~cddb/cddb.cgi") == nullptr);
+    CHECK(cdr::cddbServerPresetForUrl("http://freedbtest.dyndns.org:8080/~cddb/cddb.cgi") == nullptr);
+    CHECK(cdr::cddbServerPresetForUrl("http://freedbtest.dyndns.org/~CDDB/cddb.cgi") == nullptr);
+    CHECK(cdr::cddbServerPresetForUrl("") == nullptr);
+
+    CHECK(cdr::cddbServerDisplayName(cdr::kJapdbServer) == "JAPDB, http://freedbtest.dyndns.org:80/~cddb/cddb.cgi");
+    CHECK(cdr::cddbServerDisplayName("http://freedbtest.dyndns.org/~cddb/cddb.cgi") ==
+          "JAPDB, http://freedbtest.dyndns.org/~cddb/cddb.cgi");
+    CHECK(cdr::cddbServerDisplayName("japdb") == "JAPDB, http://freedbtest.dyndns.org:80/~cddb/cddb.cgi");
+    CHECK(cdr::cddbServerDisplayName("https://cddb.example/cgi") == "https://cddb.example/cgi");
+}
+
+TEST(cddb_server_setting_round_trip) {
+    // What is stored: the preset id, or the URL of a custom server.
+    CHECK(cdr::cddbServerSettingValue("") == "");
+    CHECK(cdr::cddbServerSettingValue("JAPDB") == "japdb");
+    CHECK(cdr::cddbServerSettingValue("gnudb") == "gnudb");
+    CHECK(cdr::cddbServerSettingValue(" https://cddb.example/cgi ") == "https://cddb.example/cgi");
+    // Settings saved before #46 hold URLs: a preset's URL becomes the preset.
+    CHECK(cdr::cddbServerSettingValue(cdr::kDefaultCddbServer) == "gnudb");
+    CHECK(cdr::cddbServerSettingValue("http://FREEDBTEST.dyndns.org/~cddb/cddb.cgi/") == "japdb");
+    CHECK(cdr::cddbServerSettingValue("https://freedbtest.dyndns.org/~cddb/cddb.cgi") ==
+          "https://freedbtest.dyndns.org/~cddb/cddb.cgi");
+
+    CHECK(cdr::cddbServerChoice("") == "gnudb");
+    CHECK(cdr::cddbServerChoice("gnudb") == "gnudb");
+    CHECK(cdr::cddbServerChoice("japdb") == "japdb");
+    CHECK(cdr::cddbServerChoice(cdr::kJapdbServer) == "japdb");
+    CHECK(cdr::cddbServerChoice("https://cddb.example/cgi") == cdr::kCddbServerCustom);
+
+    for (const char* value : {"japdb", "https://cddb.example/cgi"}) {
+        cdr::CddbConfig config;
+        config.server = value;
+        cdr::SettingsStore store;
+        cdr::storeCddbConfig(store, config);
+        const cdr::SettingsStore reread = cdr::SettingsStore::parse(store.serialize());
+        const cdr::CddbConfig back = cdr::cddbConfigFromSettings(reread);
+        CHECK(back.server == value);
+        CHECK(cdr::cddbConfigError(back).empty());
+    }
+
+    // The request URL of a japdb setting.
+    cdr::CddbConfig config;
+    config.server = "japdb";
+    const cdr::CddbOptions options = cdr::cddbOptionsFromConfig(config, "0.1.0");
+    CHECK(options.server == cdr::kJapdbServer);
+    CHECK(cdr::cddbRequestUrl(options.server, "cddb query 0c025803", options.client) ==
+          "http://freedbtest.dyndns.org:80/~cddb/cddb.cgi?cmd=cddb+query+0c025803"
+          "&hello=cdreader+localhost+cdreader+0.1.0&proto=6");
+    // Only gnudb wants the contact address.
+    CHECK(!cdr::cddbServerWantsEmail(options.server));
+    CHECK(cdr::cddbServerWantsEmail(cdr::cddbOptionsFromConfig({}, "0.1.0").server));
+    config.server = "GNUDB";
+    CHECK(cdr::cddbOptionsFromConfig(config, "0.1.0").server == cdr::kDefaultCddbServer);
+}
+
+TEST(cddb_lookup_log_lines_name_the_preset) {
+    FakeHttp http;
+    http.reply("cddb query", "202 No match found\r\n");
+    const cdr::CddbLookupResult r = cdr::lookupCddb(http, makeCddbToc());
+    CHECK(cdr::cddbLookupLogLines(true, cdr::kJapdbServer, r) ==
+          std::vector<std::string>{
+              "CDDB lookup (JAPDB, http://freedbtest.dyndns.org:80/~cddb/cddb.cgi): no matching disc in the database"});
+    CHECK(cdr::cddbLookupLogLines(true, cdr::kDefaultCddbServer, r)[0] ==
+          "CDDB lookup (GNUDB, https://gnudb.gnudb.org/~cddb/cddb.cgi): no matching disc in the database");
 }
 
 TEST(cddb_connection_test) {

@@ -323,6 +323,26 @@ TEST(cddb_uses_configured_server_and_hello) {
     CHECK(!anonymous.urls.empty() && contains(anonymous.urls[0], "&hello=cdreader+localhost+cdreader+0.1.0&"));
 }
 
+// #46: the JAPDB preset as the app passes it ("japdb" through JNI): the
+// requests go to its plain HTTP URL and rip.log names the preset.
+TEST(cddb_lookup_on_japdb_preset) {
+    Rig rig;
+    FakeHttp http;
+    addCddbAlbum(http);
+    cdr::CddbConfig config;
+    config.server = "japdb";
+    cdr::CddbSettings cddb;
+    cddb.options = cdr::cddbOptionsFromConfig(config, "0.1.0");
+    const cdr::CddbLookupResult& r = rig.session.lookupCddb(&http, cddb);
+    CHECK(r.found);
+    CHECK_EQ(http.urls.size(), size_t(2));
+    for (const std::string& url : http.urls)
+        CHECK(url.rfind("http://freedbtest.dyndns.org:80/~cddb/cddb.cgi?cmd=cddb+", 0) == 0);
+    rig.session.beginRip(settings("wav"));
+    CHECK(contains(rig.session.ripLog(),
+                   "CDDB lookup (JAPDB, http://freedbtest.dyndns.org:80/~cddb/cddb.cgi): 1 exact match(es)\n"));
+}
+
 // gnudb's answer to the anonymous hello: the rip goes on with generic names
 // and rip.log says what to do.
 TEST(cddb_hello_refused_puts_hint_in_rip_log) {
@@ -337,7 +357,7 @@ TEST(cddb_hello_refused_puts_hint_in_rip_log) {
     TempDir dir;
     rig.session.ripTrack(1, dir.path / "t.wav");
     const std::string log = rig.session.ripLog();
-    CHECK(contains(log, "CDDB lookup (" + std::string(cdr::kDefaultCddbServer) + "): query failed: " + refusal + "\n" +
+    CHECK(contains(log, "CDDB lookup (GNUDB, " + std::string(cdr::kDefaultCddbServer) + "): query failed: " + refusal + "\n" +
                             cdr::cddbHintText(cdr::CddbHint::ContactEmail) + "\n"));
     CHECK(contains(log, "set a contact e-mail address in the CDDB settings"));
     CHECK(contains(log, "Track01.wav  CRC32 "));
@@ -667,7 +687,7 @@ TEST(accuraterip_reports_v1_and_v2_matches) {
     CHECK(contains(log, "Drive: FAKE"));
     CHECK(contains(log, "Format: flac"));
     CHECK(contains(log, "Mode: burst, retries 2"));
-    CHECK(contains(log, "CDDB lookup (" + std::string(cdr::kDefaultCddbServer) + "): 1 exact match(es)"));
+    CHECK(contains(log, "CDDB lookup (GNUDB, " + std::string(cdr::kDefaultCddbServer) + "): 1 exact match(es)"));
     CHECK(contains(log, "Artist: Various\nAlbum: Album: Live\nYear: 1999\nGenre: Rock"));
     CHECK(contains(log, "Folder: Various - Album_ Live"));
     CHECK(contains(log, "01 - Opening.flac  CRC32 "));
@@ -712,7 +732,7 @@ TEST(failed_lookups_do_not_stop_the_rip) {
     CHECK_EQ(report.tracks.size(), size_t(1));
     CHECK(!report.tracks.empty() && !report.tracks[0].inDatabase());
     std::string log = rig.session.ripLog();
-    CHECK(contains(log, "CDDB lookup (" + std::string(cdr::kDefaultCddbServer) + "): no route"));
+    CHECK(contains(log, "CDDB lookup (GNUDB, " + std::string(cdr::kDefaultCddbServer) + "): no route"));
     CHECK(contains(log, "AccurateRip: lookup failed: no route"));
     CHECK(contains(log, "All tracks ripped without errors"));
 
