@@ -69,6 +69,8 @@ cdreader offset D:                  読み取りオフセットを AccurateRip �
 cdreader offset D: --save           検出したオフセットをこのドライブの値として保存
 cdreader offsets                    保存済みのオフセット (ドライブごと) の一覧
 cdreader config cddb-email you@example.com  CDDB に送る連絡先メールアドレスを保存 (gnudb で必要)
+cdreader config cddb-server japdb   CDDB サーバーに JAPDB を使う (gnudb / japdb / URL)
+cdreader rip D: --cddb-server japdb  今回だけ JAPDB で検索する
 cdreader config                     保存済みの設定の一覧
 cdreader cddb-test                  CDDB サーバーへの接続テスト
 ```
@@ -99,7 +101,7 @@ CDDB のオプション (`rip` と `toc` の両方で使えます。`--cddb-serv
 | オプション | 説明 |
 | --- | --- |
 | `--no-cddb` | CDDB に問い合わせない |
-| `--cddb-server <url>` | CDDB サーバー (HTTP / HTTPS の CGI の URL。既定: 設定 `cddb-server`、なければ `https://gnudb.gnudb.org/~cddb/cddb.cgi`) |
+| `--cddb-server <name\|url>` | CDDB サーバー。プリセット名 (`gnudb` / `japdb`、大文字小文字は区別しない) または HTTP / HTTPS の CGI の URL (既定: 設定 `cddb-server`、なければ `gnudb`。「CDDB 設定」の節を参照) |
 | `--cddb-match <n>` | 候補が複数あるときに使う候補の番号 (1 から。既定: 1) |
 | `--cddb-hello <user@host>` | CDDB の hello に送る連絡先メールアドレス (`@` の前がユーザー名、後ろがホスト名として送られます。既定: 設定 `cddb-email`、なければ匿名の `cdreader@localhost`) |
 
@@ -111,11 +113,11 @@ CDDB のオプション (`rip` と `toc` の両方で使えます。`--cddb-serv
 | `cdreader config <key>` | 1 つの設定の値を表示 |
 | `cdreader config <key> <value>` | 設定を検証して保存 |
 | `cdreader config <key> --unset` | 既定値に戻す |
-| `cdreader cddb-test [--cddb-server <url>] [--cddb-hello <user@host>]` | CDDB サーバーへの接続テスト (`stat` コマンドを 1 回送り、サーバーの応答を表示。終了コード 0 成功 / 1 失敗) |
+| `cdreader cddb-test [--cddb-server <name\|url>] [--cddb-hello <user@host>]` | CDDB サーバーへの接続テスト (`stat` コマンドを 1 回送り、サーバーの応答を表示。終了コード 0 成功 / 1 失敗) |
 
 | 設定 (`<key>`) | 内容 |
 | --- | --- |
-| `cddb-server` | CDDB サーバーの URL (`http://` または `https://`) |
+| `cddb-server` | CDDB サーバー: プリセット名 (`gnudb` / `japdb`) または URL (`http://` または `https://`)。プリセットの URL を指定した場合もプリセット名で保存します |
 | `cddb-email` | CDDB の hello に送る連絡先メールアドレス (`user@host` 形式) |
 | `cddb-app-name` / `cddb-app-version` | hello に送るアプリ名 / バージョン (既定: `cdreader` / プログラムのバージョン。通常は変更不要) |
 
@@ -136,6 +138,32 @@ CDDB のオプション (`rip` と `toc` の両方で使えます。`--cddb-serv
 
 ### CDDB 設定 (サーバーと連絡先メールアドレス)
 
+#### サーバーの選択 ([#46](https://github.com/noribow/cdreader/issues/46))
+
+CDDB サーバーは次のプリセットから選ぶか、任意の URL (カスタム) を指定します。
+
+| プリセット (名前) | 表示名 | URL | 備考 |
+| --- | --- | --- | --- |
+| `gnudb` (既定) | GNUDB | `https://gnudb.gnudb.org/~cddb/cddb.cgi` | 連絡先メールアドレスが必要 (下記) |
+| `japdb` | JAPDB | `http://freedbtest.dyndns.org:80/~cddb/cddb.cgi` | freedb 互換のサーバー。HTTP (暗号化なし) |
+
+- Windows: `cdreader config cddb-server japdb` (または `gnudb`、`https://...` の URL) で保存し、今回だけ変えるなら `--cddb-server japdb`。
+  `cdreader config` の一覧には `cddb-server  japdb (JAPDB, http://...)` のようにプリセットの表示名と URL を表示します。
+  `cdreader --help` の「CDDB servers」にプリセットの一覧があります。
+- Android: 「詳細設定」→「CDDB」の「サーバー」のドロップダウンで「GNUDB / JAPDB / カスタム」を選びます。
+  プリセットを選ぶとその URL をドロップダウンの下に表示し、「カスタム」を選んだときだけ URL の入力欄を表示します。
+  以前のバージョンで URL を保存していた場合、それがプリセットの URL (末尾の `/`、既定のポート `:80` / `:443`、
+  スキームとホスト名の大文字小文字の違いは無視) ならそのプリセットに、それ以外ならカスタムに自動で切り替わります。
+  「接続テスト」は選択中のサーバーに送ります。
+- 設定には、プリセットならプリセット名 (`gnudb` / `japdb`)、カスタムなら URL を保存します。
+- `rip.log` の CDDB の行は、プリセットのサーバーなら表示名も記録します (例: `CDDB lookup (JAPDB, http://freedbtest.dyndns.org:80/~cddb/cddb.cgi): 1 exact match(es)`)。
+- 連絡先メールアドレスの注意 (gnudb が要求) は、サーバーが gnudb.org のときだけ表示します。
+- Android の通信設定 (`network_security_config.xml`) は暗号化なしの HTTP を AccurateRip と JAPDB のホスト
+  (`freedbtest.dyndns.org`) にだけ許可しています。カスタムに `http://` の他のサーバーを入力すると、
+  欄に「https:// の URL を指定してください」と表示して保存しません (Windows 版には制限はありません)。
+
+#### 連絡先メールアドレス
+
 CDDB の問い合わせには毎回 hello (`ユーザー名 ホスト名 アプリ名 バージョン`) を付けます。
 既定のサーバー gnudb.org は、利用者 (開発者) の **連絡先メールアドレス** を hello に含めることを求めており、
 匿名の hello (`cdreader localhost cdreader 0.1.0`) には次のように応答して検索に応じません:
@@ -148,7 +176,7 @@ CDDB の問い合わせには毎回 hello (`ユーザー名 ホスト名 アプ�
 hello のユーザー名とホスト名として送られます (例: `you@example.com` → `hello=you example.com cdreader 0.1.0`)。
 
 - Windows: `cdreader config cddb-email you@example.com` で保存します (毎回指定するなら `--cddb-hello you@example.com`)。
-  別のサーバーを使うには `cdreader config cddb-server <url>`。`cdreader cddb-test` で設定を確認できます。
+  別のサーバーを使うには `cdreader config cddb-server japdb` (または `<url>`)。`cdreader cddb-test` で設定を確認できます。
   設定は `%APPDATA%\cdreader\settings.txt` (読み取りオフセットの `drive_offsets.txt` と同じフォルダ。`APPDATA` が無ければ
   `cdreader.exe` と同じフォルダ) に `key=value` 形式で保存されます。コマンドラインのオプションは保存値より優先されます。
 - Android: 「詳細設定」の「CDDB」で「連絡先メールアドレス」を入力します (「Android の使い方」を参照)。
@@ -716,7 +744,7 @@ SCSI/MMC コマンドを送ります)。
    - 「キャッシュ対策」: 自動 (既定) / FUA / 追い出し / なし (Windows 版の `--cache auto|fua|flush|none`。「ドライブキャッシュ対策」の節を参照)。
      自動ではディスクごとに最初のリッピング開始時に数秒かけてドライブを試験します
    - 「CDDB」([#38](https://github.com/noribow/cdreader/issues/38)。「CDDB 設定」の節を参照):
-     「サーバー URL」(空欄なら既定の gnudb。欄に既定の URL が薄く表示されます)、
+     「サーバー」(ドロップダウンで GNUDB (既定) / JAPDB / カスタム。カスタムのときだけ URL の入力欄を表示。[#46](https://github.com/noribow/cdreader/issues/46))、
      「連絡先メールアドレス」(gnudb は開発者/利用者の連絡先メールを要求します。入力したアドレスはサーバーに送信されます。空欄なら匿名)。
      入力内容はその場で検証し (形式が正しくない場合は欄にエラーを表示し、保存しません)、正しい値を次回以降も使います。
      「接続テスト」でサーバーに `stat` を送り、結果 (サーバーの応答またはエラー) を横に表示します。
@@ -872,6 +900,9 @@ CDDB は偽の `HttpClient` を使い (ネットワークには接続しませ�
 CDDB 設定 (#38) は、メールアドレスの有無による hello と URL、サーバー URL・メールアドレス・アプリ名の検証、設定ファイル (`key=value`) の往復と壊れた行の無視、
 接続テスト (成功・gnudb でアドレス未設定・hello の拒否・その他のエラー・通信エラー・CDDB でない応答)、
 gnudb の実際の応答 `500 Unknown application, developer email for cdreader 0.1.0` からの案内文への対応付けと `rip.log` の `Hint:` 行を検証します。
+サーバーのプリセット (#46) は、名前の解決 (大文字小文字)、URL からプリセットの判定 (末尾の `/`・既定のポート・スキームとホスト名の大文字小文字の正規化、
+スキーム・ポート・パスが違えばカスタム)、設定の保存値 (プリセット名 / カスタム URL / 以前の URL からの移行) と設定ファイルの往復、
+JAPDB の問い合わせ URL、`rip.log` の行 (`CDDB lookup (JAPDB, ...)`)、JAPDB を選んだ `RipSession` の検索 (偽の `HttpClient`) を検証します。
 AccurateRip はネットワークに接続せず (偽の `HttpClient` を使用)、実在のディスクの ID・データベース応答と、独立した参照実装で求めたチェックサムで検証します。
 Opus / Vorbis は、ヘッダー (`OpusHead` / `OpusTags`、Vorbis の 3 つのヘッダー) のバイト列とページ構成、
 グラニュール位置 (pre-skip、最後のページでの長さの切り詰め)、EOS フラグを検証し、libopus / libvorbis のデコーダでデコードして
@@ -1002,6 +1033,8 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
   (実装済み・実機での動作確認待ち)
 - [x] CDDB 設定 (サーバー URL・連絡先メールアドレス、接続テスト、hello を拒否されたときの案内。`cdreader config` / `cddb-test`、
   Android は詳細設定の「CDDB」) — [#38](https://github.com/noribow/cdreader/issues/38)
+  (実装済み・実機での動作確認待ち)
+- [x] CDDB サーバーのプリセット (GNUDB / JAPDB / カスタム。`--cddb-server japdb`、Android はドロップダウン) — [#46](https://github.com/noribow/cdreader/issues/46)
   (実装済み・実機での動作確認待ち)
 - [ ] Windows GUI
 

@@ -1,5 +1,6 @@
 #include "cdreader/cddb.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -123,6 +124,83 @@ std::string hex32(uint32_t v) {
 }
 
 }  // namespace
+
+// --- Server presets (#46) -------------------------------------------------------
+
+const std::vector<CddbServerPreset>& cddbServerPresets() {
+    static const std::vector<CddbServerPreset> presets = {
+        {kCddbServerGnudb, "GNUDB", kDefaultCddbServer},
+        {kCddbServerJapdb, "JAPDB", kJapdbServer},
+    };
+    return presets;
+}
+
+const CddbServerPreset* findCddbServerPreset(const std::string& name) {
+    const std::string id = lower(trim(name));
+    for (const CddbServerPreset& p : cddbServerPresets())
+        if (id == p.id) return &p;
+    return nullptr;
+}
+
+std::string normalizeCddbServerUrl(const std::string& url) {
+    const std::string u = trim(url);
+    const std::string l = lower(u);
+    size_t schemeEnd = 0;
+    const char* defaultPort = nullptr;
+    if (l.rfind("http://", 0) == 0) {
+        schemeEnd = 7;
+        defaultPort = ":80";
+    } else if (l.rfind("https://", 0) == 0) {
+        schemeEnd = 8;
+        defaultPort = ":443";
+    } else {
+        return u;
+    }
+    const size_t authorityEnd = std::min(u.find_first_of("/?", schemeEnd), u.size());
+    std::string authority = l.substr(schemeEnd, authorityEnd - schemeEnd);
+    const std::string port = defaultPort;
+    if (authority.size() > port.size() && authority.compare(authority.size() - port.size(), port.size(), port) == 0)
+        authority.erase(authority.size() - port.size());
+    const size_t queryStart = std::min(u.find('?', authorityEnd), u.size());
+    std::string path = u.substr(authorityEnd, queryStart - authorityEnd);
+    while (!path.empty() && path.back() == '/') path.pop_back();
+    return l.substr(0, schemeEnd) + authority + path + u.substr(queryStart);
+}
+
+const CddbServerPreset* cddbServerPresetForUrl(const std::string& url) {
+    const std::string n = normalizeCddbServerUrl(url);
+    for (const CddbServerPreset& p : cddbServerPresets())
+        if (n == normalizeCddbServerUrl(p.url)) return &p;
+    return nullptr;
+}
+
+std::string resolveCddbServer(const std::string& value) {
+    const std::string v = trim(value);
+    if (v.empty()) return kDefaultCddbServer;
+    if (const CddbServerPreset* p = findCddbServerPreset(v)) return p->url;
+    return v;
+}
+
+std::string cddbServerSettingValue(const std::string& value) {
+    const std::string v = trim(value);
+    if (v.empty()) return {};
+    if (const CddbServerPreset* p = findCddbServerPreset(v)) return p->id;
+    if (const CddbServerPreset* p = cddbServerPresetForUrl(v)) return p->id;
+    return v;
+}
+
+std::string cddbServerChoice(const std::string& value) {
+    if (trim(value).empty()) return cddbServerPresets().front().id;
+    const std::string stored = cddbServerSettingValue(value);
+    return findCddbServerPreset(stored) ? stored : kCddbServerCustom;
+}
+
+std::string cddbServerDisplayName(const std::string& server) {
+    const CddbServerPreset* p = findCddbServerPreset(server);
+    if (p) return std::string(p->label) + ", " + p->url;
+    p = cddbServerPresetForUrl(server);
+    return p ? std::string(p->label) + ", " + trim(server) : server;
+}
 
 std::string toValidUtf8(const std::string& s) {
     bool valid = true;
@@ -412,12 +490,13 @@ std::vector<std::string> cddbLookupLogLines(bool enabled, const std::string& ser
         lines.push_back("CDDB lookup: disabled");
         return lines;
     }
+    const std::string name = cddbServerDisplayName(server);
     if (!result.found) {
-        lines.push_back("CDDB lookup (" + server + "): " + result.error);
+        lines.push_back("CDDB lookup (" + name + "): " + result.error);
         if (result.hint != CddbHint::None) lines.push_back(cddbHintText(result.hint));
         return lines;
     }
-    lines.push_back("CDDB lookup (" + server + "): " + std::to_string(result.matches.size()) +
+    lines.push_back("CDDB lookup (" + name + "): " + std::to_string(result.matches.size()) +
                     (result.exact ? " exact" : " inexact") + " match(es)");
     for (size_t i = 0; i < result.matches.size(); ++i) {
         const CddbMatch& m = result.matches[i];
@@ -472,7 +551,7 @@ void storeCddbConfig(SettingsStore& store, const CddbConfig& config) {
 }
 
 CddbConfigProblem checkCddbServer(const std::string& url) {
-    if (url.empty()) return CddbConfigProblem::None;
+    if (url.empty() || findCddbServerPreset(url)) return CddbConfigProblem::None;
     const std::string l = lower(url);
     size_t schemeEnd = 0;
     if (l.rfind("http://", 0) == 0) schemeEnd = 7;
@@ -575,7 +654,7 @@ bool splitCddbEmail(const std::string& email, std::string& user, std::string& ho
 CddbOptions cddbOptionsFromConfig(const CddbConfig& config, const std::string& version) {
     CddbOptions options;
     if (!config.server.empty() && checkCddbServer(config.server) == CddbConfigProblem::None)
-        options.server = config.server;
+        options.server = resolveCddbServer(config.server);
     splitCddbEmail(config.email, options.client.user, options.client.host);
     if (!version.empty() && checkCddbHelloField(version) == CddbConfigProblem::None) options.client.version = version;
     if (!config.appName.empty() && checkCddbHelloField(config.appName) == CddbConfigProblem::None)

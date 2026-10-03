@@ -15,6 +15,51 @@ namespace cdr {
 
 constexpr const char* kDefaultCddbServer = "https://gnudb.gnudb.org/~cddb/cddb.cgi";
 
+// --- Server presets (#46) -------------------------------------------------------
+// The servers the user can pick by name (CLI: --cddb-server japdb, Android: the
+// server dropdown). The first one is the default (kDefaultCddbServer).
+struct CddbServerPreset {
+    const char* id;     // "gnudb": stored in the settings, accepted case-insensitively
+    const char* label;  // "GNUDB": shown in the UI and in rip.log
+    const char* url;    // CGI URL
+};
+
+constexpr const char* kCddbServerGnudb = "gnudb";
+constexpr const char* kCddbServerJapdb = "japdb";
+constexpr const char* kCddbServerCustom = "custom";  // the choice for any other URL
+constexpr const char* kJapdbServer = "http://freedbtest.dyndns.org:80/~cddb/cddb.cgi";
+
+const std::vector<CddbServerPreset>& cddbServerPresets();
+
+// The preset named `name` (its id, case-insensitive, surrounding spaces
+// ignored), nullptr for anything else.
+const CddbServerPreset* findCddbServerPreset(const std::string& name);
+
+// Comparable form of a server URL: scheme and host in lower case, default
+// ports (:80 for http, :443 for https) and trailing slashes removed. Values
+// that are not http(s) URLs only lose surrounding spaces.
+std::string normalizeCddbServerUrl(const std::string& url);
+
+// The preset whose URL is `url` once both are normalised, nullptr for others.
+const CddbServerPreset* cddbServerPresetForUrl(const std::string& url);
+
+// The URL for a server setting / option: "" -> kDefaultCddbServer, a preset
+// name -> its URL, anything else (a URL) as it is (spaces trimmed).
+std::string resolveCddbServer(const std::string& value);
+
+// What to store for a server setting: a preset name or a URL of a preset ->
+// the preset id; "" stays "" (the default); other URLs are kept (trimmed).
+// Also the migration of settings saved before #46 (URLs only).
+std::string cddbServerSettingValue(const std::string& value);
+
+// Which choice a server setting is: a preset id ("" is the default, gnudb), or
+// kCddbServerCustom for any other URL.
+std::string cddbServerChoice(const std::string& value);
+
+// The server for messages and rip.log: "JAPDB, http://..." for a preset's
+// URL, otherwise the URL (or setting value) itself.
+std::string cddbServerDisplayName(const std::string& server);
+
 // One disc in a query response.
 struct CddbMatch {
     std::string category;  // e.g. "rock"; needed for "cddb read"
@@ -103,6 +148,7 @@ CddbLookupResult lookupCddb(HttpClient& http, const Toc& toc, const CddbOptions&
 //   "CDDB lookup: disabled" /
 //   "CDDB lookup (<server>): <error>" [+ "Hint: ..."] /
 //   "CDDB lookup (<server>): N exact match(es)", the matches, artist, album, year, genre.
+// <server> is cddbServerDisplayName(server), e.g. "JAPDB, http://freedbtest...".
 std::vector<std::string> cddbLookupLogLines(bool enabled, const std::string& server, const CddbLookupResult& result);
 
 // --- Settings (#38) ------------------------------------------------------------
@@ -123,7 +169,8 @@ std::string cddbHintText(CddbHint hint);
 
 // What the user configured. Empty values mean the defaults.
 struct CddbConfig {
-    std::string server;      // CDDB CGI URL (http:// or https://); empty: kDefaultCddbServer
+    std::string server;      // preset id ("gnudb", "japdb") or CDDB CGI URL (http:// or https://);
+                             // empty: kDefaultCddbServer (resolveCddbServer)
     std::string email;       // contact address "user@host" for the hello; empty: anonymous hello
     std::string appName;     // empty: "cdreader"
     std::string appVersion;  // empty: the program's version
@@ -149,7 +196,8 @@ enum class CddbConfigProblem {
     HelloCharacters = 5,   // spaces, control or non-ASCII characters, more than 64 (app name / version)
 };
 
-// Each accepts the empty string (= the default).
+// Each accepts the empty string (= the default); checkCddbServer also a
+// preset name (findCddbServerPreset).
 CddbConfigProblem checkCddbServer(const std::string& url);
 CddbConfigProblem checkCddbEmail(const std::string& email);
 CddbConfigProblem checkCddbHelloField(const std::string& value);

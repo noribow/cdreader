@@ -347,8 +347,9 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeReadT
     }
 }
 
-// Looks the disc up on CDDB (or clears the metadata when !enabled); an empty
-// `server` means the default server, an empty `email` the anonymous hello
+// Looks the disc up on CDDB (or clears the metadata when !enabled); `server`
+// is a preset id ("japdb", #46) or a URL, empty for the default server; an
+// empty `email` means the anonymous hello
 // (#38: the contact address "user@host" the user entered; invalid values are
 // ignored). Never fails for network problems.
 // Returns [found ("1"/"0"), message (error, or "exact"/"inexact"), artist,
@@ -392,7 +393,8 @@ JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeLo
     }
 }
 
-// Checks the CDDB settings (#38) as typed: [server problem, e-mail problem],
+// Checks the CDDB settings (#38) as typed: [server problem, e-mail problem]
+// (the server may also be a preset id, #46),
 // each 0 valid (or empty), 1 not http(s)://, 2 bad host, 3 bad characters,
 // 4 not an e-mail address (cdr::CddbConfigProblem).
 JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeCheckCddbSettings(JNIEnv* env, jclass,
@@ -401,6 +403,27 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeCheck
     std::string url, address;
     if (!fromJava(env, server, url) || !fromJava(env, email, address)) return nullptr;
     return toJavaArray(env, std::vector<jint>{jint(cdr::checkCddbServer(url)), jint(cdr::checkCddbEmail(address))});
+}
+
+// CDDB server presets (#46): [id, label, URL] per preset, the default first.
+JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeCddbServerPresets(JNIEnv* env, jclass) {
+    std::vector<std::string> v;
+    for (const cdr::CddbServerPreset& p : cdr::cddbServerPresets()) {
+        v.push_back(p.id);
+        v.push_back(p.label);
+        v.push_back(p.url);
+    }
+    return toJavaArray(env, v);
+}
+
+// A saved server setting (#46): [value to store (preset id, custom URL or ""
+// for the default; a URL saved by earlier versions becomes the preset it
+// names), choice (a preset id or "custom")]. No I/O.
+JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeCddbServerSetting(JNIEnv* env, jclass,
+                                                                                               jstring value) {
+    std::string v;
+    if (!fromJava(env, value, v)) return nullptr;
+    return toJavaArray(env, std::vector<std::string>{cdr::cddbServerSettingValue(v), cdr::cddbServerChoice(v)});
 }
 
 // CDDB connection test (#38): one "stat" request with the hello of the
