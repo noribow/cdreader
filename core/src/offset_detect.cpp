@@ -47,84 +47,149 @@ std::string cleanNote(std::string s) {
 bool evaluate(OffsetDetection& d, const OffsetDetectOptions& options) {
     const int need = d.usableTracks >= options.minAgreeingTracks ? options.minAgreeingTracks
                                                                  : std::max(1, d.usableTracks);
-    // Tracks per offset, and their confidence.
-    std::map<int, int> tracksAt;
-    std::map<int, int> confidenceAt;
-    int matchedTracks = 0;
-    for (const OffsetDetectTrack& t : d.tracks) {
-        matchedTracks += t.matches.empty() ? 0 : 1;
-        for (const AccurateRipOffsetMatch& m : t.matches) {
-            ++tracksAt[m.offset];
-            confidenceAt[m.offset] += m.confidence();
-        }
-    }
     d.candidates.clear();
+    d.alternatives.clear();
     d.agreeingTracks = 0;
     d.v1Confidence = d.v2Confidence = 0;
+    d.offsetPressings.clear();
     d.singleTrack = false;
-    if (tracksAt.empty()) {
+    // Per offset: the tracks that match there, their submissions and pressings.
+    std::map<int, OffsetCandidate> at;
+    std::vector<const OffsetDetectTrack*> matched;
+    for (const OffsetDetectTrack& t : d.tracks) {
+        if (!t.matches.empty()) matched.push_back(&t);
+        for (const AccurateRipOffsetMatch& m : t.matches) {
+            OffsetCandidate& c = at[m.offset];
+            c.offset = m.offset;
+            ++c.tracks;
+            c.v1Confidence += m.v1Confidence;
+            c.v2Confidence += m.v2Confidence;
+            for (const AccurateRipPressingMatch& h : m.hits)
+                if (std::find(c.pressings.begin(), c.pressings.end(), h.pressing) == c.pressings.end())
+                    c.pressings.push_back(h.pressing);
+        }
+    }
+    if (at.empty()) {
         d.status = OffsetDetection::Status::NoMatch;
         return false;
     }
-    int best = 0;
-    for (const auto& [offset, n] : tracksAt) best = std::max(best, n);
-    std::vector<int> top;
-    for (const auto& [offset, n] : tracksAt)
-        if (n == best) top.push_back(offset);
-    // The best candidate (for the report): most tracks, then most submissions.
-    int offset = top.front();
-    for (int o : top)
-        if (confidenceAt[o] > confidenceAt[offset]) offset = o;
-    d.offset = offset;
-    d.agreeingTracks = best;
-    for (const OffsetDetectTrack& t : d.tracks) {
-        if (const AccurateRipOffsetMatch* m = matchAt(t, offset)) {
-            d.v1Confidence += m->v1Confidence;
-            d.v2Confidence += m->v2Confidence;
-        }
+    for (auto& [offset, c] : at) std::sort(c.pressings.begin(), c.pressings.end());
+    auto take = [&](const OffsetCandidate& c) {
+        d.offset = c.offset;
+        d.agreeingTracks = c.tracks;
+        d.v1Confidence = c.v1Confidence;
+        d.v2Confidence = c.v2Confidence;
+        d.offsetPressings = c.pressings;
+    };
+    // An offset is consistent with a matching track when it matches there, or when none of the pressings
+    // behind it has an entry for that track (then its absence says nothing).
+    auto consistent = [](const OffsetCandidate& c, const OffsetDetectTrack& t) {
+        if (matchAt(t, c.offset)) return true;
+        for (int p : c.pressings)
+            if (std::find(t.pressingsWithEntry.begin(), t.pressingsWithEntry.end(), p) != t.pressingsWithEntry.end())
+                return false;
+        return true;
+    };
+    std::vector<OffsetCandidate> shared;  // consistent with every matching track
+    for (const auto& [offset, c] : at) {
+        bool all = true;
+        for (const OffsetDetectTrack* t : matched) all = all && consistent(c, *t);
+        if (all) shared.push_back(c);
     }
-    // Tracks that matched, but not at the best offset, disagree.
-    const bool disagreement = matchedTracks > best;
-    if (top.size() > 1 || disagreement) {
+    if (shared.empty()) {
+        // Tracks match at disjoint offsets: another track cannot undo that.
+        std::vector<OffsetCandidate> all;
+        for (const auto& [offset, c] : at) all.push_back(c);
+        std::stable_sort(all.begin(), all.end(), [](const OffsetCandidate& a, const OffsetCandidate& b) {
+            if (a.tracks != b.tracks) return a.tracks > b.tracks;
+            return a.score() > b.score();
+        });
+        take(all.front());
+        for (const OffsetCandidate& c : all) d.candidates.push_back(c.offset);
         d.status = OffsetDetection::Status::Conflict;
-        d.candidates.clear();
-        for (const auto& [o, n] : tracksAt) d.candidates.push_back(o);
-        std::stable_sort(d.candidates.begin(), d.candidates.end(),
-                         [&](int a, int b) { return tracksAt.at(a) > tracksAt.at(b); });
-        // Another track cannot undo a disagreement, but may break a tie
-        // (a track matching two pressings shifted against each other).
-        return disagreement;
-    }
-    if (best >= need) {
-        if (need == 1 && d.usableTracks <= 1 && d.confidence() < options.singleTrackMinConfidence) {
-            d.status = OffsetDetection::Status::NotEnough;
-            return false;
-        }
-        d.status = OffsetDetection::Status::Detected;
-        d.singleTrack = need == 1;
         return true;
     }
-    d.status = OffsetDetection::Status::NotEnough;
+    // Most submissions first; then the offset more tracks matched at.
+    std::stable_sort(shared.begin(), shared.end(), [](const OffsetCandidate& a, const OffsetCandidate& b) {
+        if (a.score() != b.score()) return a.score() > b.score();
+        return a.tracks > b.tracks;
+    });
+    const OffsetCandidate& best = shared.front();
+    take(best);
+    if (shared.size() == 1) {
+        if (best.tracks >= need) {
+            if (need == 1 && d.usableTracks <= 1 && d.confidence() < options.singleTrackMinConfidence) {
+                d.status = OffsetDetection::Status::NotEnough;
+                return false;
+            }
+            d.status = OffsetDetection::Status::Detected;
+            d.singleTrack = need == 1;
+            return true;
+        }
+        d.status = OffsetDetection::Status::NotEnough;
+        return false;
+    }
+    // Pressings shifted against each other: every matching track shows the same offsets.
+    d.alternatives.assign(shared.begin() + 1, shared.end());
+    for (const OffsetCandidate& c : shared) d.candidates.push_back(c.offset);
+    const OffsetCandidate& second = shared[1];
+    const bool clear = double(best.score()) >= options.pressingScoreRatio * double(second.score());
+    if (best.tracks >= std::max(2, need) && clear) {
+        d.status = OffsetDetection::Status::Detected;
+        return true;
+    }
+    // One matching track cannot tell pressings apart: read more if there are more.
+    d.status = matched.size() < 2 && d.usableTracks > 1 ? OffsetDetection::Status::NotEnough
+                                                        : OffsetDetection::Status::Ambiguous;
     return false;
 }
 
 }  // namespace
 
+std::string OffsetCandidate::matchedVersion() const { return versionName(v1Confidence, v2Confidence); }
+
 std::string OffsetDetection::matchedVersion() const { return versionName(v1Confidence, v2Confidence); }
 
-std::string OffsetDetection::agreement() const {
-    std::string s = std::to_string(agreeingTracks) + " of " + std::to_string(testedTracks()) + " track" +
-                    (testedTracks() == 1 ? "" : "s") + " agreed";
-    if (!matchedVersion().empty()) s += ", " + matchedVersion();
-    if (singleTrack) s += ", only one track in database";
+std::string OffsetDetection::alternativesText() const {
+    if (alternatives.empty()) return {};
+    std::string s = "also ";
+    for (size_t i = 0; i < alternatives.size(); ++i)
+        s += (i ? ", " : "") + signedNumber(alternatives[i].offset) + " (" + std::to_string(alternatives[i].score()) +
+             ")";
+    return s + ": other pressings";
+}
+
+namespace {
+
+std::string agreementCore(const OffsetDetection& d) {
+    std::string s = std::to_string(d.agreeingTracks) + " of " + std::to_string(d.testedTracks()) + " track" +
+                    (d.testedTracks() == 1 ? "" : "s") + " agreed";
+    if (!d.matchedVersion().empty()) s += ", " + d.matchedVersion();
+    if (d.singleTrack) s += ", only one track in database";
     return s;
+}
+
+std::string pressingList(const std::vector<int>& pressings) {
+    std::string s = pressings.size() == 1 ? "pressing " : "pressings ";
+    for (size_t i = 0; i < pressings.size(); ++i) s += (i ? "+" : "") + std::to_string(pressings[i]);
+    return s;
+}
+
+}  // namespace
+
+std::string OffsetDetection::agreement() const {
+    const std::string also = alternativesText();
+    return agreementCore(*this) + (also.empty() ? "" : "; " + also);
 }
 
 std::string OffsetDetection::summary() const {
     switch (status) {
         case Status::Detected:
-            return "Read offset " + signedNumber(offset) + " (" + agreement() + ", confidence " +
-                   std::to_string(confidence()) + ")";
+        {
+            const std::string also = alternativesText();
+            return "Read offset " + signedNumber(offset) + " (" + agreementCore(*this) + ", confidence " +
+                   std::to_string(confidence()) + (also.empty() ? "" : "; " + also) + ")";
+        }
         case Status::NotInDatabase:
             return "This disc is not in the AccurateRip database: the offset cannot be detected with it. "
                    "Try a more popular CD.";
@@ -151,6 +216,14 @@ std::string OffsetDetection::summary() const {
         }
         case Status::Cancelled:
             return "Offset detection cancelled.";
+        case Status::Ambiguous: {
+            std::string list = signedNumber(offset) + " (" + std::to_string(confidence()) + ")";
+            for (const OffsetCandidate& c : alternatives)
+                list += ", " + signedNumber(c.offset) + " (" + std::to_string(c.score()) + ")";
+            return "The tracks read all match at the same offsets " + list +
+                   " (pressings shifted against each other), but none has clearly more submissions than the "
+                   "others. Try another disc.";
+        }
     }
     return {};
 }
@@ -164,13 +237,38 @@ std::vector<std::string> OffsetDetection::logLines() const {
         std::string found;
         for (size_t i = 0; i < t.matches.size() && i < 5; ++i) {
             const AccurateRipOffsetMatch& m = t.matches[i];
-            std::snprintf(buf, sizeof buf, "%s%s %s (confidence %d)", found.empty() ? "" : ", ",
+            std::snprintf(buf, sizeof buf, "%s%s %s (confidence %d", found.empty() ? "" : ", ",
                           signedNumber(m.offset).c_str(), m.matchedVersion().c_str(), m.confidence());
             found += buf;
+            if (pressings > 1) {
+                std::vector<int> numbers;
+                for (const AccurateRipPressingMatch& h : m.hits) numbers.push_back(h.pressing);
+                found += ", " + pressingList(numbers);
+            }
+            found += ")";
         }
         if (t.matches.size() > 5) found += ", ...";
         std::snprintf(buf, sizeof buf, "  Track %02d (%d submissions): ", t.track, t.totalConfidence);
         lines.push_back(buf + (found.empty() ? std::string("no match") : found));
+    }
+    if (!alternatives.empty()) {
+        // Offsets every track matched at (shifted pressings), by summed confidence.
+        std::vector<OffsetCandidate> all;
+        OffsetCandidate best;
+        best.offset = offset;
+        best.tracks = agreeingTracks;
+        best.v1Confidence = v1Confidence;
+        best.v2Confidence = v2Confidence;
+        best.pressings = offsetPressings;
+        all.push_back(best);
+        all.insert(all.end(), alternatives.begin(), alternatives.end());
+        std::string list;
+        for (const OffsetCandidate& c : all) {
+            list += (list.empty() ? "" : ", ") + signedNumber(c.offset) + " " + c.matchedVersion() + " confidence " +
+                    std::to_string(c.score()) + " (" + std::to_string(c.tracks) + " track" +
+                    (c.tracks == 1 ? "" : "s") + (c.pressings.empty() ? "" : ", " + pressingList(c.pressings)) + ")";
+        }
+        lines.push_back("  Shifted pressings, summed per offset: " + list);
     }
     lines.push_back("  Result: " + summary());
     return lines;
@@ -239,6 +337,9 @@ OffsetDetection detectReadOffset(CdDrive& drive, const Toc& toc, const std::vect
         result.track = track.number;
         const size_t entry = accurateRipEntryIndex(toc, track);
         result.totalConfidence = matchAccurateRip(pressings, entry, track.number, 0, 0).totalConfidence;
+        for (size_t n = 0; n < pressings.size(); ++n)
+            if (entry < pressings[n].tracks.size() && pressings[n].tracks[entry].confidence != 0)
+                result.pressingsWithEntry.push_back(int(n) + 1);
         try {
             const AccurateRipOffsetScan scan = scanReadOffsets(
                 drive, toc, track, options.maxOffset, options.rip, [&](uint32_t done, uint32_t total) {

@@ -9,8 +9,21 @@
 // offsets in [-maxOffset, +maxOffset] whose v1 or v2 checksum equals a
 // database entry (findAccurateRipOffsets()). An offset is only confirmed
 // when several tracks agree on it (see OffsetDetectOptions::minAgreeingTracks):
-// a single coincidental match, or pressings shifted against each other,
-// must not set a wrong offset for every later rip with this drive.
+// a single coincidental match must not set a wrong offset for every later
+// rip with this drive.
+//
+// Pressings shifted against each other: a popular disc often has several
+// pressings in the database whose audio is the same, only shifted by a fixed
+// number of samples. Then every track matches at several offsets, one per
+// pressing (e.g. +6, -145, -658 for a drive whose offset is +6). When every
+// track read shows the same set of offsets (an offset may only be missing
+// on a track whose database entries lack the pressings it matched), this is
+// not a conflict: each offset is scored by the submissions behind it summed
+// over the tracks, and the best one is confirmed when its score is at least
+// OffsetDetectOptions::pressingScoreRatio times the runner-up's and it
+// matched on at least two tracks (the drive's own offset is the one most
+// people ripped with). Otherwise the result is Ambiguous. Tracks matching at
+// disjoint offsets remain a Conflict.
 
 #include <cstdint>
 #include <functional>
@@ -45,6 +58,12 @@ struct OffsetDetectOptions {
     // that track's matching submissions must reach singleTrackMinConfidence.
     int minAgreeingTracks = 2;
     int singleTrackMinConfidence = 10;
+    // Pressings shifted against each other: the best offset needs at least
+    // this many times the summed confidence of the next one. 1.5 separates
+    // the main pressing plus its v1 submissions (e.g. 14 + 7 per track)
+    // from the next pressing (13), but not two pressings of about the same
+    // size, where the drive's offset cannot be told from the database.
+    double pressingScoreRatio = 1.5;
     // Preferred track lengths: shorter tracks carry little data (and often
     // few submissions), longer ones take long to read and need about
     // 4 bytes per sample of memory. Tracks outside the range are only read
@@ -65,7 +84,22 @@ struct OffsetDetectOptions {
 struct OffsetDetectTrack {
     int track = 0;
     int totalConfidence = 0;  // all submissions for the track
+    std::vector<int> pressingsWithEntry;  // 1-based database records with an entry for the track
     std::vector<AccurateRipOffsetMatch> matches;  // highest confidence first
+};
+
+// An offset matched by pressings shifted against each other, with the
+// submissions behind it summed over the tracks read (each pressing once
+// per track; v1 and v2 hits of different pressings both count).
+struct OffsetCandidate {
+    int offset = 0;
+    int tracks = 0;  // tracks that match at it
+    int v1Confidence = 0;
+    int v2Confidence = 0;
+    std::vector<int> pressings;  // 1-based database records that match at it (any track)
+
+    int score() const { return v1Confidence + v2Confidence; }
+    std::string matchedVersion() const;  // "v1", "v2", "v1+v2"
 };
 
 struct OffsetDetection {
@@ -78,6 +112,7 @@ struct OffsetDetection {
         NotEnough,       // matches, but too few tracks agree (or one track with low confidence)
         Conflict,        // tracks match at different offsets
         Cancelled,
+        Ambiguous,       // every track matches the same offsets (shifted pressings), none clearly best
     };
     Status status = Status::NoMatch;
     std::string error;            // LookupFailed / read errors
@@ -92,16 +127,24 @@ struct OffsetDetection {
     int agreeingTracks = 0;       // tracks that match at `offset`
     int v1Confidence = 0;         // their submissions at `offset`
     int v2Confidence = 0;
+    std::vector<int> offsetPressings;  // 1-based database records that match at `offset`
     bool singleTrack = false;     // confirmed by the disc's only usable track
-    std::vector<int> candidates;  // Conflict: the competing offsets
+    std::vector<int> candidates;  // Conflict / Ambiguous: the competing offsets (Ambiguous: best score first)
+    // Detected / Ambiguous with shifted pressings: the other pressings'
+    // offsets, highest score first (the chosen / best one is `offset`).
+    std::vector<OffsetCandidate> alternatives;
 
     bool detected() const { return status == Status::Detected; }
     int testedTracks() const { return int(tracks.size()); }
     int confidence() const { return v1Confidence + v2Confidence; }
     std::string matchedVersion() const;  // "v1", "v2", "v1+v2"
 
-    // "2 of 3 tracks agreed, v2" (Detected), used in rip.log and the store.
+    // "2 of 3 tracks agreed, v2" (Detected), used in rip.log and the store;
+    // with shifted pressings "2 of 2 tracks agreed, v1+v2; also -145 (26),
+    // -658 (8): other pressings".
     std::string agreement() const;
+    // "also -145 (26), -658 (8): other pressings" (score in parentheses), or empty.
+    std::string alternativesText() const;
     // One English sentence: the result, or why there is none.
     std::string summary() const;
     // Block for rip.log / the console: the result and every track read.

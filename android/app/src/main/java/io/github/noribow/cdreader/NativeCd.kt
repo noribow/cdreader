@@ -88,8 +88,13 @@ enum class OffsetSource(val code: Int) { MANUAL(0), SAVED(1), DETECTED(2) }
 
 /** Result of [CdSession.detectOffset], in the order of the native status codes. */
 enum class OffsetDetectStatus {
-    DETECTED, NOT_IN_DATABASE, LOOKUP_FAILED, NO_USABLE_TRACKS, NO_MATCH, NOT_ENOUGH, CONFLICT, CANCELLED
+    DETECTED, NOT_IN_DATABASE, LOOKUP_FAILED, NO_USABLE_TRACKS, NO_MATCH, NOT_ENOUGH, CONFLICT, CANCELLED,
+    /** Every track matches the same offsets (pressings shifted against each other), none clearly best. */
+    AMBIGUOUS,
 }
+
+/** An offset matched by another pressing, with its submissions summed over the tracks read. */
+data class OffsetAlternative(val offset: Int, val confidence: Int)
 
 data class OffsetDetection(
     val status: OffsetDetectStatus,
@@ -103,13 +108,15 @@ data class OffsetDetection(
     /** Confirmed by the disc's only track in the database. */
     val singleTrack: Boolean,
     val usableTracks: Int,
-    /** CONFLICT: the competing offsets. */
+    /** CONFLICT / AMBIGUOUS: the competing offsets. */
     val candidates: List<Int>,
     /** English one-line summary (as in rip.log). */
     val summary: String,
     /** "2 of 2 tracks agreed, v2" (rip.log, the saved note). */
     val agreement: String,
     val error: String,
+    /** DETECTED / AMBIGUOUS with shifted pressings: the other pressings' offsets, highest confidence first. */
+    val alternatives: List<OffsetAlternative> = emptyList(),
 )
 
 data class TrackInfo(
@@ -392,6 +399,10 @@ class CdSession private constructor(private val handle: Long) : Closeable {
             v[1].toInt(), v[2].toInt(), v[3].toInt(), v[4].toInt(), v[5], v[6] == "1", v[7].toInt(),
             if (v[8].isEmpty()) emptyList() else v[8].split(",").map { it.toInt() },
             v[9], v[10], v[11],
+            v.getOrNull(12).orEmpty().split(",").filter { it.isNotEmpty() }.map {
+                val (offset, confidence) = it.split(":")
+                OffsetAlternative(offset.toInt(), confidence.toInt())
+            },
         )
     }
 

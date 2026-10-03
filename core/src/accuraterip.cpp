@@ -347,9 +347,14 @@ std::vector<AccurateRipOffsetMatch> findAccurateRipOffsets(const AccurateRipOffs
                                                            const std::vector<AccurateRipPressing>& pressings,
                                                            size_t entryIndex) {
     std::vector<const AccurateRipEntry*> entries;
-    for (const AccurateRipPressing& p : pressings)
-        if (entryIndex < p.tracks.size() && p.tracks[entryIndex].confidence != 0)
+    std::vector<int> numbers;  // 1-based record number of each entry
+    for (size_t n = 0; n < pressings.size(); ++n) {
+        const AccurateRipPressing& p = pressings[n];
+        if (entryIndex < p.tracks.size() && p.tracks[entryIndex].confidence != 0) {
             entries.push_back(&p.tracks[entryIndex]);
+            numbers.push_back(int(n) + 1);
+        }
+    }
     std::vector<AccurateRipOffsetMatch> matches;
     if (entries.empty()) return matches;
 
@@ -360,7 +365,8 @@ std::vector<AccurateRipOffsetMatch> findAccurateRipOffsets(const AccurateRipOffs
         m.offset = int(i) - int(scan.maxOffset());
         bool haveV2 = false;
         uint32_t v2 = 0;
-        for (const AccurateRipEntry* e : entries) {
+        for (size_t k = 0; k < entries.size(); ++k) {
+            const AccurateRipEntry* e = entries[k];
             // As in matchAccurateRip(): an entry equal to both counts as v2.
             if (scan.mayMatchV2(residues[i], e->checksum)) {
                 if (!haveV2) {
@@ -370,12 +376,14 @@ std::vector<AccurateRipOffsetMatch> findAccurateRipOffsets(const AccurateRipOffs
                 if (v2 == e->checksum) {
                     m.v2Confidence += e->confidence;
                     ++m.pressings;
+                    m.hits.push_back({numbers[k], e->checksum, e->confidence, 2});
                     continue;
                 }
             }
             if (v1[i] == e->checksum) {
                 m.v1Confidence += e->confidence;
                 ++m.pressings;
+                m.hits.push_back({numbers[k], e->checksum, e->confidence, 1});
             }
         }
         if (m.confidence() > 0) matches.push_back(m);

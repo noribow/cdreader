@@ -1718,12 +1718,138 @@ TEST(offset_detect_shifted_pressings) {
     CHECK_EQ(d.offset, 6);
     CHECK_EQ(d.testedTracks(), 2);
 
-    // Every track matches both: undecidable.
+    CHECK(d.alternatives.empty());  // +30 does not match track 2, where its pressing has an entry
+
+    // Every track matches both. This used to be undecidable (Conflict); since
+    // the real-device report in #37 (5 shifted pressings, every track matching
+    // +6 / -145 / -658) the offset with clearly more submissions wins and the
+    // other one is reported as another pressing's.
     p[1] = pressingAt(makeOffsetDisc, {30, 30, 30, 30, 30}, {2, 2, 2, 2, 2});
     FakeDrive again = makeOffsetDisc();
     d = detectOn(again, p);
-    CHECK(d.status == cdr::OffsetDetection::Status::Conflict);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 6);
+    CHECK_EQ(d.testedTracks(), 2);
+    CHECK_EQ(d.confidence(), 40);
+    CHECK_EQ(d.alternatives.size(), 1u);
+    CHECK(!d.alternatives.empty() && d.alternatives[0].offset == 30 && d.alternatives[0].score() == 4);
+    CHECK(d.agreement() == "2 of 2 tracks agreed, v2; also +30 (4): other pressings");
+
+    // Both about equally popular: undecidable (all 3 tracks read).
+    p[1] = pressingAt(makeOffsetDisc, {30, 30, 30, 30, 30}, {15, 15, 15, 15, 15});
+    FakeDrive close = makeOffsetDisc();
+    d = detectOn(close, p);
+    CHECK(d.status == cdr::OffsetDetection::Status::Ambiguous);
+    CHECK(!d.detected());
     CHECK_EQ(d.testedTracks(), 3);
+    CHECK_EQ(d.offset, 6);
+    CHECK_EQ(d.confidence(), 60);
+    CHECK((d.candidates == std::vector<int>{6, 30}));
+    CHECK(d.summary() == "The tracks read all match at the same offsets +6 (60), +30 (45) (pressings shifted "
+                         "against each other), but none has clearly more submissions than the others. Try another "
+                         "disc.");
+}
+
+namespace {
+
+// The disc of the real-device report in #37: 5 pressings, shifted by -151 and
+// -664 samples against pressing 1; pressing 3 is pressing 1's audio with v1
+// checksums, pressing 5 pressing 4's. The drive's offset is +6.
+std::vector<cdr::AccurateRipPressing> fivePressings(int p1 = 14, int p2 = 13) {
+    auto c = [](int n) { return std::vector<uint8_t>(5, uint8_t(n)); };
+    return {pressingAt(makeOffsetDisc, {6, 6, 6, 6, 6}, c(p1)),
+            pressingAt(makeOffsetDisc, {-145, -145, -145, -145, -145}, c(p2)),
+            pressingAt(makeOffsetDisc, {6, 6, 6, 6, 6}, c(7), false),
+            pressingAt(makeOffsetDisc, {-658, -658, -658, -658, -658}, c(4)),
+            pressingAt(makeOffsetDisc, {-658, -658, -658, -658, -658}, c(3), false)};
+}
+
+}  // namespace
+
+TEST(offset_detect_shifted_pressings_by_confidence) {
+    FakeDrive fake = makeOffsetDisc();
+    cdr::OffsetDetection d = detectOn(fake, fivePressings());
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 6);
+    CHECK_EQ(d.testedTracks(), 2);
+    CHECK_EQ(d.agreeingTracks, 2);
+    CHECK_EQ(d.v2Confidence, 28);
+    CHECK_EQ(d.v1Confidence, 14);
+    CHECK((d.offsetPressings == std::vector<int>{1, 3}));
+    CHECK_EQ(d.alternatives.size(), 2u);
+    if (d.alternatives.size() == 2) {
+        CHECK_EQ(d.alternatives[0].offset, -145);
+        CHECK_EQ(d.alternatives[0].score(), 26);
+        CHECK_EQ(d.alternatives[0].tracks, 2);
+        CHECK((d.alternatives[0].pressings == std::vector<int>{2}));
+        CHECK_EQ(d.alternatives[1].offset, -658);
+        CHECK_EQ(d.alternatives[1].score(), 14);
+        CHECK(d.alternatives[1].matchedVersion() == "v1+v2");
+    }
+    CHECK((d.candidates == std::vector<int>{6, -145, -658}));
+    CHECK(d.agreement() == "2 of 2 tracks agreed, v1+v2; also -145 (26), -658 (14): other pressings");
+    CHECK(d.summary() == "Read offset +6 (2 of 2 tracks agreed, v1+v2, confidence 42; also -145 (26), -658 (14): "
+                         "other pressings)");
+    const std::vector<std::string> lines = d.logLines();
+    CHECK_EQ(lines.size(), 5u);
+    if (lines.size() == 5) {
+        CHECK(lines[0].find(", 5 pressing(s), ") != std::string::npos);
+        CHECK(lines[1] == "  Track 02 (41 submissions): +6 v1+v2 (confidence 21, pressings 1+3), -145 v2 "
+                          "(confidence 13, pressing 2), -658 v1+v2 (confidence 7, pressings 4+5)");
+        CHECK(lines[3] == "  Shifted pressings, summed per offset: +6 v1+v2 confidence 42 (2 tracks, pressings "
+                          "1+3), -145 v2 confidence 26 (2 tracks, pressing 2), -658 v1+v2 confidence 14 (2 tracks, "
+                          "pressings 4+5)");
+        CHECK(lines[4] == "  Result: " + d.summary());
+    }
+    CHECK(cdr::readOffsetLogLine(d.offset, {cdr::ReadOffsetSource::Kind::Detected, d.agreement()}) ==
+          "Read offset correction: +6 samples (auto-detected: 2 of 2 tracks agreed, v1+v2; also -145 (26), "
+          "-658 (14): other pressings)");
+
+    // Pressing 2 about as popular as pressing 1 plus its v1 submissions: 21 vs 20 per track.
+    FakeDrive close = makeOffsetDisc();
+    d = detectOn(close, fivePressings(14, 20));
+    CHECK(d.status == cdr::OffsetDetection::Status::Ambiguous);
+    CHECK_EQ(d.testedTracks(), 3);  // more tracks read, bounded by maxTracks
+    CHECK_EQ(d.offset, 6);
+    CHECK_EQ(d.alternatives.size(), 2u);
+    CHECK((d.candidates == std::vector<int>{6, -145, -658}));
+
+    // Just at the threshold (1.5): 21 vs 14 per track.
+    FakeDrive edge = makeOffsetDisc();
+    d = detectOn(edge, fivePressings(14, 14));
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 6);
+
+    // A stricter ratio refuses the same disc.
+    cdr::OffsetDetectOptions strict = shortTrackOptions();
+    strict.pressingScoreRatio = 2.0;
+    FakeDrive strictDrive = makeOffsetDisc();
+    d = detectOn(strictDrive, fivePressings(), strict);
+    CHECK(d.status == cdr::OffsetDetection::Status::Ambiguous);
+}
+
+TEST(offset_detect_shifted_pressing_missing_on_a_track) {
+    // Pressing 2 has no entry for track 2: its offset may be missing there.
+    std::vector<cdr::AccurateRipPressing> p = {pressingAt(makeOffsetDisc, {6, 6, 6, 6, 6}, {14, 30, 14, 14, 14}),
+                                               pressingAt(makeOffsetDisc, {-145, -145, -145, -145, -145},
+                                                          {13, 0, 13, 13, 13})};
+    FakeDrive fake = makeOffsetDisc();
+    cdr::OffsetDetection d = detectOn(fake, p);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 6);
+    CHECK_EQ(d.testedTracks(), 2);
+    CHECK(d.tracks.size() == 2 && d.tracks[0].track == 2 && d.tracks[1].track == 3);
+    CHECK_EQ(d.alternatives.size(), 1u);
+    CHECK(!d.alternatives.empty() && d.alternatives[0].offset == -145 && d.alternatives[0].tracks == 1);
+
+    // With an entry that does not match there, the tracks disagree: a genuine conflict.
+    p[1] = pressingAt(makeOffsetDisc, {-145, kGarbage, -145, -145, -145}, {13, 13, 13, 13, 13});
+    p[0] = pressingAt(makeOffsetDisc, {6, 6, kGarbage, 6, 6}, {14, 30, 14, 14, 14});
+    FakeDrive conflict = makeOffsetDisc();
+    d = detectOn(conflict, p);
+    CHECK(d.status == cdr::OffsetDetection::Status::Conflict);
+    CHECK_EQ(d.testedTracks(), 2);
+    CHECK(d.alternatives.empty());
     CHECK_EQ(d.candidates.size(), 2u);
 }
 

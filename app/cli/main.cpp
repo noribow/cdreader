@@ -982,6 +982,13 @@ int cmdOffset(const std::vector<std::string>& args) {
     }
     std::printf("\nRead offset: %+d  (use: cdreader rip %c: --offset %d%s)\n", found.offset, letter, found.offset,
                 save ? ", or --offset auto" : "; --save stores it for --offset auto");
+    if (!found.alternatives.empty()) {
+        std::string others;
+        for (const cdr::OffsetCandidate& c : found.alternatives)
+            others += (others.empty() ? "" : ", ") + std::string(c.offset > 0 ? "+" : "") + std::to_string(c.offset) +
+                      " (confidence " + std::to_string(c.score()) + ")";
+        std::printf("Other pressings' offsets: %s; fewer submissions, not used\n", others.c_str());
+    }
     if (save) saveDriveOffset(d.info, {found.offset, driveNote(found)});
     return 0;
 }
