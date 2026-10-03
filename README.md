@@ -32,7 +32,7 @@
 - トラックごとの CRC32 と `rip.log` (TOC・結果) を出力
 - [AccurateRip](https://www.accuraterip.com/) データベースとの照合 (チェックサム v1 / v2、confidence を表示)
 - AccurateRip を使ったドライブの読み取りオフセットの自動検出 (`cdreader offset`、`rip --offset auto`、Android は詳細設定)。
-  複数トラックが同じオフセットで一致したときだけ確定し、ドライブ (ベンダー・モデル・リビジョン) ごとに保存して次回から自動で適用
+  複数トラックが同じオフセットで一致したときだけ確定し (互いにずれた別プレスの登録が混在するディスクでは一致件数が十分に多いオフセットで確定)、ドライブ (ベンダー・モデル・リビジョン) ごとに保存して次回から自動で適用
 - CD-Extra (エンハンスド CD) のデータトラック・セッション間ギャップを考慮
 - CDDB (既定は [gnudb.org](https://gnudb.org/)) からアルバム名・アーティスト・曲名などを取得し、
   フォルダ名・ファイル名・`rip.log` に使用
@@ -480,13 +480,17 @@ Drive: HL-DT-ST BD-RE BP71N (1.03)
 Detecting the read offset with AccurateRip (offsets -3000..+3000)...
 Reading track 07 (2 of at most 3)  100%
 
-Read offset detection (AccurateRip disc id 039-..., 5 pressing(s), offsets -3000..+3000)
-  Track 12 (41 submissions): +6 v1+v2 (confidence 38)
-  Track 07 (40 submissions): +6 v2 (confidence 37)
-  Result: Read offset +6 (2 of 2 tracks agreed, v1+v2, confidence 75)
+Read offset detection (AccurateRip disc id 039-0032e455-0583f8e1-fb08ee27, 5 pressing(s), offsets -3000..+3000)
+  Track 12 (41 submissions): +6 v1+v2 (confidence 21, pressings 1+3), -145 v2 (confidence 13, pressing 2), -658 v2 (confidence 4, pressing 4)
+  Track 07 (40 submissions): +6 v1+v2 (confidence 20, pressings 1+3), -145 v2 (confidence 13, pressing 2), -658 v2 (confidence 4, pressing 4)
+  Shifted pressings, summed per offset: +6 v1+v2 confidence 41 (2 tracks, pressings 1+3), -145 v2 confidence 26 (2 tracks, pressing 2), -658 v2 confidence 8 (2 tracks, pressing 4)
+  Result: Read offset +6 (2 of 2 tracks agreed, v1+v2, confidence 41; also -145 (26), -658 (8): other pressings)
 
 Read offset: +6  (use: cdreader rip D: --offset 6; --save stores it for --offset auto)
+Other pressings' offsets: -145 (confidence 26), -658 (confidence 8); fewer submissions, not used
 ```
+
+(データベースに複数のプレスがあるディスクでは、一致したプレスの番号も表示します。)
 
 - **トラックの選び方**: データベースに登録のあるオーディオトラックのうち、ディスクの最初・最後のトラック
   (大きなオフセットでディスクの外にはみ出す) を避け、長さ 10 秒〜8 分のものを登録件数 (confidence) の多い順に最大 3 トラック読みます。
@@ -494,7 +498,15 @@ Read offset: +6  (use: cdreader rip D: --offset 6; --save stores it for --offset
 - **確定の条件**: 2 トラックが同じオフセットで一致した時点で確定します (多くの場合 2 トラックの読み取りで終わります)。
   - トラックごとに一致するオフセットが違う場合 (候補が割れた) は確定しません。
   - 一致したのが 1 トラックだけの場合、どのオフセットでも一致しない場合も確定しません。
-  - 読んだトラックがすべて同じ 2 つのオフセットで一致する場合 (互いにずれたプレスの登録が混在) も確定しません。
+  - **互いにずれたプレス**: よく売れた CD には、同じ音声が一定サンプル数ずれた別プレス (別の盤) の登録が混在していることがあり、
+    その場合はどのトラックも複数のオフセットで一致します (例: ドライブのオフセットが +6 のとき +6 / -145 / -658)。
+    読んだトラックがすべて同じオフセットの組で一致した場合 (あるオフセットがトラックで一致しないのは、そのオフセットで一致したプレスが
+    そのトラックの登録を持たないときだけ許します) は、候補の割れではなくプレスの違いとみなし、オフセットごとに一致件数
+    (confidence。1 トラックにつき各プレスを 1 回ずつ数え、別プレスの v1 と v2 の一致はどちらも加算) を読んだトラック全体で合計します。
+    最も多いオフセットが 2 番目の **1.5 倍以上**で、かつ 2 トラック以上で一致していれば確定します
+    (ドライブの本来のオフセットで読んだ人が最も多いはず、という判断です。上の例では +6 の 41 件に対し -145 は 26 件)。
+    差が小さい場合は最大 3 トラックまで読んで判定し直し、それでも差がなければ「判断できない」として確定しません。
+    確定した場合も、他のプレスのオフセットと件数を結果・`rip.log`・保存するメモに併記します (Android 版は「他のプレスの候補: -145, -658」)。
   - データベースに登録のあるトラックが 1 つしかないディスク (シングルなど) では、その 1 トラックの一致件数が 10 件以上のときだけ確定し、その旨を表示します。
   - ディスクが AccurateRip に登録されていない場合は「検出できない」と表示します。別の (よく売れた) CD で試してください。
 - `--save` を付けると、確定したオフセットを**ドライブ (ベンダー・モデル・リビジョン) ごと**に保存します。
@@ -512,7 +524,7 @@ Read offset: +6  (use: cdreader rip D: --offset 6; --save stores it for --offset
 - `rip.log` には補正値の出所が記録されます。その場で検出した場合は、読み取ったトラックごとの結果も記録されます:
 
 ```
-Read offset correction: +6 samples (auto-detected: 2 of 2 tracks agreed, v1+v2)
+Read offset correction: +6 samples (auto-detected: 2 of 2 tracks agreed, v1+v2; also -145 (26), -658 (8): other pressings)
 Read offset correction: +6 samples (saved for drive HL-DT-ST BD-RE BP71N (1.03); auto-detected: 2 of 2 tracks agreed, v1+v2)
 Read offset correction: 0 samples (manual)
 ```
@@ -879,9 +891,9 @@ Matroska (`cdreader_mka_tests`) は、EBML の可変長整数・各要素の符�
 (CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング、
 C2 付き読み取りの転送サイズ 24 × 2646 バイト) を検証します。
 `cdreader_rip_session_tests` は Android 版のリッピング処理 (`platform/android/rip_session.*`) を仮想 USB デバイスと偽の `HttpClient` で検証します
-(FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`、C2 の有効・無効・非対応・切り替えと `rip.log` の C2 の行、キャッシュ対策の設定・ディスクごとに 1 回の判定・`none` でコマンドを送らないこと・FUA から追い出しへの切り替えと `rip.log` の行、USB 経由のオフセット自動検出 (オフセット 0 で不一致 → 検出 → 検出値でのリッピングで全トラック一致)・照会失敗・未登録・キャンセルと `rip.log` のオフセットの出所の行、設定した CDDB サーバー・連絡先メールアドレスでの問い合わせと、hello を拒否されたときの `rip.log` の `Hint:` 行)。
+(FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`、C2 の有効・無効・非対応・切り替えと `rip.log` の C2 の行、キャッシュ対策の設定・ディスクごとに 1 回の判定・`none` でコマンドを送らないこと・FUA から追い出しへの切り替えと `rip.log` の行、USB 経由のオフセット自動検出 (オフセット 0 で不一致 → 検出 → 検出値でのリッピングで全トラック一致、互いにずれた 5 プレスの登録からの検出と `rip.log` の他プレスの候補)・照会失敗・未登録・キャンセルと `rip.log` のオフセットの出所の行、設定した CDDB サーバー・連絡先メールアドレスでの問い合わせと、hello を拒否されたときの `rip.log` の `Hint:` 行)。
 
-読み取りオフセットの自動検出 (#37) は、仮想ドライブと偽の AccurateRip データ (各トラックを指定のオフセットで読んだチェックサム) で、正のオフセット (+6, +667)・負のオフセット (-1164, -472)・v1 / v2、トラックの選び方 (中間・登録件数・長さ・`-t`)、候補が割れる場合、互いにずれたプレス、1 トラックだけ一致、一致なし、登録トラックが 1 つのディスク (件数による確定 / 保留)、未登録 (HTTP 404)・ネットワーク障害 (読み取りをしないこと)、キャンセルと進行状況、ディスクの最初・最後のトラックを ±3000 サンプルで端まで読むこと、保存形式の往復 (壊れた行の無視) と `rip.log` の行を検証します。
+読み取りオフセットの自動検出 (#37) は、仮想ドライブと偽の AccurateRip データ (各トラックを指定のオフセットで読んだチェックサム) で、正のオフセット (+6, +667)・負のオフセット (-1164, -472)・v1 / v2、トラックの選び方 (中間・登録件数・長さ・`-t`)、候補が割れる場合、互いにずれたプレス (5 プレスの登録で件数の合計による確定・件数が近いときの保留・プレスの登録がないトラック)、1 トラックだけ一致、一致なし、登録トラックが 1 つのディスク (件数による確定 / 保留)、未登録 (HTTP 404)・ネットワーク障害 (読み取りをしないこと)、キャンセルと進行状況、ディスクの最初・最後のトラックを ±3000 サンプルで端まで読むこと、保存形式の往復 (壊れた行の無視) と `rip.log` の行を検証します。
 
 ### Android アプリ
 
