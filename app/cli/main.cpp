@@ -3,7 +3,9 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -25,6 +27,7 @@
 #include "cdreader/cue_sheet.h"
 #include "cdreader/disc_image.h"
 #include "cdreader/drive_cache.h"
+#include "cdreader/drive_offset_db.h"
 #include "cdreader/file_naming.h"
 #include "cdreader/gaps.h"
 #include "cdreader/metadata.h"
@@ -94,6 +97,34 @@ void saveDriveOffset(const cdr::DriveInfo& info, const cdr::SavedDriveOffset& va
     writeTextFile(path, store.serialize());
     std::printf("Saved read offset %+d for %s in %s\n", value.offset, info.displayName().c_str(),
                 path.u8string().c_str());
+}
+
+// --- AccurateRip drive offset database (#37): DriveOffsets.bin, downloaded
+// again after 30 days (cdr::loadDriveOffsetDb()).
+fs::path driveOffsetDbPath() { return settingsDirectory() / L"DriveOffsets.bin"; }
+
+// The drive's entry: the stored file when fresh, otherwise downloaded with
+// `http` (null: only the stored file) and stored. Never throws.
+cdr::DriveOffsetDbMatch lookupDriveOffsetDb(cdr::HttpClient* http, const cdr::DriveInfo& info) {
+    const fs::path path = driveOffsetDbPath();
+    cdr::DriveOffsetDbCache cache;
+    std::error_code ec;
+    const fs::file_time_type written = fs::last_write_time(path, ec);
+    if (!ec) {
+        cache.bytes = readTextFile(path);
+        cache.present = !cache.bytes.empty();
+        cache.ageSeconds =
+            std::chrono::duration_cast<std::chrono::seconds>(fs::file_time_type::clock::now() - written).count();
+    }
+    const cdr::DriveOffsetDbLoad load = cdr::loadDriveOffsetDb(http, cache);
+    if (load.shouldStore()) {
+        try {
+            writeTextFile(path, load.bytes);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "Warning: %s\n", e.what());
+        }
+    }
+    return cdr::matchDriveOffsetDb(load, info);
 }
 
 // --- Settings (#38): settings.txt (key=value, cdr::SettingsStore) -------------------
@@ -205,6 +236,13 @@ void printUsage() {
         "  -r, --retries <n>     Retries per failing read (default: 5)\n"
         "      --save            Save a confirmed offset for this drive (used by\n"
         "                        rip --offset auto). Saved offsets: %s\n"
+        "      --choose <n>      Pressings shifted against each other without a clear\n"
+        "                        winner: use candidate offset <n> of the list the\n"
+        "                        detection prints (e.g. --choose +6); with --save it\n"
+        "                        is saved as selected by the user\n"
+        "  The AccurateRip drive offset database (DriveOffsets.bin, kept 30 days next\n"
+        "  to the saved offsets) decides between such candidates when it lists one of\n"
+        "  them for this drive.\n"
         "\n"
         "CDDB options (rip, toc and cddb-test; they override the saved settings):\n"
         "      --no-cddb         Do not look up the disc online\n"
@@ -466,6 +504,7 @@ void printToc(const cdr::Toc& toc, const cdr::AlbumMetadata& album, const cdr::D
 int cmdDrives() {
     const std::vector<char> letters = cdr::win::listOpticalDrives();
     const cdr::DriveOffsetStore offsets = loadOffsetStore();
+    const bool haveDb = fs::exists(driveOffsetDbPath());
     if (letters.empty()) {
         std::printf("No optical drives found.\n");
         return 1;
@@ -483,8 +522,14 @@ int cmdDrives() {
                 saved ? ", saved read offset " + std::string(saved->offset > 0 ? "+" : "") +
                             std::to_string(saved->offset)
                       : "";
-            std::printf("%c:  %s  [%s, %s%s]\n", letter, d.info.displayName().c_str(),
-                        cdr::checkC2(caps, true).logLine().c_str(), cache.c_str(), offset.c_str());
+            // The drive database only from the stored file (no download here).
+            std::string db;
+            if (haveDb) {
+                const cdr::DriveOffsetDbMatch m = lookupDriveOffsetDb(nullptr, d.info);
+                if (m.found()) db = ", AccurateRip drive database " + m.entry.describe();
+            }
+            std::printf("%c:  %s  [%s, %s%s%s]\n", letter, d.info.displayName().c_str(),
+                        cdr::checkC2(caps, true).logLine().c_str(), cache.c_str(), offset.c_str(), db.c_str());
         } catch (const std::exception& e) {
             std::printf("%c:  (%s)\n", letter, e.what());
         }
@@ -530,7 +575,11 @@ int cmdOffsets() {
 
 // Runs the offset detection with a progress line on the console. Never
 // throws for network or read problems (see the status).
-cdr::OffsetDetection detectOffset(cdr::CdDrive& drive, const cdr::Toc& toc, cdr::OffsetDetectOptions options) {
+cdr::OffsetDetection detectOffset(cdr::CdDrive& drive, const cdr::DriveInfo& info, const cdr::Toc& toc,
+                                  cdr::OffsetDetectOptions options) {
+    cdr::win::WinHttpClient http(std::string("cdreader/") + kVersion);
+    options.driveDatabase = lookupDriveOffsetDb(&http, info);
+    std::printf("%s\n", options.driveDatabase.logLine().c_str());
     std::printf("Detecting the read offset with AccurateRip (offsets -%u..+%u)...\n", options.maxOffset,
                 options.maxOffset);
     std::fflush(stdout);
@@ -544,13 +593,31 @@ cdr::OffsetDetection detectOffset(cdr::CdDrive& drive, const cdr::Toc& toc, cdr:
         lastPercent = percent;
         lastStep = p.step;
     };
-    cdr::win::WinHttpClient http(std::string("cdreader/") + kVersion);
     const cdr::OffsetDetection d = cdr::detectReadOffset(drive, toc, http, options);
     if (lastStep) std::printf("\n");
     return d;
 }
 
 std::string driveNote(const cdr::OffsetDetection& d) { return "auto-detected: " + d.agreement(); }
+
+std::string signedText(int v) { return (v > 0 ? "+" : "") + std::to_string(v); }
+
+// Shifted pressings: the numbered list of candidates (offset, tracks,
+// summed confidence, pressings, the drive database's).
+void printCandidates(const cdr::OffsetDetection& d) {
+    const std::vector<cdr::OffsetCandidate> all = d.allCandidates();
+    if (all.empty()) return;
+    std::printf("\nCandidates (pressings shifted against each other):\n");
+    for (size_t i = 0; i < all.size(); ++i) {
+        const cdr::OffsetCandidate& c = all[i];
+        std::string pressings;
+        for (int p : c.pressings) pressings += (pressings.empty() ? "" : "+") + std::to_string(p);
+        if (!pressings.empty()) pressings = (c.pressings.size() == 1 ? ", pressing " : ", pressings ") + pressings;
+        const bool db = d.driveDatabase.found() && d.driveDatabase.entry.offset == c.offset;
+        std::printf("  %d. %+5d  %d track%s, confidence %d%s%s\n", int(i + 1), c.offset, c.tracks,
+                    c.tracks == 1 ? "" : "s", c.score(), pressings.c_str(), db ? "  <- AccurateRip drive database" : "");
+    }
+}
 
 struct ArTrack {
     cdr::Track track;
@@ -721,18 +788,36 @@ int cmdRip(const std::vector<std::string>& args) {
         } else {
             cdr::OffsetDetectOptions detect;
             detect.rip.maxRetries = options.maxRetries;
-            const cdr::OffsetDetection found = detectOffset(*d.drive, toc, detect);
+            const cdr::OffsetDetection found = detectOffset(*d.drive, d.info, toc, detect);
             for (const std::string& l : found.logLines()) std::printf("%s\n", l.c_str());
-            if (!found.detected())
+            if (!found.detected()) {
+                if (found.status == cdr::OffsetDetection::Status::Ambiguous && !found.allCandidates().empty()) {
+                    printCandidates(found);
+                    throw std::runtime_error(std::string("--offset auto: the disc's pressings do not tell the "
+                                                         "offset. Pick one: 'cdreader offset ") +
+                                             letter + ": --save --choose <offset>', then rip with --offset auto; "
+                                             "or rip with --offset <n>.");
+                }
                 throw std::runtime_error("--offset auto: the read offset of this drive could not be detected with "
                                          "this disc. Rip with --offset <n>, or try 'cdreader offset' with another "
                                          "(popular) disc.");
+            }
             options.readOffsetSamples = found.offset;
             offsetSource.kind = cdr::ReadOffsetSource::Kind::Detected;
             offsetSource.detail = found.agreement();
             detectionLog = found.logLines();
             saveDriveOffset(d.info, {found.offset, driveNote(found)});
         }
+    }
+
+    // The drive database's offset for rip.log (#37); online only with AccurateRip enabled.
+    cdr::DriveOffsetDbMatch driveDb;
+    if (detectionLog.empty()) {
+        cdr::win::WinHttpClient http(std::string("cdreader/") + kVersion);
+        driveDb = lookupDriveOffsetDb(accurateRip ? &http : nullptr, d.info);
+        if (driveDb.found() && driveDb.entry.offset != options.readOffsetSamples)
+            std::printf("Note: the AccurateRip drive database lists %s for this drive.\n",
+                        driveDb.entry.describe().c_str());
     }
 
     // C2 error pointers (#33): only for drives that report them.
@@ -824,6 +909,8 @@ int cmdRip(const std::vector<std::string>& args) {
         << "\n"
         << cdr::readOffsetLogLine(options.readOffsetSamples, offsetSource) << "\n";
     for (const std::string& l : detectionLog) log << l << "\n";
+    if (driveDb.status != cdr::DriveOffsetDbMatch::Status::NotChecked)
+        log << driveDb.logLine(options.readOffsetSamples) << "\n";
     log << "Format: " << format << "\n";
     if (!encoderText.empty()) log << "Encoder: " << encoderText << "\n";
     log << "\n";
@@ -948,6 +1035,8 @@ int cmdOffset(const std::vector<std::string>& args) {
     const char letter = parseDriveLetter(args[1]);
     int range = 3000;
     bool save = false;
+    bool choose = false;
+    int chosen = 0;
     cdr::OffsetDetectOptions options;
     for (size_t i = 2; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -971,6 +1060,10 @@ int cmdOffset(const std::vector<std::string>& args) {
         else if (a == "--range") range = parseInt(value(), "offset range");
         else if (a == "-r" || a == "--retries") options.rip.maxRetries = parseInt(value(), "retry count");
         else if (a == "--save") save = true;
+        else if (a == "--choose") {
+            choose = true;
+            chosen = parseSignedInt(value(), "candidate offset");
+        }
         else throw UsageError("unknown option '" + a + "'");
     }
     if (range < 1 || range > int(100 * cdr::kSamplesPerSector)) throw UsageError("offset range out of range");
@@ -993,22 +1086,37 @@ int cmdOffset(const std::vector<std::string>& args) {
         std::printf("Saved read offset for this drive: %+d%s%s\n", saved->offset, saved->note.empty() ? "" : "  ",
                     saved->note.c_str());
 
-    const cdr::OffsetDetection found = detectOffset(*d.drive, toc, options);
+    const cdr::OffsetDetection found = detectOffset(*d.drive, d.info, toc, options);
     std::printf("\n");
     for (const std::string& l : found.logLines()) std::printf("%s\n", l.c_str());
+    printCandidates(found);
+    const std::vector<cdr::OffsetCandidate> all = found.allCandidates();
+    const bool ambiguous = found.status == cdr::OffsetDetection::Status::Ambiguous && !all.empty();
+    if (choose) {
+        // Pick one of the candidates by hand (#37): only among the offsets every track matched at.
+        const bool known = std::any_of(all.begin(), all.end(), [&](const cdr::OffsetCandidate& c) {
+            return c.offset == chosen;
+        });
+        if (!(ambiguous || found.detected()) || !known) {
+            std::printf("\n--choose %s: not a candidate of this detection%s\n", signedText(chosen).c_str(),
+                        save ? "; nothing saved." : ".");
+            return 1;
+        }
+        std::printf("\nRead offset: %+d, selected from the candidates (use: cdreader rip %c: --offset %d%s)\n",
+                    chosen, letter, chosen, save ? ", or --offset auto" : "; --save stores it for --offset auto");
+        if (save) saveDriveOffset(d.info, {chosen, found.selectionNote()});
+        return 0;
+    }
     if (!found.detected()) {
+        if (ambiguous)
+            std::printf("\nChoose the offset by hand: cdreader offset %c: --save --choose <offset>\n"
+                        "(e.g. --choose %s; a rip whose tracks then match AccurateRip confirms it)\n",
+                        letter, signedText(all.front().offset).c_str());
         if (save) std::printf("Nothing saved.\n");
         return 1;
     }
     std::printf("\nRead offset: %+d  (use: cdreader rip %c: --offset %d%s)\n", found.offset, letter, found.offset,
                 save ? ", or --offset auto" : "; --save stores it for --offset auto");
-    if (!found.alternatives.empty()) {
-        std::string others;
-        for (const cdr::OffsetCandidate& c : found.alternatives)
-            others += (others.empty() ? "" : ", ") + std::string(c.offset > 0 ? "+" : "") + std::to_string(c.offset) +
-                      " (confidence " + std::to_string(c.score()) + ")";
-        std::printf("Other pressings' offsets: %s; fewer submissions, not used\n", others.c_str());
-    }
     if (save) saveDriveOffset(d.info, {found.offset, driveNote(found)});
     return 0;
 }

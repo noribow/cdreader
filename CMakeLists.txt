@@ -41,6 +41,7 @@ add_library(cdreader_core STATIC
   core/src/cue_sheet.cpp
   core/src/disc_image.cpp
   core/src/drive_cache.cpp
+  core/src/drive_offset_db.cpp
   core/src/file_naming.cpp
   core/src/flac_encoder.cpp
   core/src/flac_writer.cpp

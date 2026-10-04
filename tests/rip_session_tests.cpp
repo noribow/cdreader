@@ -142,12 +142,17 @@ cdr::HttpResponse reply(int status, const std::string& body) {
 struct FakeHttp : cdr::HttpClient {
     std::map<std::string, cdr::HttpResponse> cddb;
     cdr::HttpResponse accurateRip;
+    cdr::HttpResponse driveOffsets;  // DriveOffsets.bin (#37)
     std::vector<std::string> urls;
 
-    FakeHttp() { accurateRip.error = "no route"; }
+    FakeHttp() {
+        accurateRip.error = "no route";
+        driveOffsets.error = "no route";
+    }
 
     cdr::HttpResponse get(const std::string& url) override {
         urls.push_back(url);
+        if (contains(url, "DriveOffsets.bin")) return driveOffsets;
         if (contains(url, "accuraterip.com")) return accurateRip;
         const size_t cmd = url.find("cmd=");
         if (cmd != std::string::npos) {
@@ -162,7 +167,12 @@ struct FakeHttp : cdr::HttpClient {
     }
 
     int accurateRipRequests() const {
-        return int(std::count_if(urls.begin(), urls.end(), [](const std::string& u) { return contains(u, "accuraterip.com"); }));
+        return int(std::count_if(urls.begin(), urls.end(), [](const std::string& u) {
+            return contains(u, "accuraterip.com") && !contains(u, "DriveOffsets.bin");
+        }));
+    }
+    int driveOffsetRequests() const {
+        return int(std::count_if(urls.begin(), urls.end(), [](const std::string& u) { return contains(u, "DriveOffsets.bin"); }));
     }
 };
 
@@ -1205,6 +1215,153 @@ TEST(offset_detection_over_usb_shifted_pressings) {
                         "pressings 4+5)\n"));
     CHECK(contains(log, "\n  Result: Read offset +6 (2 of 2 tracks agreed, v1+v2, confidence 42; also -145 (26), "
                         "-658 (14): other pressings)\n"));
+}
+
+// --- AccurateRip drive offset database over USB (#37) ------------------------------
+
+namespace {
+
+// One DriveOffsets.bin record (see cdreader/drive_offset_db.h).
+std::string driveRecord(int offset, const std::string& name, int32_t submissions, int32_t percent = 100) {
+    std::string r;
+    r.push_back(char(uint8_t(offset & 0xff)));
+    r.push_back(char(uint8_t((offset >> 8) & 0xff)));
+    std::string n = name;
+    n.resize(33, '\0');
+    r += n;
+    for (int32_t v : {submissions, percent})
+        for (int i = 0; i < 4; ++i) r.push_back(char(uint8_t(uint32_t(v) >> (8 * i))));
+    r.resize(69, '\0');
+    return r;
+}
+
+// The disc of the real-device report: per track +6 has 14 (v2) + 7 (v1)
+// submissions, -145 17, -658 4 + 3: submissions alone do not decide.
+std::string ambiguousDbar(const cdr::AccurateRipDiscId& id) {
+    std::vector<std::vector<std::pair<uint8_t, uint32_t>>> pressings(5);
+    for (int n = 1; n <= 3; ++n) {
+        const Reference own = referenceRip(n, 6), p2 = referenceRip(n, -145), p4 = referenceRip(n, -658);
+        pressings[0].push_back({14, own.v2});
+        pressings[1].push_back({17, p2.v2});
+        pressings[2].push_back({7, own.v1});
+        pressings[3].push_back({4, p4.v2});
+        pressings[4].push_back({3, p4.v1});
+    }
+    return dbar(id, pressings);
+}
+
+std::string fileText(const fs::path& path) {
+    const std::vector<uint8_t> bytes = readFile(path);
+    return std::string(bytes.begin(), bytes.end());
+}
+
+}  // namespace
+
+TEST(offset_detection_over_usb_drive_database) {
+    Rig rig;
+    FakeHttp http;
+    TempDir dir;
+    const fs::path cache = dir.path / "cache" / "DriveOffsets.bin";
+    rig.session.setDriveOffsetDbCache(cache);
+    http.accurateRip = reply(200, ambiguousDbar(cdr::AccurateRipDiscId::fromToc(rig.session.toc())));
+    cdr::OffsetDetectOptions options;
+    options.minTrackSectors = 0;
+
+    // The drive database cannot be downloaded: ambiguous as before, and said so.
+    const cdr::OffsetDetection* d = &rig.session.detectReadOffset(&http, options);
+    CHECK(d->status == cdr::OffsetDetection::Status::Ambiguous);
+    CHECK(d->driveDatabase.status == cdr::DriveOffsetDbMatch::Status::Unavailable);
+    CHECK(contains(d->summary(), "The AccurateRip drive database is unavailable (no route)."));
+    CHECK_STR(d->candidateList(), "+6, -145, -658");
+    CHECK(!fs::exists(cache));
+    CHECK_EQ(http.driveOffsetRequests(), 1);
+
+    // Downloaded: it lists +6 for "FAKE - CD-ROM DRIVE" (and other drives); stored for later.
+    const std::string file = driveRecord(667, "HL-DT-ST - BD-RE  BH16NS40", 2400) +
+                             driveRecord(6, "FAKE - CD-ROM  DRIVE", 1234) + driveRecord(30, "FAKE - CD-ROM DRIVE", 2);
+    http.driveOffsets = reply(200, file);
+    d = &rig.session.detectReadOffset(&http, options);
+    CHECK(d->detected());
+    CHECK_EQ(d->offset, 6);
+    CHECK(d->decidedByDriveDatabase);
+    CHECK(d->matchesDriveDatabase());
+    CHECK_STR(d->driveDatabase.entry.name, "FAKE - CD-ROM  DRIVE");
+    CHECK_EQ(http.driveOffsetRequests(), 2);
+    CHECK(fs::exists(cache) && fileText(cache) == file);
+    CHECK(!fs::exists(fs::path(cache).concat(".tmp")));
+    CHECK(rig.session.driveOffsetDb().found());
+
+    // Rip with it: rip.log carries the detection and the database line.
+    cdr::RipSettings s = settings("wav", d->offset);
+    s.offsetSource.kind = cdr::ReadOffsetSource::Kind::Detected;
+    s.offsetSource.detail = d->agreement();
+    rig.session.beginRip(s);
+    for (int n = 1; n <= 3; ++n) rig.session.ripTrack(n, dir.path / "t.wav");
+    CHECK_EQ(rig.session.checkAccurateRip(&http).accurateTracks(), 3);
+    std::string log = rig.session.ripLog();
+    CHECK(contains(log, "\nRead offset correction: +6 samples (auto-detected: 1 of 1 track agreed, v1+v2, matches "
+                        "AccurateRip drive database (1234 submissions); also -145 (17), -658 (7): other pressings)\n"));
+    CHECK(contains(log, "\n  AccurateRip drive database: +6 (1234 submissions, 100% agree)\n"));
+    CHECK(contains(log, "\n  Confirmed by the AccurateRip drive database, which lists +6 for this drive\n"));
+    CHECK(contains(log, "\nAccurateRip drive database: +6 (1234 submissions, 100% agree)\nFormat: wav\n"));
+
+    // Fresh in the cache: not downloaded again (the server would fail now).
+    http.driveOffsets = reply(500, "");
+    d = &rig.session.detectReadOffset(&http, options);
+    CHECK(d->detected());
+    CHECK_EQ(http.driveOffsetRequests(), 2);
+    // Without a client the stored file is used as well.
+    CHECK(rig.session.lookupDriveOffsetDb(nullptr).found());
+
+    // Older than 30 days: downloaded again; a failure keeps using the stored file.
+    const auto old = fs::file_time_type::clock::now() - std::chrono::hours(24 * 40);
+    fs::last_write_time(cache, old);
+    d = &rig.session.detectReadOffset(&http, options);
+    CHECK_EQ(http.driveOffsetRequests(), 3);
+    CHECK(d->detected());
+    CHECK(d->decidedByDriveDatabase);
+    CHECK(fileText(cache) == file);
+    // A new file replaces it; this one does not list the drive: ambiguous again.
+    const std::string other = driveRecord(667, "HL-DT-ST - BD-RE  BH16NS40", 2400);
+    http.driveOffsets = reply(200, other);
+    d = &rig.session.detectReadOffset(&http, options);
+    CHECK_EQ(http.driveOffsetRequests(), 4);
+    CHECK(fileText(cache) == other);
+    CHECK(d->status == cdr::OffsetDetection::Status::Ambiguous);
+    CHECK(d->driveDatabase.status == cdr::DriveOffsetDbMatch::Status::NotListed);
+    CHECK(contains(d->summary(), "The AccurateRip drive database has no entry for this drive."));
+
+    // The user picks a candidate (the app's dialog): rip.log names the choice and the candidates.
+    const std::vector<cdr::OffsetCandidate> all = d->allCandidates();
+    CHECK_EQ(all.size(), 3u);
+    CHECK(all.size() == 3 && all[0].offset == 6 && all[1].offset == -145 && all[2].offset == -658);
+    CHECK_STR(d->selectionNote(), "selected by user from candidates +6, -145, -658");
+    s = settings("wav", 6);
+    s.offsetSource.kind = cdr::ReadOffsetSource::Kind::Selected;
+    s.offsetSource.detail = d->candidateList();
+    rig.session.beginRip(s);
+    rig.session.ripTrack(2, dir.path / "t.wav");
+    log = rig.session.ripLog();
+    CHECK(contains(log, "\nRead offset correction: +6 samples (selected by user from candidates +6, -145, -658)\n"));
+    CHECK(contains(log, "\nRead offset detection (AccurateRip disc id "));
+    CHECK(contains(log, "\nAccurateRip drive database: drive not listed\n"));
+
+    // A manual offset that differs from the database's: noted in rip.log.
+    http.driveOffsets = reply(200, file);
+    fs::last_write_time(cache, old);
+    CHECK(rig.session.lookupDriveOffsetDb(&http).found());
+    rig.session.beginRip(settings("wav", 0));
+    rig.session.ripTrack(2, dir.path / "t.wav");
+    log = rig.session.ripLog();
+    CHECK(contains(log, "\nRead offset correction: 0 samples (manual)\n"));
+    CHECK(contains(log, "\nAccurateRip drive database: +6 (1234 submissions, 100% agree); differs from the read "
+                        "offset used\n"));
+    CHECK(!contains(log, "Read offset detection"));
+
+    // Without a cache file set nothing is stored, the lookup still works.
+    Rig plain;
+    CHECK(plain.session.lookupDriveOffsetDb(&http).found());
+    CHECK(plain.session.lookupDriveOffsetDb(nullptr).status == cdr::DriveOffsetDbMatch::Status::Unavailable);
 }
 
 TEST(offset_detection_over_usb_failures_and_cancel) {

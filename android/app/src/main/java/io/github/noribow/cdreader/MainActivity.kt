@@ -73,6 +73,8 @@ class MainActivity : Activity() {
         // Detected read offsets per drive model (#37): key = DriveInfo.offsetKey.
         const val DRIVE_OFFSETS = "driveOffsets"
         const val DRIVE_OFFSET_NOTES = "driveOffsetNotes"
+        // AccurateRip drive offset database (#37), in cacheDir; refreshed after 30 days.
+        const val DRIVE_OFFSET_DB_FILE = "DriveOffsets.bin"
         const val MAX_RETRIES = 5
         const val READY_WAIT_SECONDS = 30
         const val USER_AGENT = "cdreader/0.1.0 (Android)"
@@ -140,6 +142,8 @@ class MainActivity : Activity() {
     // UI thread state.
     private var driveName = ""
     private var driveInfo: DriveInfo? = null
+    // The drive's entry in the AccurateRip drive offset database, if known (#37).
+    private var driveDb: DriveOffsetDb? = null
     // Where the value in editOffset came from (#37); a manual edit makes it MANUAL.
     private var offsetSource = OffsetSource.MANUAL
     private var offsetDetail = ""
@@ -390,9 +394,13 @@ class MainActivity : Activity() {
                 )
                 synchronized(sessionLock) { session = s }
                 val info = s.driveInfo()
+                // AccurateRip drive offset database (#37): only the stored copy here, no network.
+                s.setDriveOffsetDbCache(File(cacheDir, DRIVE_OFFSET_DB_FILE))
+                val db = runCatching { s.lookupDriveOffsetDb(null) }.getOrNull()
                 runOnUiThread {
                     driveName = info.displayName
                     driveInfo = info
+                    driveDb = db
                     askedOffset = false
                     textDrive.text = info.displayName
                     applySavedOffset()
@@ -575,6 +583,8 @@ class MainActivity : Activity() {
                 val image = if (singleFile) imageNamesOrExplain(s, format, selected) else null
                 if (image != null) checkImageSpace(disc, selected, image, format)
                 if (cacheMode == CacheMode.AUTO) runOnUiThread { setStatus("ドライブのキャッシュを確認しています…") }
+                // The drive database's offset for rip.log (#37); online only with AccurateRip enabled.
+                runCatching { s.lookupDriveOffsetDb(if (accurateRip) http else null) }
                 s.beginRip(format, offset, MAX_RETRIES, verify, useC2, cacheMode, source, sourceDetail)
                 val ripped = mutableListOf<Pair<Int, RipResult>>()
                 var imageResult: ImageResult? = null
@@ -764,12 +774,23 @@ class MainActivity : Activity() {
         if (saved != null) {
             val note = driveOffsetNotePrefs().getString(info.offsetKey, "").orEmpty()
             val detail = info.displayName + if (note.isEmpty()) "" else "; $note"
-            setOffsetField(saved, OffsetSource.SAVED, detail, "(ドライブ ${info.product} の保存値)")
+            setOffsetField(saved, OffsetSource.SAVED, detail, "(ドライブ ${info.product} の保存値)" + driveDbLabel(saved))
         } else if (offsetSource != OffsetSource.MANUAL) {
             // The value of another drive: back to the app-wide manual value.
             val manual = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(PREF_OFFSET, 0)
-            setOffsetField(manual, OffsetSource.MANUAL, "", "")
+            setOffsetField(manual, OffsetSource.MANUAL, "", driveDbLabel(manual).trim())
+        } else {
+            showOffsetSource(driveDbLabel(editOffset.text.toString().trim().toIntOrNull()).trim())
         }
+    }
+
+    /** " (AccurateRip ドライブ DB: +6, 1234 件)" when the stored database lists the drive, else "". */
+    private fun driveDbLabel(current: Int?): String {
+        val db = driveDb ?: return ""
+        if (db.status != DriveDbStatus.FOUND) return ""
+        val count = if (db.submissions >= 0) ", ${db.submissions} 件" else ""
+        val differs = if (current != null && current != db.offset) " — 現在の値と異なります" else ""
+        return " (AccurateRip ドライブ DB: %+d%s)%s".format(db.offset, count, differs)
     }
 
     private fun suggestOffsetDetection() {
@@ -820,21 +841,35 @@ class MainActivity : Activity() {
 
     private fun finishDetection(info: DriveInfo, d: OffsetDetection, thenRip: Boolean) {
         if (driveInfo?.offsetKey != info.offsetKey) return  // the drive was unplugged meanwhile
+        // Detection consulted the drive offset database (online): keep its answer for the label.
+        if (d.driveDbStatus == DriveDbStatus.FOUND || driveDb?.status != DriveDbStatus.FOUND)
+            if (d.driveDbStatus != DriveDbStatus.NOT_CHECKED)
+                driveDb = DriveOffsetDb(d.driveDbStatus, d.driveDbOffset, d.driveDbSubmissions, -1, "", d.driveDbLogLine)
         if (d.status == OffsetDetectStatus.DETECTED) {
-            val agreed = "${d.agreeingTracks}/${d.testedTracks} トラック一致, ${d.version}"
+            val db = if (d.matchesDriveDb) ", ドライブ DB と一致" else ""
+            val agreed = "${d.agreeingTracks}/${d.testedTracks} トラック一致, ${d.version}$db"
             setOffsetField(d.offset, OffsetSource.DETECTED, d.agreement, "(自動検出: $agreed)")
             saveOffset(info, d.offset, "auto-detected: ${d.agreement}")
-            val single = if (d.singleTrack) " 登録トラックが 1 つだけのディスクのため、別の CD でも確認することをおすすめします。" else ""
+            val single = if (d.singleTrack && !d.matchesDriveDb)
+                " 登録トラックが 1 つだけのディスクのため、別の CD でも確認することをおすすめします。" else ""
             val others = if (d.alternatives.isEmpty()) "" else
                 " 他のプレスの候補: ${d.alternatives.joinToString(", ") { "%+d".format(it.offset) }}"
-            setStatus("オフセット %+d を検出しました (%s)。ドライブ %s の値として保存しました。%s%s".format(
-                d.offset, agreed, info.product, single, others
+            val decided = if (d.decidedByDriveDb)
+                " AccurateRip のドライブ DB の登録値%sと一致したため確定しました。"
+                    .format(if (d.driveDbSubmissions >= 0) " (${d.driveDbSubmissions} 件)" else "")
+            else ""
+            setStatus("オフセット %+d を検出しました (%s)。ドライブ %s の値として保存しました。%s%s%s".format(
+                d.offset, agreed, info.product, decided, single, others
             ))
             if (thenRip) startRip(askOffset = false)
             return
         }
         val message = describeDetectionFailure(d)
         setStatus(message)
+        if (d.status == OffsetDetectStatus.AMBIGUOUS && d.allCandidates.isNotEmpty()) {
+            chooseOffsetCandidate(info, d, message, thenRip)
+            return
+        }
         if (thenRip && d.status != OffsetDetectStatus.CANCELLED) {
             AlertDialog.Builder(this)
                 .setTitle("オフセットを検出できませんでした")
@@ -845,7 +880,54 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun describeDetectionFailure(d: OffsetDetection): String = when (d.status) {
+    /**
+     * Ambiguous detection (#37): the candidates as a list to pick from. The
+     * chosen offset is applied and saved for the drive ("selected by user from
+     * candidates ...").
+     */
+    private fun chooseOffsetCandidate(info: DriveInfo, d: OffsetDetection, message: String, thenRip: Boolean) {
+        val dbFound = d.driveDbStatus == DriveDbStatus.FOUND
+        val items = d.allCandidates.map { c ->
+            val pressings = if (c.pressings.isEmpty()) "" else ", プレス ${c.pressings.joinToString("+")}"
+            val marker = if (dbFound && c.offset == d.driveDbOffset) "  ★ドライブ DB の登録値" else ""
+            "%+d: %d トラック一致, 登録 %d 件%s%s".format(c.offset, c.tracks, c.confidence, pressings, marker)
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("オフセットの候補から選択")
+            .setItems(items) { _, which ->
+                val chosen = d.allCandidates[which].offset
+                if (driveInfo?.offsetKey != info.offsetKey) return@setItems
+                setOffsetField(chosen, OffsetSource.SELECTED, d.candidateList, "(候補から選択)")
+                saveOffset(info, chosen, d.selectionNote)
+                setStatus("オフセット %+d を選択し、ドライブ %s の値として保存しました".format(chosen, info.product))
+                if (thenRip) startRip(askOffset = false)
+            }
+            .setNegativeButton(if (thenRip) "選ばずにリッピング" else "選ばない") { _, _ ->
+                if (thenRip) startRip(askOffset = false)
+            }
+            .show()
+        // The explanation stays in the status line (a list dialog shows no message).
+        setStatus("$message\n候補から正しいと思うオフセットを選んでください (同じドライブで別の CD を検出すると確定できることがあります)")
+    }
+
+    /** What the AccurateRip drive database says when detection did not confirm an offset. */
+    private fun driveDbNote(d: OffsetDetection): String = when (d.driveDbStatus) {
+        DriveDbStatus.FOUND -> {
+            val found = d.allCandidates.any { it.offset == d.driveDbOffset } || d.candidates.contains(d.driveDbOffset) ||
+                (d.agreeingTracks > 0 && d.offset == d.driveDbOffset)
+            if (found) "" else "\nAccurateRip のドライブ DB の登録値は %+d%s ですが、候補に含まれていません".format(
+                d.driveDbOffset, if (d.driveDbSubmissions >= 0) " (${d.driveDbSubmissions} 件)" else ""
+            )
+        }
+        DriveDbStatus.NOT_LISTED -> "\nAccurateRip のドライブ DB にこのドライブの登録はありません"
+        DriveDbStatus.UNAVAILABLE -> "\nAccurateRip のドライブ DB を取得できませんでした"
+        DriveDbStatus.NOT_CHECKED -> ""
+    }
+
+    private fun describeDetectionFailure(d: OffsetDetection): String =
+        describeDetectionStatus(d) + if (d.status == OffsetDetectStatus.CANCELLED) "" else driveDbNote(d)
+
+    private fun describeDetectionStatus(d: OffsetDetection): String = when (d.status) {
         OffsetDetectStatus.DETECTED -> d.summary
         OffsetDetectStatus.NOT_IN_DATABASE ->
             "このディスクは AccurateRip に登録されていないため、オフセットを検出できません。よく知られた別の CD で試してください"
@@ -867,7 +949,7 @@ class MainActivity : Activity() {
         OffsetDetectStatus.CANCELLED -> "オフセットの検出を中止しました"
         OffsetDetectStatus.AMBIGUOUS ->
             ("どのトラックも同じ複数のオフセットで一致しました (互いにずれた別プレスの登録)。" +
-                "登録件数に十分な差がないため確定できません (候補: %s)。別の CD で試してください")
+                "登録件数に十分な差がないため確定できません (候補: %s)")
                 .format(
                     (listOf(OffsetAlternative(d.offset, d.confidence)) + d.alternatives)
                         .joinToString(", ") { "%+d (%d 件)".format(it.offset, it.confidence) }
