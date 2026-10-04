@@ -264,8 +264,11 @@ std::string OffsetDetection::agreement() const {
 }
 
 std::string OffsetDetection::summary() const {
-    if (status == Status::Detected || status == Status::Cancelled) return summaryCore();
-    return summaryCore() + driveDatabaseNote(*this);
+    std::string s = summaryCore();
+    if (status == Status::Detected || status == Status::Cancelled) return s;
+    const std::string note = driveDatabaseNote(*this);
+    if (!note.empty() && !s.empty() && s.back() != '.') s += '.';
+    return s + note;
 }
 
 std::string OffsetDetection::summaryCore() const {
@@ -358,8 +361,8 @@ std::vector<std::string> OffsetDetection::logLines() const {
                         ", but the AccurateRip drive database lists " + signedNumber(offset) +
                         ", which every track read matches as well: using " + signedNumber(offset));
     else if (decidedByDriveDatabase)
-        lines.push_back("  Submissions alone do not decide; " + signedNumber(offset) +
-                        " is the AccurateRip drive database's offset for this drive");
+        lines.push_back("  Confirmed by the AccurateRip drive database, which lists " + signedNumber(offset) +
+                        " for this drive");
     lines.push_back("  Result: " + summary());
     return lines;
 }

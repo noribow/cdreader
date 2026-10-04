@@ -851,7 +851,7 @@ class MainActivity : Activity() {
             val others = if (d.alternatives.isEmpty()) "" else
                 " 他のプレスの候補: ${d.alternatives.joinToString(", ") { "%+d".format(it.offset) }}"
             val decided = if (d.decidedByDriveDb)
-                " 登録件数だけでは決まらないため、AccurateRip のドライブ DB の登録値%sで確定しました。"
+                " AccurateRip のドライブ DB の登録値%sと一致したため確定しました。"
                     .format(if (d.driveDbSubmissions >= 0) " (${d.driveDbSubmissions} 件)" else "")
             else ""
             setStatus("オフセット %+d を検出しました (%s)。ドライブ %s の値として保存しました。%s%s%s".format(

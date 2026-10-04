@@ -27,6 +27,7 @@
 #include "cdreader/cue_sheet.h"
 #include "cdreader/disc_image.h"
 #include "cdreader/drive_cache.h"
+#include "cdreader/drive_offset_db.h"
 #include "cdreader/file_naming.h"
 #include "cdreader/flac_encoder.h"
 #include "cdreader/flac_writer.h"
@@ -2071,6 +2072,385 @@ TEST(offset_detect_cancel_and_progress) {
         thrown = true;
     }
     CHECK(thrown);
+}
+
+// --- AccurateRip drive offset database (#37) ---------------------------------------
+
+namespace {
+
+// One DriveOffsets.bin record: int16 offset, 33-byte name, int32 submissions,
+// int32 percentage, padding to 69 bytes.
+std::string driveRecord(int offset, const std::string& name, int32_t submissions = 100, int32_t percent = 100) {
+    std::string r;
+    r.push_back(char(uint8_t(offset & 0xff)));
+    r.push_back(char(uint8_t((offset >> 8) & 0xff)));
+    std::string n = name.substr(0, cdr::kDriveOffsetNameSize);
+    n.resize(cdr::kDriveOffsetNameSize, '\0');
+    r += n;
+    for (int32_t v : {submissions, percent})
+        for (int i = 0; i < 4; ++i) r.push_back(char(uint8_t(uint32_t(v) >> (8 * i))));
+    r.resize(cdr::kDriveOffsetRecordSize, '\0');
+    return r;
+}
+
+std::string driveOffsetFile() {
+    return driveRecord(667, "HL-DT-ST - BD-RE  BH16NS40", 2400, 99) + driveRecord(6, "HL-DT-ST - BD-RE  BP71N", 1234, 100) +
+           driveRecord(-472, "PLEXTOR - DVDR   PX-716A", 3000, 98) + driveRecord(48, "TSSTcorp - CDDVDW SH-224DB", 7, 100) +
+           driveRecord(1, "HL-DT-ST - BD-RE  BP71N", 3, 66);  // a second, smaller entry for the same name
+}
+
+cdr::DriveInfo bp71n() {
+    cdr::DriveInfo info;
+    info.vendor = "HL-DT-ST";
+    info.product = "BD-RE  BP71N";
+    info.revision = "1.03";
+    return info;
+}
+
+cdr::DriveOffsetDbMatch dbListing(int offset, int submissions = 1234) {
+    cdr::DriveOffsetDbMatch m;
+    m.status = cdr::DriveOffsetDbMatch::Status::Found;
+    m.entry.offset = offset;
+    m.entry.name = "FAKE - CD-ROM DRIVE";
+    m.entry.submissions = submissions;
+    m.entry.agreePercent = 100;
+    return m;
+}
+
+}  // namespace
+
+TEST(drive_offset_db_parses_records) {
+    const std::string file = driveOffsetFile();
+    CHECK_EQ(file.size(), 5u * 69u);
+    cdr::DriveOffsetDb db = cdr::DriveOffsetDb::parse(file);
+    CHECK(db.valid());
+    CHECK_EQ(db.records, 5u);
+    CHECK_EQ(db.badRecords, 0u);
+    CHECK_EQ(db.entries.size(), 5u);
+    if (db.entries.size() == 5) {
+        CHECK_EQ(db.entries[0].offset, 667);
+        CHECK(db.entries[0].name == "HL-DT-ST - BD-RE  BH16NS40");
+        CHECK_EQ(db.entries[0].submissions, 2400);
+        CHECK_EQ(db.entries[0].agreePercent, 99);
+        CHECK_EQ(db.entries[2].offset, -472);  // int16, sign extended
+        CHECK(db.entries[1].describe() == "+6 (1234 submissions, 100% agree)");
+        CHECK(db.entries[2].describe() == "-472 (3000 submissions, 98% agree)");
+    }
+    // The entry with most submissions of the same name.
+    const cdr::DriveOffsetDbEntry* e = db.find("HL-DT-ST", "BD-RE  BP71N");
+    CHECK(e != nullptr && e->offset == 6 && e->submissions == 1234);
+    CHECK(db.find("HL-DT-ST", "BD-RE  BP50NB40") == nullptr);
+    CHECK(db.find("", "") == nullptr);
+
+    // A trailing partial record (a cut download) is ignored, the rest is kept.
+    db = cdr::DriveOffsetDb::parse(file + std::string(30, 'x'));
+    CHECK(db.valid());
+    CHECK_EQ(db.records, 5u);
+    CHECK_EQ(db.entries.size(), 5u);
+
+    // A record with a control character or an empty name is skipped.
+    std::string junk = driveRecord(5, "BAD\x01NAME") + driveRecord(9, "") + file;
+    db = cdr::DriveOffsetDb::parse(junk);
+    CHECK(db.valid());
+    CHECK_EQ(db.records, 7u);
+    CHECK_EQ(db.badRecords, 2u);
+    CHECK_EQ(db.entries.size(), 5u);
+
+    // A name of the full 33 bytes without a NUL, and padding with spaces.
+    db = cdr::DriveOffsetDb::parse(driveRecord(12, std::string(33, 'A')) + driveRecord(-3, "  VENDOR - MODEL   "));
+    CHECK(db.valid());
+    CHECK(db.entries.size() == 2 && db.entries[0].name == std::string(33, 'A') && db.entries[1].name == "VENDOR - MODEL");
+
+    // Whole files that are no drive offset list.
+    CHECK(!cdr::DriveOffsetDb::parse("").valid());
+    CHECK(!cdr::DriveOffsetDb::parse(std::string(68, '\0')).valid());
+    db = cdr::DriveOffsetDb::parse("<html><head><title>403 Forbidden</title></head><body>" + std::string(200, ' ') +
+                                   "</body></html>");
+    CHECK(!db.valid());
+    CHECK(db.error.find("HTML") != std::string::npos);
+    CHECK(!cdr::DriveOffsetDb::parse("\r\n <!DOCTYPE html>" + std::string(100, 'x')).valid());
+    std::string noise;
+    for (int i = 0; i < 69 * 10; ++i) noise.push_back(char(uint8_t(i * 7 % 32)));  // control characters only
+    CHECK(!cdr::DriveOffsetDb::parse(noise).valid());
+    CHECK(!cdr::DriveOffsetDb::parse(std::string(69 * 3, '\0')).valid());
+    // Mostly junk: rejected, even with one good record.
+    CHECK(!cdr::DriveOffsetDb::parse(driveRecord(6, "OK - DRIVE") + noise.substr(0, 69 * 2)).valid());
+
+    // Submission / percentage fields that do not fit their meaning: unknown for the whole file.
+    std::string odd;
+    for (int i = 0; i < 5; ++i) odd += driveRecord(i, "V - M" + std::to_string(i), -5 - i, 1000 + i);
+    odd += driveRecord(6, "HL-DT-ST - BD-RE  BP71N", 1234, 100);
+    db = cdr::DriveOffsetDb::parse(odd);
+    CHECK(db.valid());
+    CHECK_EQ(db.entries.size(), 6u);
+    for (const cdr::DriveOffsetDbEntry& entry : db.entries) CHECK(entry.submissions == -1 && entry.agreePercent == -1);
+    CHECK(db.entries.back().describe() == "+6");
+}
+
+TEST(drive_offset_db_name_matching) {
+    using cdr::driveOffsetNameMatches;
+    // AccurateRip's form (vendor " - " product), any spacing, any case.
+    CHECK(driveOffsetNameMatches("HL-DT-ST - BD-RE  BP71N", "HL-DT-ST", "BD-RE  BP71N"));
+    CHECK(driveOffsetNameMatches("HL-DT-ST - BD-RE BP71N", "HL-DT-ST", "BD-RE  BP71N   "));
+    CHECK(driveOffsetNameMatches("hl-dt-st - bd-re bp71n", "HL-DT-ST", "BD-RE  BP71N"));
+    CHECK(driveOffsetNameMatches("HL-DT-ST -  BD-RE  BP71N", "HL-DT-ST ", "BD-RE  BP71N"));
+    CHECK(driveOffsetNameMatches("HL-DT-ST-BD-RE BP71N", "HL-DT-ST", "BD-RE BP71N"));
+    // EAC's form (vendor, space, product).
+    CHECK(driveOffsetNameMatches("HL-DT-ST BD-RE  BP71N", "HL-DT-ST", "BD-RE  BP71N"));
+    CHECK(driveOffsetNameMatches("PLEXTOR - DVDR   PX-716A", "PLEXTOR ", "DVDR   PX-716A  "));
+    // Other drives.
+    CHECK(!driveOffsetNameMatches("HL-DT-ST - BD-RE  BP71NB", "HL-DT-ST", "BD-RE  BP71N"));
+    CHECK(!driveOffsetNameMatches("HL-DT-ST - BD-RE  BP71N", "HL-DT-ST", "BD-RE  BP71"));
+    CHECK(!driveOffsetNameMatches("LG - BD-RE  BP71N", "HL-DT-ST", "BD-RE  BP71N"));
+    CHECK(!driveOffsetNameMatches("BD-RE  BP71N", "HL-DT-ST", "BD-RE  BP71N"));
+    CHECK(!driveOffsetNameMatches("HL-DT-ST - ", "HL-DT-ST", ""));
+
+    // matchDriveOffsetDb: found, not listed, unavailable.
+    cdr::DriveOffsetDbLoad load;
+    load.source = cdr::DriveOffsetDbLoad::Source::Cache;
+    load.db = cdr::DriveOffsetDb::parse(driveOffsetFile());
+    cdr::DriveOffsetDbMatch m = cdr::matchDriveOffsetDb(load, bp71n());
+    CHECK(m.found());
+    CHECK_EQ(m.entry.offset, 6);
+    CHECK(m.logLine() == "AccurateRip drive database: +6 (1234 submissions, 100% agree)");
+    CHECK(m.logLine(6) == m.logLine());
+    CHECK(m.logLine(0) == "AccurateRip drive database: +6 (1234 submissions, 100% agree); differs from the read "
+                          "offset used");
+    CHECK(m.agreementText() == "matches AccurateRip drive database (1234 submissions)");
+    cdr::DriveInfo other = bp71n();
+    other.product = "DVD-ROM XYZ";
+    m = cdr::matchDriveOffsetDb(load, other);
+    CHECK(m.status == cdr::DriveOffsetDbMatch::Status::NotListed);
+    CHECK(m.logLine() == "AccurateRip drive database: drive not listed");
+    CHECK(m.logLine(0) == m.logLine());
+    load = {};
+    load.error = "no network";
+    m = cdr::matchDriveOffsetDb(load, bp71n());
+    CHECK(m.status == cdr::DriveOffsetDbMatch::Status::Unavailable);
+    CHECK(m.logLine() == "AccurateRip drive database: unavailable (no network)");
+    CHECK(cdr::DriveOffsetDbMatch{}.logLine() == "AccurateRip drive database: not checked");
+}
+
+TEST(drive_offset_db_cache_and_download) {
+    const int64_t day = 24 * 60 * 60;
+    cdr::DriveOffsetDbCache cache;
+    CHECK(!cdr::driveOffsetDbCacheFresh(cache));
+    cache.present = true;
+    cache.bytes = driveOffsetFile();
+    cache.ageSeconds = 0;
+    CHECK(cdr::driveOffsetDbCacheFresh(cache));
+    cache.ageSeconds = 30 * day;
+    CHECK(cdr::driveOffsetDbCacheFresh(cache));
+    cache.ageSeconds = 30 * day + 1;
+    CHECK(!cdr::driveOffsetDbCacheFresh(cache));
+    CHECK(cdr::driveOffsetDbCacheFresh(cache, 31 * day));
+    cache.ageSeconds = -60;  // written "in the future": the clock moved
+    CHECK(!cdr::driveOffsetDbCacheFresh(cache));
+
+    // Fresh and valid: no request.
+    CannedHttp http;
+    http.response.error = "must not be asked";
+    cache.ageSeconds = 2 * day;
+    cdr::DriveOffsetDbLoad load = cdr::loadDriveOffsetDb(&http, cache);
+    CHECK(load.source == cdr::DriveOffsetDbLoad::Source::Cache);
+    CHECK(!load.shouldStore());
+    CHECK(http.requests.empty());
+    CHECK(load.db.valid());
+
+    // Fresh but damaged: downloaded again.
+    cdr::DriveOffsetDbCache damaged = cache;
+    damaged.bytes = "<html>oops</html>" + std::string(100, ' ');
+    http.response = httpReply(200, driveOffsetFile());
+    load = cdr::loadDriveOffsetDb(&http, damaged);
+    CHECK(load.source == cdr::DriveOffsetDbLoad::Source::Download);
+    CHECK(load.shouldStore());
+    CHECK(load.bytes == driveOffsetFile());
+    CHECK_EQ(http.requests.size(), 1u);
+    CHECK(!http.requests.empty() && http.requests[0] == "http://www.accuraterip.com/accuraterip/DriveOffsets.bin");
+
+    // Stale: downloaded; when that fails, the stale file is still used.
+    cache.ageSeconds = 45 * day;
+    http.requests.clear();
+    load = cdr::loadDriveOffsetDb(&http, cache);
+    CHECK(load.source == cdr::DriveOffsetDbLoad::Source::Download);
+    CHECK_EQ(http.requests.size(), 1u);
+    http.response = cdr::HttpResponse{};
+    http.response.error = "no network";
+    load = cdr::loadDriveOffsetDb(&http, cache);
+    CHECK(load.source == cdr::DriveOffsetDbLoad::Source::StaleCache);
+    CHECK(load.available());
+    CHECK(!load.shouldStore());
+    CHECK(load.error == "no network");
+    CHECK(cdr::matchDriveOffsetDb(load, bp71n()).found());
+    // Without a client only the stored file counts, stale or not.
+    load = cdr::loadDriveOffsetDb(nullptr, cache);
+    CHECK(load.source == cdr::DriveOffsetDbLoad::Source::StaleCache);
+
+    // Nothing stored and no download: unavailable, with the reason.
+    const cdr::DriveOffsetDbCache none;
+    load = cdr::loadDriveOffsetDb(&http, none);
+    CHECK(!load.available());
+    CHECK(load.error == "no network");
+    load = cdr::loadDriveOffsetDb(nullptr, none);
+    CHECK(!load.available());
+    http.response = httpReply(404, "<html>Not Found</html>");
+    load = cdr::loadDriveOffsetDb(&http, none);
+    CHECK(!load.available());
+    CHECK(load.error == "HTTP 404");
+    // An error page with status 200, or a truncated body, is not stored.
+    http.response = httpReply(200, "<!DOCTYPE html><html><body>Maintenance</body></html>" + std::string(80, ' '));
+    load = cdr::loadDriveOffsetDb(&http, none);
+    CHECK(!load.available());
+    CHECK(!load.shouldStore());
+    CHECK(load.error.find("invalid DriveOffsets.bin") == 0);
+    http.response = httpReply(200, driveOffsetFile().substr(0, 40));
+    load = cdr::loadDriveOffsetDb(&http, none);
+    CHECK(!load.available());
+}
+
+// The real-device report of #37 (BP71N, 5 pressings): per track +6 has 14 + 7
+// submissions, -145 17, -658 4 + 3. Submissions alone do not decide (21 vs 17).
+TEST(offset_detect_ambiguous_decided_by_drive_database) {
+    FakeDrive fake = makeOffsetDisc();
+    cdr::OffsetDetection d = detectOn(fake, fivePressings(14, 17));
+    CHECK(d.status == cdr::OffsetDetection::Status::Ambiguous);
+    CHECK_EQ(d.testedTracks(), 3);
+    CHECK(d.driveDatabase.status == cdr::DriveOffsetDbMatch::Status::NotChecked);
+    // Without the database nothing about it in the summary.
+    CHECK(d.summary().find("drive database") == std::string::npos);
+    const std::vector<cdr::OffsetCandidate> all = d.allCandidates();
+    CHECK_EQ(all.size(), 3u);
+    if (all.size() == 3) {
+        CHECK(all[0].offset == 6 && all[0].score() == 63 && all[0].tracks == 3);
+        CHECK((all[0].pressings == std::vector<int>{1, 3}));
+        CHECK(all[1].offset == -145 && all[1].score() == 51);
+        CHECK(all[2].offset == -658 && all[2].score() == 21);
+    }
+    CHECK(d.candidateList() == "+6, -145, -658");
+    CHECK(d.selectionNote() == "selected by user from candidates +6, -145, -658");
+    CHECK(cdr::readOffsetLogLine(-145, {cdr::ReadOffsetSource::Kind::Selected, d.candidateList()}) ==
+          "Read offset correction: -145 samples (selected by user from candidates +6, -145, -658)");
+
+    // The drive database lists +6 for the drive: confirmed.
+    cdr::OffsetDetectOptions o = shortTrackOptions();
+    o.driveDatabase = dbListing(6);
+    FakeDrive withDb = makeOffsetDisc();
+    d = detectOn(withDb, fivePressings(14, 17), o);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 6);
+    CHECK(d.decidedByDriveDatabase);
+    CHECK(!d.overrodeMostSubmissions);
+    CHECK(d.matchesDriveDatabase());
+    CHECK_EQ(d.testedTracks(), 1);  // a match at the drive's known offset needs no second track
+    CHECK(d.agreement() == "1 of 1 track agreed, v1+v2, matches AccurateRip drive database (1234 submissions); "
+                           "also -145 (17), -658 (7): other pressings");
+    CHECK((d.candidates == std::vector<int>{6, -145, -658}));
+    const std::vector<std::string> lines = d.logLines();
+    CHECK(lines.size() >= 3 && lines[1] == "  AccurateRip drive database: +6 (1234 submissions, 100% agree)");
+    CHECK(!lines.empty() && lines[lines.size() - 2] ==
+                                "  Confirmed by the AccurateRip drive database, which lists +6 for this drive");
+    CHECK(d.summary() == "Read offset +6 (1 of 1 track agreed, v1+v2, matches AccurateRip drive database (1234 "
+                         "submissions), confidence 21; also -145 (17), -658 (7): other pressings)");
+
+    // The score rule would have taken +6 (21 vs 13), the database lists -145, which every track matches as
+    // well: the database wins, both are logged.
+    o.driveDatabase = dbListing(-145, 50);
+    FakeDrive overrule = makeOffsetDisc();
+    d = detectOn(overrule, fivePressings(), o);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, -145);
+    CHECK(d.overrodeMostSubmissions);
+    CHECK_EQ(d.mostSubmissionsOffset, 6);
+    CHECK(d.alternatives.size() == 2 && d.alternatives[0].offset == 6 && d.alternatives[1].offset == -658);
+    bool logged = false;
+    for (const std::string& l : d.logLines())
+        logged = logged || l == "  Most submissions at +6, but the AccurateRip drive database lists -145, which every "
+                                "track read matches as well: using -145";
+    CHECK(logged);
+
+    // The offset with most submissions is the database's: confirmed after the first track already.
+    o.driveDatabase = dbListing(6);
+    FakeDrive agree = makeOffsetDisc();
+    d = detectOn(agree, fivePressings(), o);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 6);
+    CHECK_EQ(d.testedTracks(), 1);
+    CHECK(d.matchesDriveDatabase());
+    CHECK(d.decidedByDriveDatabase);
+    CHECK(!d.overrodeMostSubmissions);
+    CHECK(d.agreement().find(", matches AccurateRip drive database (1234 submissions); also") != std::string::npos);
+}
+
+TEST(offset_detect_drive_database_not_among_candidates) {
+    cdr::OffsetDetectOptions o = shortTrackOptions();
+    o.driveDatabase = dbListing(667);
+    FakeDrive fake = makeOffsetDisc();
+    cdr::OffsetDetection d = detectOn(fake, fivePressings(14, 17), o);
+    CHECK(d.status == cdr::OffsetDetection::Status::Ambiguous);
+    CHECK(!d.driveDatabaseIsCandidate());
+    CHECK(!d.decidedByDriveDatabase);
+    CHECK(d.summary().find("Try another disc. The AccurateRip drive database lists +667 (1234 submissions, 100% "
+                           "agree) for this drive, which is not among the offsets found.") != std::string::npos);
+
+    // Detected by submissions at another offset than the database's: kept, mentioned.
+    FakeDrive clear = makeOffsetDisc();
+    d = detectOn(clear, fivePressings(), o);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 6);
+    CHECK(!d.matchesDriveDatabase());
+    CHECK(d.summary().find("; the AccurateRip drive database lists +667 (1234 submissions, 100% agree)") !=
+          std::string::npos);
+    CHECK(d.agreement().find("drive database") == std::string::npos);
+
+    // Database unavailable / drive not listed: as without it, and said so.
+    o.driveDatabase = {};
+    o.driveDatabase.status = cdr::DriveOffsetDbMatch::Status::Unavailable;
+    o.driveDatabase.error = "no network";
+    FakeDrive offline = makeOffsetDisc();
+    d = detectOn(offline, fivePressings(14, 17), o);
+    CHECK(d.status == cdr::OffsetDetection::Status::Ambiguous);
+    CHECK(d.summary().find(" The AccurateRip drive database is unavailable (no network).") != std::string::npos);
+    CHECK(d.logLines().size() > 1 && d.logLines()[1] == "  AccurateRip drive database: unavailable (no network)");
+    o.driveDatabase.status = cdr::DriveOffsetDbMatch::Status::NotListed;
+    FakeDrive unlisted = makeOffsetDisc();
+    d = detectOn(unlisted, fivePressings(14, 17), o);
+    CHECK(d.status == cdr::OffsetDetection::Status::Ambiguous);
+    CHECK(d.summary().find("has no entry for this drive") != std::string::npos);
+
+    // A conflict is not resolved by the database, even when it lists one of the offsets.
+    std::vector<cdr::AccurateRipPressing> p = {pressingAt(makeOffsetDisc, {6, 6, 667, -1164, 6}, {9, 9, 8, 7, 9})};
+    o.driveDatabase = dbListing(667);
+    FakeDrive conflict = makeOffsetDisc();
+    d = detectOn(conflict, p, o);
+    CHECK(d.status == cdr::OffsetDetection::Status::Conflict);
+    CHECK(d.summary().find("(one of the offsets found)") != std::string::npos);
+
+    // A single matching track at the database's offset is enough.
+    p = {pressingAt(makeOffsetDisc, {kGarbage, kGarbage, 667, kGarbage, kGarbage}, {9, 9, 40, 9, 9})};
+    FakeDrive single = makeOffsetDisc();
+    d = detectOn(single, p, o);
+    CHECK(d.detected());
+    CHECK_EQ(d.offset, 667);
+    CHECK(d.decidedByDriveDatabase);
+    // ... but not at another offset.
+    o.driveDatabase = dbListing(6);
+    FakeDrive elsewhere = makeOffsetDisc();
+    d = detectOn(elsewhere, p, o);
+    CHECK(d.status == cdr::OffsetDetection::Status::NotEnough);
+    CHECK(d.summary().find("lists +6 (1234 submissions, 100% agree) for this drive, which is not among") !=
+          std::string::npos);
+
+    // The disc lookup failed: the database is still reported.
+    CannedHttp http;
+    http.response.error = "no network";
+    FakeDrive lookup = makeOffsetDisc();
+    cdr::CdDrive drive(lookup);
+    const cdr::Toc toc = drive.readToc();
+    d = cdr::detectReadOffset(drive, toc, http, o);
+    CHECK(d.status == cdr::OffsetDetection::Status::LookupFailed);
+    CHECK(d.driveDatabase.found());
+    CHECK(d.summary() == "AccurateRip lookup failed: no network. The AccurateRip drive database lists +6 (1234 "
+                         "submissions, 100% agree) for this drive.");
 }
 
 TEST(offset_source_log_lines) {
