@@ -176,6 +176,21 @@ std::string takeJavaException(JNIEnv* env) {
     return text;
 }
 
+// [status (0 not checked, 1 found, 2 drive not listed, 3 unavailable),
+// offset, submissions (-1 unknown)] of a drive offset database entry (#37).
+std::vector<std::string> driveOffsetDbFields(const cdr::DriveOffsetDbMatch& m) {
+    using Status = cdr::DriveOffsetDbMatch::Status;
+    int status = 0;
+    switch (m.status) {
+        case Status::NotChecked: status = 0; break;
+        case Status::Found: status = 1; break;
+        case Status::NotListed: status = 2; break;
+        case Status::Unavailable: status = 3; break;
+    }
+    return {std::to_string(status), std::to_string(m.found() ? m.entry.offset : 0),
+            std::to_string(m.found() ? m.entry.submissions : -1)};
+}
+
 // cdr::HttpClient on top of the Kotlin HttpGet object:
 //   fun get(url: String): HttpResult   (fields status: Int, body: ByteArray?, error: String?)
 // Runs on the thread that called into native code (the app's worker thread,
@@ -482,7 +497,8 @@ JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTrackFi
 // `cacheMode`: drive cache defeat for re-reads (#34): 0 auto (timing test,
 // once per disc), 1 FUA, 2 flush, 3 none.
 // `offsetSource` (#37): where readOffset came from, for rip.log: 0 manual,
-// 1 saved for this drive, 2 auto-detected; `offsetDetail` the note
+// 1 saved for this drive, 2 auto-detected, 3 selected by the user from the
+// candidates of an ambiguous detection; `offsetDetail` the note
 // ("HL-DT-ST BD-RE BP71N (1.03); auto-detected: ..." / "2 of 2 tracks agreed, v2").
 JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(
     JNIEnv* env, jclass, jlong handle, jstring format, jint readOffset, jint maxRetries, jboolean verify,
@@ -494,6 +510,7 @@ JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(
         switch (offsetSource) {
             case 1: settings.offsetSource.kind = cdr::ReadOffsetSource::Kind::Saved; break;
             case 2: settings.offsetSource.kind = cdr::ReadOffsetSource::Kind::Detected; break;
+            case 3: settings.offsetSource.kind = cdr::ReadOffsetSource::Kind::Selected; break;
             default: settings.offsetSource.kind = cdr::ReadOffsetSource::Kind::Manual; break;
         }
         settings.options.readOffsetSamples = readOffset;
@@ -641,6 +658,36 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipIm
     return nullptr;
 }
 
+// Where DriveOffsets.bin (AccurateRip drive offset database, #37) is kept
+// between runs, e.g. <cacheDir>/DriveOffsets.bin.
+JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeSetDriveOffsetDbCache(JNIEnv* env, jclass,
+                                                                                           jlong handle,
+                                                                                           jstring path) {
+    std::string p;
+    if (!fromJava(env, path, p)) return;
+    session(handle)->rip.setDriveOffsetDbCache(std::filesystem::u8path(p));
+}
+
+// The drive's entry in the AccurateRip drive offset database (#37): the
+// stored file when fresh, otherwise downloaded with `httpGet` (null: only
+// the stored file). Returns driveOffsetDbFields() plus [3] the agreement
+// percentage (-1 unknown), [4] the name in the database, [5] the line for
+// rip.log. Never throws for network problems.
+JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeLookupDriveOffsetDb(JNIEnv* env, jclass,
+                                                                                                jlong handle,
+                                                                                                jobject httpGet) {
+    try {
+        JavaHttpClient http(env, httpGet);
+        const cdr::DriveOffsetDbMatch& m = session(handle)->rip.lookupDriveOffsetDb(httpGet != nullptr ? &http : nullptr);
+        std::vector<std::string> fields = driveOffsetDbFields(m);
+        fields.insert(fields.end(), {std::to_string(m.entry.agreePercent), m.entry.name, m.logLine()});
+        return toJavaArray(env, fields);
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+        return nullptr;
+    }
+}
+
 // Detects the read offset with AccurateRip (#37), calling
 // listener.onProgress(step, steps, track, doneSectors, totalSectors).
 // Returns [status (0 detected, 1 disc not in database, 2 lookup failed,
@@ -651,8 +698,16 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipIm
 // ("1" / "0"), usable tracks, competing offsets ("6,-1164"), English
 // summary, agreement ("2 of 2 tracks agreed, v2"), error, other pressings'
 // offsets with their summed confidence ("-145:26,-658:14", highest first;
-// empty without shifted pressings)]. Throws IOException on errors outside
-// the reads.
+// empty without shifted pressings), then the AccurateRip drive database
+// (#37): [13] its status (driveOffsetDbFields()), [14] its offset,
+// [15] submissions (-1 unknown), [16] "1" when the database decided,
+// [17] "1" when detected at the database's offset, [18] every candidate of
+// shifted pressings, best first, as "offset:tracks:confidence:pressings"
+// separated by ';' (pressings "1+3"; empty without shifted pressings),
+// [19] the database line for rip.log ("AccurateRip drive database: +6 (...)"),
+// [20] the note to save for a candidate chosen by the user, [21] the
+// candidates as text ("+6, -145, -658")]. Throws IOException on errors
+// outside the reads.
 JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeDetectOffset(JNIEnv* env, jclass,
                                                                                           jlong handle,
                                                                                           jobject httpGet,
@@ -693,12 +748,23 @@ JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeDe
         for (const cdr::OffsetCandidate& c : d.alternatives)
             alternatives += (alternatives.empty() ? "" : ",") + std::to_string(c.offset) + ":" +
                             std::to_string(c.score());
-        return toJavaArray(env, std::vector<std::string>{
-                                    std::to_string(status), std::to_string(d.offset), std::to_string(d.agreeingTracks),
-                                    std::to_string(d.testedTracks()), std::to_string(d.confidence()),
-                                    d.matchedVersion(), d.singleTrack ? "1" : "0", std::to_string(d.usableTracks),
-                                    candidates, d.summary(), d.agreement(), d.error,
-                                    alternatives});
+        std::string all;
+        for (const cdr::OffsetCandidate& c : d.allCandidates()) {
+            std::string pressings;
+            for (int p : c.pressings) pressings += (pressings.empty() ? "" : "+") + std::to_string(p);
+            all += (all.empty() ? "" : ";") + std::to_string(c.offset) + ":" + std::to_string(c.tracks) + ":" +
+                   std::to_string(c.score()) + ":" + pressings;
+        }
+        std::vector<std::string> fields{std::to_string(status), std::to_string(d.offset),
+                                        std::to_string(d.agreeingTracks), std::to_string(d.testedTracks()),
+                                        std::to_string(d.confidence()), d.matchedVersion(),
+                                        d.singleTrack ? "1" : "0", std::to_string(d.usableTracks), candidates,
+                                        d.summary(), d.agreement(), d.error, alternatives};
+        const std::vector<std::string> db = driveOffsetDbFields(d.driveDatabase);
+        fields.insert(fields.end(), {db[0], db[1], db[2], d.decidedByDriveDatabase ? "1" : "0",
+                                     d.matchesDriveDatabase() ? "1" : "0", all, d.driveDatabase.logLine(),
+                                     d.selectionNote(), d.candidateList()});
+        return toJavaArray(env, fields);
     } catch (const JavaExceptionPending&) {
         // propagate the listener's exception
     } catch (const std::exception& e) {

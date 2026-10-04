@@ -1,6 +1,7 @@
 package io.github.noribow.cdreader
 
 import java.io.Closeable
+import java.io.File
 
 /** Called from the ripping thread with the progress in sectors. */
 fun interface RipProgressListener {
@@ -69,6 +70,8 @@ object NativeCd {
         listener: ImageProgressListener?,
     ): IntArray
     @JvmStatic external fun nativeDetectOffset(handle: Long, http: HttpGet?, listener: OffsetProgressListener?): Array<String>
+    @JvmStatic external fun nativeSetDriveOffsetDbCache(handle: Long, path: String)
+    @JvmStatic external fun nativeLookupDriveOffsetDb(handle: Long, http: HttpGet?): Array<String>
     @JvmStatic external fun nativeCheckAccurateRip(handle: Long, enabled: Boolean, http: HttpGet?): IntArray
     @JvmStatic external fun nativeAccurateRipError(handle: Long): String
     @JvmStatic external fun nativeC2Status(handle: Long): Int
@@ -85,8 +88,40 @@ data class DriveInfo(
     val offsetKey: String,
 )
 
-/** Where the read offset of a rip came from (rip.log); [code] is what nativeBeginRip expects. */
-enum class OffsetSource(val code: Int) { MANUAL(0), SAVED(1), DETECTED(2) }
+/**
+ * Where the read offset of a rip came from (rip.log); [code] is what nativeBeginRip expects.
+ * SELECTED: chosen by the user from the candidates of an ambiguous detection.
+ */
+enum class OffsetSource(val code: Int) { MANUAL(0), SAVED(1), DETECTED(2), SELECTED(3) }
+
+/** State of the AccurateRip drive offset database lookup (#37), in the order of the native codes. */
+enum class DriveDbStatus { NOT_CHECKED, FOUND, NOT_LISTED, UNAVAILABLE }
+
+/** The drive's entry in the AccurateRip drive offset database (DriveOffsets.bin). */
+data class DriveOffsetDb(
+    val status: DriveDbStatus,
+    /** FOUND: the offset listed for the drive model. */
+    val offset: Int,
+    /** -1: unknown. */
+    val submissions: Int,
+    /** -1: unknown. */
+    val agreePercent: Int,
+    /** The drive's name in the database. */
+    val name: String,
+    /** "AccurateRip drive database: +6 (1234 submissions)" (rip.log). */
+    val logLine: String,
+)
+
+/** One offset of pressings shifted against each other, for choosing by hand (#37). */
+data class OffsetCandidateInfo(
+    val offset: Int,
+    /** Tracks read that match at it. */
+    val tracks: Int,
+    /** Submissions behind it, summed over the tracks. */
+    val confidence: Int,
+    /** 1-based AccurateRip records (pressings) that match at it. */
+    val pressings: List<Int>,
+)
 
 /** Result of [CdSession.detectOffset], in the order of the native status codes. */
 enum class OffsetDetectStatus {
@@ -119,6 +154,22 @@ data class OffsetDetection(
     val error: String,
     /** DETECTED / AMBIGUOUS with shifted pressings: the other pressings' offsets, highest confidence first. */
     val alternatives: List<OffsetAlternative> = emptyList(),
+    /** The AccurateRip drive offset database for this drive (#37). */
+    val driveDbStatus: DriveDbStatus = DriveDbStatus.NOT_CHECKED,
+    val driveDbOffset: Int = 0,
+    val driveDbSubmissions: Int = -1,
+    /** DETECTED only because the drive database lists [offset]. */
+    val decidedByDriveDb: Boolean = false,
+    /** DETECTED at the drive database's offset. */
+    val matchesDriveDb: Boolean = false,
+    /** Shifted pressings: every candidate, [offset]'s first (empty otherwise). */
+    val allCandidates: List<OffsetCandidateInfo> = emptyList(),
+    /** "AccurateRip drive database: ..." */
+    val driveDbLogLine: String = "",
+    /** Note to save with a candidate the user chose ("selected by user from candidates +6, -145, -658"). */
+    val selectionNote: String = "",
+    /** "+6, -145, -658": the detail of [OffsetSource.SELECTED] for rip.log. */
+    val candidateList: String = "",
 )
 
 data class TrackInfo(
@@ -432,6 +483,38 @@ class CdSession private constructor(private val handle: Long) : Closeable {
                 val (offset, confidence) = it.split(":")
                 OffsetAlternative(offset.toInt(), confidence.toInt())
             },
+            DriveDbStatus.entries.getOrElse(v.getOrNull(13)?.toIntOrNull() ?: 0) { DriveDbStatus.NOT_CHECKED },
+            v.getOrNull(14)?.toIntOrNull() ?: 0,
+            v.getOrNull(15)?.toIntOrNull() ?: -1,
+            v.getOrNull(16) == "1",
+            v.getOrNull(17) == "1",
+            v.getOrNull(18).orEmpty().split(";").filter { it.isNotEmpty() }.map {
+                val f = it.split(":")
+                OffsetCandidateInfo(
+                    f[0].toInt(), f[1].toInt(), f[2].toInt(),
+                    f.getOrNull(3).orEmpty().split("+").filter { p -> p.isNotEmpty() }.map { p -> p.toInt() },
+                )
+            },
+            v.getOrNull(19).orEmpty(),
+            v.getOrNull(20).orEmpty(),
+            v.getOrNull(21).orEmpty(),
+        )
+    }
+
+    /** Where DriveOffsets.bin (AccurateRip drive offset database, #37) is kept between runs. */
+    fun setDriveOffsetDbCache(file: File) = NativeCd.nativeSetDriveOffsetDbCache(handle, file.path)
+
+    /**
+     * The drive's entry in the AccurateRip drive offset database (#37): the
+     * stored file when fresh (30 days), otherwise downloaded with [http]
+     * (null: only the stored file). Network problems end up in the status.
+     * Not on the UI thread.
+     */
+    fun lookupDriveOffsetDb(http: HttpGet?): DriveOffsetDb {
+        val v = NativeCd.nativeLookupDriveOffsetDb(handle, http)
+        return DriveOffsetDb(
+            DriveDbStatus.entries.getOrElse(v[0].toInt()) { DriveDbStatus.NOT_CHECKED },
+            v[1].toInt(), v[2].toInt(), v[3].toInt(), v[4], v[5],
         )
     }
 

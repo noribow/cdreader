@@ -24,6 +24,18 @@
 // matched on at least two tracks (the drive's own offset is the one most
 // people ripped with). Otherwise the result is Ambiguous. Tracks matching at
 // disjoint offsets remain a Conflict.
+//
+// AccurateRip drive database (drive_offset_db.h): the read offset is a
+// property of the drive, so when the offset the database lists for this
+// drive model (OffsetDetectOptions::driveDatabase) is one of the offsets
+// consistent with every track read (the shifted pressings' candidates, or
+// the only offset matched), it is confirmed, even when the submissions do not
+// decide (Ambiguous), when fewer tracks than minAgreeingTracks were read, or
+// when the score rule preferred another pressing's offset (both are logged).
+// A checksum match exactly at the independently known offset cannot be a
+// coincidence of the 6001 offsets tried. When the database offset is not among
+// the candidates, or the database is unavailable, detection works as without
+// it and the summary says so.
 
 #include <cstdint>
 #include <functional>
@@ -33,6 +45,7 @@
 
 #include "cdreader/accuraterip.h"
 #include "cdreader/cd_drive.h"
+#include "cdreader/drive_offset_db.h"
 #include "cdreader/http.h"
 #include "cdreader/ripper.h"
 #include "cdreader/toc.h"
@@ -72,6 +85,9 @@ struct OffsetDetectOptions {
     uint32_t maxTrackSectors = 8 * 60 * kSectorsPerSecond;
     // Read these tracks instead of choosing (CLI `offset -t`), in this order.
     std::vector<int> tracks;
+    // The drive's entry in the AccurateRip drive database (status NotChecked:
+    // not consulted). See the top of this file.
+    DriveOffsetDbMatch driveDatabase;
     // Reads: retries, verify (the read offset is overridden).
     RipOptions rip;
     // Called while reading; may throw to abort.
@@ -134,14 +150,40 @@ struct OffsetDetection {
     // offsets, highest score first (the chosen / best one is `offset`).
     std::vector<OffsetCandidate> alternatives;
 
+    // The drive database as given in the options.
+    DriveOffsetDbMatch driveDatabase;
+    // Detected only because the drive database lists `offset` (without it:
+    // Ambiguous / NotEnough).
+    bool decidedByDriveDatabase = false;
+    // The database offset was taken over the candidate with most submissions
+    // (`mostSubmissionsOffset`), which the score rule would have preferred.
+    bool overrodeMostSubmissions = false;
+    int mostSubmissionsOffset = 0;
+
     bool detected() const { return status == Status::Detected; }
+    // Detected at the offset the drive database lists for this drive.
+    bool matchesDriveDatabase() const {
+        return detected() && driveDatabase.found() && driveDatabase.entry.offset == offset;
+    }
+    // Whether the drive database's offset is one of `candidates` / `offset`.
+    bool driveDatabaseIsCandidate() const;
+    // The best candidate (`offset`) followed by `alternatives`: what a user
+    // chooses from when the result is Ambiguous. Empty without shifted pressings.
+    std::vector<OffsetCandidate> allCandidates() const;
+    // "+6, -145, -658" (allCandidates(), or `candidates`).
+    std::string candidateList() const;
+    // Note stored for the drive when the user picked one of the candidates:
+    // "selected by user from candidates +6, -145, -658".
+    std::string selectionNote() const;
     int testedTracks() const { return int(tracks.size()); }
     int confidence() const { return v1Confidence + v2Confidence; }
     std::string matchedVersion() const;  // "v1", "v2", "v1+v2"
 
     // "2 of 3 tracks agreed, v2" (Detected), used in rip.log and the store;
     // with shifted pressings "2 of 2 tracks agreed, v1+v2; also -145 (26),
-    // -658 (8): other pressings".
+    // -658 (8): other pressings"; at the drive database's offset
+    // "2 of 2 tracks agreed, v1+v2, matches AccurateRip drive database
+    // (1234 submissions); also ...".
     std::string agreement() const;
     // "also -145 (26), -658 (8): other pressings" (score in parentheses), or empty.
     std::string alternativesText() const;
@@ -149,6 +191,9 @@ struct OffsetDetection {
     std::string summary() const;
     // Block for rip.log / the console: the result and every track read.
     std::vector<std::string> logLines() const;
+
+private:
+    std::string summaryCore() const;
 };
 
 // The tracks detection would read, in order of preference: inside the disc
@@ -169,14 +214,16 @@ OffsetDetection detectReadOffset(CdDrive& drive, const Toc& toc, HttpClient& htt
 
 // --- Where the read offset of a rip came from (rip.log) ------------------------
 struct ReadOffsetSource {
-    enum class Kind { Manual, Saved, Detected };
+    // Selected: picked by the user from the candidates of an Ambiguous detection.
+    enum class Kind { Manual, Saved, Detected, Selected };
     Kind kind = Kind::Manual;
     // Saved: the drive ("HL-DT-ST BD-RE BP71N (1.03)") and the stored note;
-    // Detected: OffsetDetection::agreement().
+    // Detected: OffsetDetection::agreement(); Selected: OffsetDetection::candidateList().
     std::string detail;
 
     // "manual", "saved for drive HL-DT-ST BD-RE BP71N (1.03); auto-detected:
-    // 2 of 2 tracks agreed, v2", "auto-detected: 3 of 3 tracks agreed, v1+v2".
+    // 2 of 2 tracks agreed, v2", "auto-detected: 3 of 3 tracks agreed, v1+v2",
+    // "selected by user from candidates +6, -145, -658".
     std::string describe() const;
 };
 

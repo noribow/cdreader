@@ -53,6 +53,9 @@ bool evaluate(OffsetDetection& d, const OffsetDetectOptions& options) {
     d.v1Confidence = d.v2Confidence = 0;
     d.offsetPressings.clear();
     d.singleTrack = false;
+    d.decidedByDriveDatabase = false;
+    d.overrodeMostSubmissions = false;
+    d.mostSubmissionsOffset = 0;
     // Per offset: the tracks that match there, their submissions and pressings.
     std::map<int, OffsetCandidate> at;
     std::vector<const OffsetDetectTrack*> matched;
@@ -116,32 +119,53 @@ bool evaluate(OffsetDetection& d, const OffsetDetectOptions& options) {
     });
     const OffsetCandidate& best = shared.front();
     take(best);
+    bool settled = false;
     if (shared.size() == 1) {
         if (best.tracks >= need) {
             if (need == 1 && d.usableTracks <= 1 && d.confidence() < options.singleTrackMinConfidence) {
                 d.status = OffsetDetection::Status::NotEnough;
-                return false;
+            } else {
+                d.status = OffsetDetection::Status::Detected;
+                d.singleTrack = need == 1;
+                settled = true;
             }
-            d.status = OffsetDetection::Status::Detected;
-            d.singleTrack = need == 1;
-            return true;
+        } else {
+            d.status = OffsetDetection::Status::NotEnough;
         }
-        d.status = OffsetDetection::Status::NotEnough;
-        return false;
+    } else {
+        // Pressings shifted against each other: every matching track shows the same offsets.
+        d.alternatives.assign(shared.begin() + 1, shared.end());
+        for (const OffsetCandidate& c : shared) d.candidates.push_back(c.offset);
+        const OffsetCandidate& second = shared[1];
+        const bool clear = double(best.score()) >= options.pressingScoreRatio * double(second.score());
+        if (best.tracks >= std::max(2, need) && clear) {
+            d.status = OffsetDetection::Status::Detected;
+            settled = true;
+        } else {
+            // One matching track cannot tell pressings apart: read more if there are more.
+            d.status = matched.size() < 2 && d.usableTracks > 1 ? OffsetDetection::Status::NotEnough
+                                                                : OffsetDetection::Status::Ambiguous;
+        }
     }
-    // Pressings shifted against each other: every matching track shows the same offsets.
-    d.alternatives.assign(shared.begin() + 1, shared.end());
-    for (const OffsetCandidate& c : shared) d.candidates.push_back(c.offset);
-    const OffsetCandidate& second = shared[1];
-    const bool clear = double(best.score()) >= options.pressingScoreRatio * double(second.score());
-    if (best.tracks >= std::max(2, need) && clear) {
-        d.status = OffsetDetection::Status::Detected;
-        return true;
+    // The drive database: its offset among the consistent candidates is the drive's.
+    const DriveOffsetDbMatch& db = options.driveDatabase;
+    if (!db.found()) return settled;
+    const auto listed = std::find_if(shared.begin(), shared.end(),
+                                     [&](const OffsetCandidate& c) { return c.offset == db.entry.offset; });
+    if (listed == shared.end()) return settled;
+    if (listed != shared.begin()) {
+        d.overrodeMostSubmissions = true;
+        d.mostSubmissionsOffset = best.offset;
+        const OffsetCandidate chosen = *listed;
+        d.alternatives.clear();
+        for (const OffsetCandidate& c : shared)
+            if (c.offset != chosen.offset) d.alternatives.push_back(c);
+        take(chosen);
     }
-    // One matching track cannot tell pressings apart: read more if there are more.
-    d.status = matched.size() < 2 && d.usableTracks > 1 ? OffsetDetection::Status::NotEnough
-                                                        : OffsetDetection::Status::Ambiguous;
-    return false;
+    if (d.status != OffsetDetection::Status::Detected) d.decidedByDriveDatabase = true;
+    d.status = OffsetDetection::Status::Detected;
+    d.singleTrack = d.singleTrack || (shared.size() == 1 && d.usableTracks <= 1);
+    return true;
 }
 
 }  // namespace
@@ -149,6 +173,41 @@ bool evaluate(OffsetDetection& d, const OffsetDetectOptions& options) {
 std::string OffsetCandidate::matchedVersion() const { return versionName(v1Confidence, v2Confidence); }
 
 std::string OffsetDetection::matchedVersion() const { return versionName(v1Confidence, v2Confidence); }
+
+bool OffsetDetection::driveDatabaseIsCandidate() const {
+    if (!driveDatabase.found()) return false;
+    const int o = driveDatabase.entry.offset;
+    if (agreeingTracks > 0 && offset == o) return true;
+    return std::find(candidates.begin(), candidates.end(), o) != candidates.end();
+}
+
+std::vector<OffsetCandidate> OffsetDetection::allCandidates() const {
+    std::vector<OffsetCandidate> all;
+    if (alternatives.empty()) return all;
+    OffsetCandidate best;
+    best.offset = offset;
+    best.tracks = agreeingTracks;
+    best.v1Confidence = v1Confidence;
+    best.v2Confidence = v2Confidence;
+    best.pressings = offsetPressings;
+    all.push_back(best);
+    all.insert(all.end(), alternatives.begin(), alternatives.end());
+    return all;
+}
+
+std::string OffsetDetection::candidateList() const {
+    std::vector<int> offsets;
+    for (const OffsetCandidate& c : allCandidates()) offsets.push_back(c.offset);
+    if (offsets.empty()) offsets = candidates;
+    std::string s;
+    for (int o : offsets) s += (s.empty() ? "" : ", ") + signedNumber(o);
+    return s;
+}
+
+std::string OffsetDetection::selectionNote() const {
+    const std::string list = candidateList();
+    return "selected by user from candidates" + (list.empty() ? std::string() : " " + list);
+}
 
 std::string OffsetDetection::alternativesText() const {
     if (alternatives.empty()) return {};
@@ -166,7 +225,29 @@ std::string agreementCore(const OffsetDetection& d) {
                     (d.testedTracks() == 1 ? "" : "s") + " agreed";
     if (!d.matchedVersion().empty()) s += ", " + d.matchedVersion();
     if (d.singleTrack) s += ", only one track in database";
+    if (d.matchesDriveDatabase()) s += ", " + d.driveDatabase.agreementText();
     return s;
+}
+
+// After a result other than Detected: what the drive database says, or "".
+std::string driveDatabaseNote(const OffsetDetection& d) {
+    const DriveOffsetDbMatch& db = d.driveDatabase;
+    switch (db.status) {
+        case DriveOffsetDbMatch::Status::NotChecked:
+            return {};
+        case DriveOffsetDbMatch::Status::Found: {
+            const std::string s = " The AccurateRip drive database lists " + db.entry.describe() + " for this drive";
+            if (d.driveDatabaseIsCandidate()) return s + " (one of the offsets found).";
+            if (d.candidates.empty() && d.agreeingTracks == 0) return s + ".";
+            return s + ", which is not among the offsets found.";
+        }
+        case DriveOffsetDbMatch::Status::NotListed:
+            return " The AccurateRip drive database has no entry for this drive.";
+        case DriveOffsetDbMatch::Status::Unavailable:
+            return " The AccurateRip drive database is unavailable" +
+                   (db.error.empty() ? std::string(".") : " (" + db.error + ").");
+    }
+    return {};
 }
 
 std::string pressingList(const std::vector<int>& pressings) {
@@ -183,12 +264,20 @@ std::string OffsetDetection::agreement() const {
 }
 
 std::string OffsetDetection::summary() const {
+    if (status == Status::Detected || status == Status::Cancelled) return summaryCore();
+    return summaryCore() + driveDatabaseNote(*this);
+}
+
+std::string OffsetDetection::summaryCore() const {
     switch (status) {
         case Status::Detected:
         {
             const std::string also = alternativesText();
-            return "Read offset " + signedNumber(offset) + " (" + agreementCore(*this) + ", confidence " +
-                   std::to_string(confidence()) + (also.empty() ? "" : "; " + also) + ")";
+            std::string s = "Read offset " + signedNumber(offset) + " (" + agreementCore(*this) + ", confidence " +
+                            std::to_string(confidence()) + (also.empty() ? "" : "; " + also) + ")";
+            if (driveDatabase.found() && !matchesDriveDatabase())
+                s += "; the AccurateRip drive database lists " + driveDatabase.entry.describe();
+            return s;
         }
         case Status::NotInDatabase:
             return "This disc is not in the AccurateRip database: the offset cannot be detected with it. "
@@ -232,6 +321,8 @@ std::vector<std::string> OffsetDetection::logLines() const {
     std::vector<std::string> lines;
     lines.push_back("Read offset detection (AccurateRip disc id " + id.toString() + ", " + std::to_string(pressings) +
                     " pressing(s), offsets -" + std::to_string(maxOffset) + "..+" + std::to_string(maxOffset) + ")");
+    if (driveDatabase.status != DriveOffsetDbMatch::Status::NotChecked)
+        lines.push_back("  " + driveDatabase.logLine());
     for (const OffsetDetectTrack& t : tracks) {
         char buf[160];
         std::string found;
@@ -253,15 +344,7 @@ std::vector<std::string> OffsetDetection::logLines() const {
     }
     if (!alternatives.empty()) {
         // Offsets every track matched at (shifted pressings), by summed confidence.
-        std::vector<OffsetCandidate> all;
-        OffsetCandidate best;
-        best.offset = offset;
-        best.tracks = agreeingTracks;
-        best.v1Confidence = v1Confidence;
-        best.v2Confidence = v2Confidence;
-        best.pressings = offsetPressings;
-        all.push_back(best);
-        all.insert(all.end(), alternatives.begin(), alternatives.end());
+        const std::vector<OffsetCandidate> all = allCandidates();
         std::string list;
         for (const OffsetCandidate& c : all) {
             list += (list.empty() ? "" : ", ") + signedNumber(c.offset) + " " + c.matchedVersion() + " confidence " +
@@ -270,6 +353,13 @@ std::vector<std::string> OffsetDetection::logLines() const {
         }
         lines.push_back("  Shifted pressings, summed per offset: " + list);
     }
+    if (overrodeMostSubmissions)
+        lines.push_back("  Most submissions at " + signedNumber(mostSubmissionsOffset) +
+                        ", but the AccurateRip drive database lists " + signedNumber(offset) +
+                        ", which every track read matches as well: using " + signedNumber(offset));
+    else if (decidedByDriveDatabase)
+        lines.push_back("  Submissions alone do not decide; " + signedNumber(offset) +
+                        " is the AccurateRip drive database's offset for this drive");
     lines.push_back("  Result: " + summary());
     return lines;
 }
@@ -319,6 +409,7 @@ OffsetDetection detectReadOffset(CdDrive& drive, const Toc& toc, const std::vect
     d.id = AccurateRipDiscId::fromToc(toc);
     d.maxOffset = options.maxOffset;
     d.pressings = pressings.size();
+    d.driveDatabase = options.driveDatabase;
     const std::vector<const Track*> usable = chooseOffsetTracks(toc, pressings, options);
     d.usableTracks = int(usable.size());
     if (usable.empty()) {
@@ -374,6 +465,7 @@ OffsetDetection detectReadOffset(CdDrive& drive, const Toc& toc, HttpClient& htt
         OffsetDetection d;
         d.id = id;
         d.maxOffset = options.maxOffset;
+        d.driveDatabase = options.driveDatabase;
         d.status = lookup.status == AccurateRipLookup::Status::NotFound ? OffsetDetection::Status::NotInDatabase
                                                                         : OffsetDetection::Status::LookupFailed;
         d.error = lookup.error;
@@ -392,6 +484,8 @@ std::string ReadOffsetSource::describe() const {
             return "saved for drive" + (detail.empty() ? std::string() : " " + detail);
         case Kind::Detected:
             return "auto-detected" + (detail.empty() ? std::string() : ": " + detail);
+        case Kind::Selected:
+            return "selected by user from candidates" + (detail.empty() ? std::string() : " " + detail);
     }
     return {};
 }

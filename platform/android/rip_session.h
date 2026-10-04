@@ -24,6 +24,7 @@
 #include "cdreader/clock.h"
 #include "cdreader/disc_image.h"
 #include "cdreader/drive_cache.h"
+#include "cdreader/drive_offset_db.h"
 #include "cdreader/gaps.h"
 #include "cdreader/http.h"
 #include "cdreader/metadata.h"
@@ -205,7 +206,18 @@ public:
     // The image of the current rip (beginRip() and ripTrack() clear it).
     const std::optional<RippedImage>& rippedImage() const { return image_; }
 
-    // Read offset auto-detection (#37): looks the disc up in AccurateRip
+    // AccurateRip drive offset database (#37): where DriveOffsets.bin is
+    // stored between runs (the app's cache folder; empty: not stored).
+    void setDriveOffsetDbCache(std::filesystem::path file) { driveOffsetDbCache_ = std::move(file); }
+    // The drive's entry: the stored file when fresh (kDriveOffsetDbMaxAgeSeconds),
+    // otherwise downloaded with `http` (null: only the stored file) and
+    // stored; a stale stored file when the download fails. Never throws.
+    // The result stays for the session (it belongs to the drive, not the disc).
+    const DriveOffsetDbMatch& lookupDriveOffsetDb(HttpClient* http);
+    const DriveOffsetDbMatch& driveOffsetDb() const { return driveOffsetDb_; }
+
+    // Read offset auto-detection (#37): consults the drive offset database
+    // (lookupDriveOffsetDb()), looks the disc up in AccurateRip
     // (`http` null: status LookupFailed) and reads a few tracks. Clears a
     // pending cancel first; cancel() makes it return status Cancelled.
     // Never throws for network or read problems; exceptions thrown by
@@ -256,6 +268,8 @@ private:
     AccurateRipReport accurateRip_;
     bool accurateRipChecked_ = false;
     std::optional<OffsetDetection> detection_;
+    std::filesystem::path driveOffsetDbCache_;
+    DriveOffsetDbMatch driveOffsetDb_;
     std::atomic<bool> cancelled_{false};
 };
 

@@ -1,8 +1,12 @@
 #include "rip_session.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
+#include <system_error>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -104,15 +108,59 @@ const std::string& RipSession::driveName() {
     return *driveName_;
 }
 
+const DriveOffsetDbMatch& RipSession::lookupDriveOffsetDb(HttpClient* http) {
+    namespace fs = std::filesystem;
+    DriveOffsetDbCache cache;
+    if (!driveOffsetDbCache_.empty()) {
+        std::error_code ec;
+        const fs::file_time_type written = fs::last_write_time(driveOffsetDbCache_, ec);
+        if (!ec) {
+            std::ifstream in(driveOffsetDbCache_, std::ios::binary);
+            if (in) {
+                cache.bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                cache.present = !in.bad();
+                cache.ageSeconds =
+                    std::chrono::duration_cast<std::chrono::seconds>(fs::file_time_type::clock::now() - written).count();
+            }
+        }
+    }
+    const DriveOffsetDbLoad load = loadDriveOffsetDb(http, cache);
+    if (load.shouldStore() && !driveOffsetDbCache_.empty()) {
+        // Write next to it and rename, so that a failure never leaves half a file.
+        std::error_code ec;
+        fs::create_directories(driveOffsetDbCache_.parent_path(), ec);
+        fs::path temp = driveOffsetDbCache_;
+        temp += ".tmp";
+        {
+            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+            out.write(load.bytes.data(), std::streamsize(load.bytes.size()));
+            out.flush();
+            if (!out) ec = std::make_error_code(std::errc::io_error);
+        }
+        if (!ec) fs::rename(temp, driveOffsetDbCache_, ec);
+        if (ec) fs::remove(temp, ec);
+    }
+    try {
+        driveOffsetDb_ = matchDriveOffsetDb(load, driveInfo());
+    } catch (const std::exception& e) {
+        driveOffsetDb_ = {};
+        driveOffsetDb_.status = DriveOffsetDbMatch::Status::Unavailable;
+        driveOffsetDb_.error = e.what();
+    }
+    return driveOffsetDb_;
+}
+
 const OffsetDetection& RipSession::detectReadOffset(HttpClient* http, OffsetDetectOptions options) {
     const Toc& t = toc();
     cancelled_ = false;
     options.cancelled = [this] { return cancelled_.load(); };
     detection_.reset();
+    options.driveDatabase = lookupDriveOffsetDb(http);
     if (http == nullptr) {
         OffsetDetection d;
         d.id = AccurateRipDiscId::fromToc(t);
         d.maxOffset = options.maxOffset;
+        d.driveDatabase = options.driveDatabase;
         d.status = OffsetDetection::Status::LookupFailed;
         d.error = "AccurateRip lookup disabled";
         detection_ = std::move(d);
@@ -447,10 +495,23 @@ std::string RipSession::ripLog() {
     log << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
         << readOffsetLogLine(options.readOffsetSamples, settings_.offsetSource) << "\n";
-    // The detection behind an auto-detected offset (#37).
-    if (settings_.offsetSource.kind == ReadOffsetSource::Kind::Detected && detection_ && detection_->detected() &&
+    // The detection behind an auto-detected offset, or the candidates the
+    // user chose from (#37); otherwise the drive database's offset, if known.
+    const ReadOffsetSource::Kind kind = settings_.offsetSource.kind;
+    bool detectionShown = false;
+    if (detection_ && kind == ReadOffsetSource::Kind::Detected && detection_->detected() &&
         detection_->offset == options.readOffsetSamples)
+        detectionShown = true;
+    if (detection_ && kind == ReadOffsetSource::Kind::Selected) {
+        const std::vector<OffsetCandidate> all = detection_->allCandidates();
+        detectionShown = std::any_of(all.begin(), all.end(), [&](const OffsetCandidate& c) {
+            return c.offset == options.readOffsetSamples;
+        });
+    }
+    if (detectionShown)
         for (const std::string& l : detection_->logLines()) log << l << "\n";
+    if (driveOffsetDb_.status != DriveOffsetDbMatch::Status::NotChecked)
+        log << driveOffsetDb_.logLine(options.readOffsetSamples) << "\n";
     log << "Format: " << settings_.format << "\n";
     if (const std::unique_ptr<AudioWriter> writer = createAudioWriter(settings_.format, settings_.encoder)) {
         const std::string encoder = writer->encoderDescription();
