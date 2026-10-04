@@ -841,6 +841,10 @@ class MainActivity : Activity() {
 
     private fun finishDetection(info: DriveInfo, d: OffsetDetection, thenRip: Boolean) {
         if (driveInfo?.offsetKey != info.offsetKey) return  // the drive was unplugged meanwhile
+        // Detection consulted the drive offset database (online): keep its answer for the label.
+        if (d.driveDbStatus == DriveDbStatus.FOUND || driveDb?.status != DriveDbStatus.FOUND)
+            if (d.driveDbStatus != DriveDbStatus.NOT_CHECKED)
+                driveDb = DriveOffsetDb(d.driveDbStatus, d.driveDbOffset, d.driveDbSubmissions, -1, "", d.driveDbLogLine)
         if (d.status == OffsetDetectStatus.DETECTED) {
             val db = if (d.matchesDriveDb) ", ドライブ DB と一致" else ""
             val agreed = "${d.agreeingTracks}/${d.testedTracks} トラック一致, ${d.version}$db"

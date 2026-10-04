@@ -32,7 +32,9 @@
 - トラックごとの CRC32 と `rip.log` (TOC・結果) を出力
 - [AccurateRip](https://www.accuraterip.com/) データベースとの照合 (チェックサム v1 / v2、confidence を表示)
 - AccurateRip を使ったドライブの読み取りオフセットの自動検出 (`cdreader offset`、`rip --offset auto`、Android は詳細設定)。
-  複数トラックが同じオフセットで一致したときだけ確定し (互いにずれた別プレスの登録が混在するディスクでは一致件数が十分に多いオフセットで確定)、ドライブ (ベンダー・モデル・リビジョン) ごとに保存して次回から自動で適用
+  複数トラックが同じオフセットで一致したときだけ確定し (互いにずれた別プレスの登録が混在するディスクでは、AccurateRip のドライブオフセット DB に
+  このドライブの登録値が候補にあればその値、なければ一致件数が十分に多いオフセットで確定。決まらなければ候補から選択)、
+  ドライブ (ベンダー・モデル・リビジョン) ごとに保存して次回から自動で適用
 - CD-Extra (エンハンスド CD) のデータトラック・セッション間ギャップを考慮
 - CDDB (既定は [gnudb.org](https://gnudb.org/)) からアルバム名・アーティスト・曲名などを取得し、
   フォルダ名・ファイル名・`rip.log` に使用
@@ -67,6 +69,7 @@ cdreader rip D: --no-gaps           プリギャップ (INDEX 00) を検出し�
 cdreader rip D: -f flac --htoa      1 曲目の前の隠しトラック (HTOA) も 00 - Hidden Track.flac として保存
 cdreader offset D:                  読み取りオフセットを AccurateRip で検出
 cdreader offset D: --save           検出したオフセットをこのドライブの値として保存
+cdreader offset D: --save --choose +6  候補が決まらないとき、表示された候補から +6 を選んで保存
 cdreader offsets                    保存済みのオフセット (ドライブごと) の一覧
 cdreader config cddb-email you@example.com  CDDB に送る連絡先メールアドレスを保存 (gnudb で必要)
 cdreader config cddb-server japdb   CDDB サーバーに JAPDB を使う (gnudb / japdb / URL)
@@ -505,17 +508,23 @@ AccurateRip に登録されているディスク (よく売れた CD ほど登�
 
 ```
 Drive: HL-DT-ST BD-RE BP71N (1.03)
+AccurateRip drive database: unavailable (HTTP 503)
 Detecting the read offset with AccurateRip (offsets -3000..+3000)...
 Reading track 07 (2 of at most 3)  100%
 
 Read offset detection (AccurateRip disc id 039-0032e455-0583f8e1-fb08ee27, 5 pressing(s), offsets -3000..+3000)
+  AccurateRip drive database: unavailable (HTTP 503)
   Track 12 (41 submissions): +6 v1+v2 (confidence 21, pressings 1+3), -145 v2 (confidence 13, pressing 2), -658 v2 (confidence 4, pressing 4)
   Track 07 (40 submissions): +6 v1+v2 (confidence 20, pressings 1+3), -145 v2 (confidence 13, pressing 2), -658 v2 (confidence 4, pressing 4)
   Shifted pressings, summed per offset: +6 v1+v2 confidence 41 (2 tracks, pressings 1+3), -145 v2 confidence 26 (2 tracks, pressing 2), -658 v2 confidence 8 (2 tracks, pressing 4)
   Result: Read offset +6 (2 of 2 tracks agreed, v1+v2, confidence 41; also -145 (26), -658 (8): other pressings)
 
+Candidates (pressings shifted against each other):
+  1.    +6  2 tracks, confidence 41, pressings 1+3
+  2.  -145  2 tracks, confidence 26, pressing 2
+  3.  -658  2 tracks, confidence 8, pressing 4
+
 Read offset: +6  (use: cdreader rip D: --offset 6; --save stores it for --offset auto)
-Other pressings' offsets: -145 (confidence 26), -658 (confidence 8); fewer submissions, not used
 ```
 
 (データベースに複数のプレスがあるディスクでは、一致したプレスの番号も表示します。)
@@ -535,6 +544,18 @@ Other pressings' offsets: -145 (confidence 26), -658 (confidence 8); fewer submi
     (ドライブの本来のオフセットで読んだ人が最も多いはず、という判断です。上の例では +6 の 41 件に対し -145 は 26 件)。
     差が小さい場合は最大 3 トラックまで読んで判定し直し、それでも差がなければ「判断できない」として確定しません。
     確定した場合も、他のプレスのオフセットと件数を結果・`rip.log`・保存するメモに併記します (Android 版は「他のプレスの候補: -145, -658」)。
+  - **AccurateRip のドライブオフセット DB** (下の節) にこのドライブの登録値があり、それが上の候補 (読んだすべてのトラックと矛盾しない
+    オフセット。別プレスがない場合は一致した唯一のオフセット) に含まれていれば、件数の差に関係なくその値で確定します。
+    オフセットはディスクではなくドライブの性質なので、登録件数が拮抗した 2 系統のプレスのディスク (#37 の実機報告:
+    1 トラックあたり +6 が 14 + 7 件、-145 が 13〜17 件) でも決まります。件数で選ばれる候補と DB の値が違う場合も、
+    DB の値が候補にあれば DB の値を使い、両方を結果と `rip.log` に記録します。
+    DB の値で一致したトラックがあれば、1 トラック目で確定します (あらかじめ分かっているオフセットでチェックサムが偶然一致することはまずありません)。
+    DB の値が候補にない場合、DB にドライブの登録がない場合、DB を取得できなかった場合は従来どおりに判定し、結果にその旨を表示します。
+  - それでも決まらない場合 (「判断できない」) は候補を一覧表示します (オフセット・一致したトラック数・合計件数・プレス番号、
+    DB の登録値には印)。Windows 版は `cdreader offset D: --save --choose <オフセット>` (例: `--choose +6`) で、もう一度検出したうえで
+    その候補を選んで保存します (候補にない値は受け付けません)。`--save` なしの `--choose` は表示だけです。
+    保存するメモは `selected by user from candidates +6, -145, -658` になり、`rip --offset auto` で使われます。
+    確かめるには、選んだ値でリッピングして AccurateRip で一致するかを見てください。
   - データベースに登録のあるトラックが 1 つしかないディスク (シングルなど) では、その 1 トラックの一致件数が 10 件以上のときだけ確定し、その旨を表示します。
   - ディスクが AccurateRip に登録されていない場合は「検出できない」と表示します。別の (よく売れた) CD で試してください。
 - `--save` を付けると、確定したオフセットを**ドライブ (ベンダー・モデル・リビジョン) ごと**に保存します。
@@ -553,9 +574,36 @@ Other pressings' offsets: -145 (confidence 26), -658 (confidence 8); fewer submi
 
 ```
 Read offset correction: +6 samples (auto-detected: 2 of 2 tracks agreed, v1+v2; also -145 (26), -658 (8): other pressings)
+Read offset correction: +6 samples (auto-detected: 1 of 1 track agreed, v1+v2, matches AccurateRip drive database (1234 submissions); also -145 (17), -658 (7): other pressings)
 Read offset correction: +6 samples (saved for drive HL-DT-ST BD-RE BP71N (1.03); auto-detected: 2 of 2 tracks agreed, v1+v2)
+Read offset correction: +6 samples (selected by user from candidates +6, -145, -658)
 Read offset correction: 0 samples (manual)
+AccurateRip drive database: +6 (1234 submissions, 100% agree); differs from the read offset used
 ```
+
+(件数は説明用の例です。)
+
+#### AccurateRip のドライブオフセット DB (DriveOffsets.bin)
+
+EAC・dBpoweramp・CUETools が使う、ドライブの機種ごとに登録されたオフセットの一覧
+(`http://www.accuraterip.com/accuraterip/DriveOffsets.bin`。[一覧の Web 版](https://www.accuraterip.com/driveoffsets.htm)) を、
+自動検出のときにダウンロードして使います。
+
+- **形式** (公式の仕様書はなく、同じファイルを読む CUETools の実装から): ヘッダなし、1 件 69 (0x45) バイトの固定長レコードの並び。
+  先頭 2 バイトがオフセット (int16 リトルエンディアン、EAC / `--offset` と同じ符号)、続く 33 バイトがドライブ名
+  (ASCII、NUL / 空白埋め。INQUIRY のベンダーとモデルを ` - ` でつないだもの。例: `HL-DT-ST - BD-RE  BP71N`)、残り 34 バイトがその他のデータです。
+  その他のデータの先頭は登録数 (int32) と一致率 (int32、%) と解釈していますが、**この部分は検証できていません**。
+  範囲外 (登録数 0〜1000 万、一致率 0〜100 以外) の値は「不明」とし、そうしたレコードが 1 割を超えるファイルでは全件「不明」として扱います
+  (使うのは同名の登録が複数あるときの優先順位と表示だけです)。
+- 壊れたデータへの対策: 末尾の半端なレコードは無視し、名前が空・制御文字を含むレコードは読み飛ばします。
+  HTML (エラーページ) や大半が読めないファイルは丸ごと無効とし、保存もしません。
+- **ドライブの照合**: INQUIRY のベンダーとモデルで探します。大文字小文字と空白の違いは無視し、
+  `ベンダー - モデル` (AccurateRip の形) と `ベンダー モデル` (EAC の形) のどちらでも一致とします。
+  同じドライブの登録が複数あれば登録数の多いものを使います。リビジョン (ファームウェア) は DB にないので照合に使いません。
+- **キャッシュ**: ダウンロードしたファイルは Windows 版は `%APPDATA%\cdreader\DriveOffsets.bin` (`drive_offsets.txt` と同じフォルダ)、
+  Android 版はアプリのキャッシュフォルダに保存し、30 日間は再ダウンロードしません。期限切れでダウンロードに失敗したときは古いファイルを使います。
+- `cdreader drives` は保存済みの DB にドライブの登録があれば `AccurateRip drive database +6 (...)` と表示します (ダウンロードはしません)。
+- `cdreader rip` は (`--no-accuraterip` でなければ) DB を参照し、使うオフセットと DB の値が違えば画面と `rip.log` に表示します。
 
 ### タグ
 
@@ -735,6 +783,10 @@ SCSI/MMC コマンドを送ります)。
    - 読み取りオフセット (Windows 版の `--offset` と同じ値)。「オフセットを自動検出」を押すと、入っているディスクで
      AccurateRip を使って検出し (Windows 版の `cdreader offset` と同じ処理。進行状況を表示し、「検出を中止」で中断できます)、
      確定した値を欄に入れてドライブ (ベンダー・モデル・リビジョン) ごとに保存します。
+     AccurateRip のドライブオフセット DB の登録値で確定した場合はその旨を表示します。
+     別プレスの件数が拮抗して決まらない場合は、候補 (オフセット・一致トラック数・登録件数・プレス番号。DB の登録値には「★ドライブ DB の登録値」)
+     を一覧するダイアログを表示し、選んだ値を欄に入れてドライブの値として保存します (メモは「selected by user from candidates ...」)。
+     保存済みの DB にドライブの登録があれば、欄の横に「(AccurateRip ドライブ DB: +6, … 件)」も表示します。
      保存済みのドライブを接続すると自動でその値を使い、欄の横に「(ドライブ <モデル名> の保存値)」と表示します
      (欄を書き換えると手動の値になります)。
      オフセットが保存されていないドライブでオフセット 0 のままリッピングを始めると、先に自動検出するかを確認します
@@ -922,9 +974,13 @@ Matroska (`cdreader_mka_tests`) は、EBML の可変長整数・各要素の符�
 (CBW/CSW、REQUEST SENSE、ショート転送、STALL・フェーズエラーからのリセット回復、仮想ドライブ経由のリッピング、
 C2 付き読み取りの転送サイズ 24 × 2646 バイト) を検証します。
 `cdreader_rip_session_tests` は Android 版のリッピング処理 (`platform/android/rip_session.*`) を仮想 USB デバイスと偽の `HttpClient` で検証します
-(FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`、C2 の有効・無効・非対応・切り替えと `rip.log` の C2 の行、キャッシュ対策の設定・ディスクごとに 1 回の判定・`none` でコマンドを送らないこと・FUA から追い出しへの切り替えと `rip.log` の行、USB 経由のオフセット自動検出 (オフセット 0 で不一致 → 検出 → 検出値でのリッピングで全トラック一致、互いにずれた 5 プレスの登録からの検出と `rip.log` の他プレスの候補)・照会失敗・未登録・キャンセルと `rip.log` のオフセットの出所の行、設定した CDDB サーバー・連絡先メールアドレスでの問い合わせと、hello を拒否されたときの `rip.log` の `Hint:` 行)。
+(FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`、C2 の有効・無効・非対応・切り替えと `rip.log` の C2 の行、キャッシュ対策の設定・ディスクごとに 1 回の判定・`none` でコマンドを送らないこと・FUA から追い出しへの切り替えと `rip.log` の行、USB 経由のオフセット自動検出 (オフセット 0 で不一致 → 検出 → 検出値でのリッピングで全トラック一致、互いにずれた 5 プレスの登録からの検出と `rip.log` の他プレスの候補)・照会失敗・未登録・キャンセルと `rip.log` のオフセットの出所の行、ドライブオフセット DB (偽の DriveOffsets.bin のダウンロードと保存、30 日以内は再取得しないこと、期限切れ時の再取得と失敗時の古いファイルの利用、DB による確定と `rip.log` の DB の行、候補からの選択の `rip.log`、手動値と DB の値の違いの表示)、設定した CDDB サーバー・連絡先メールアドレスでの問い合わせと、hello を拒否されたときの `rip.log` の `Hint:` 行)。
 
 読み取りオフセットの自動検出 (#37) は、仮想ドライブと偽の AccurateRip データ (各トラックを指定のオフセットで読んだチェックサム) で、正のオフセット (+6, +667)・負のオフセット (-1164, -472)・v1 / v2、トラックの選び方 (中間・登録件数・長さ・`-t`)、候補が割れる場合、互いにずれたプレス (5 プレスの登録で件数の合計による確定・件数が近いときの保留・プレスの登録がないトラック)、1 トラックだけ一致、一致なし、登録トラックが 1 つのディスク (件数による確定 / 保留)、未登録 (HTTP 404)・ネットワーク障害 (読み取りをしないこと)、キャンセルと進行状況、ディスクの最初・最後のトラックを ±3000 サンプルで端まで読むこと、保存形式の往復 (壊れた行の無視) と `rip.log` の行を検証します。
+AccurateRip のドライブオフセット DB は、合成した DriveOffsets.bin (末尾の半端なレコード・不正な名前・HTML・ノイズ・範囲外の登録数) の解析、
+ドライブ名の照合 (空白・大文字小文字・区切りの違い、別機種)、キャッシュの鮮度とダウンロード失敗時の扱い、
+件数で決まらない #37 のディスク (+6 / -145 / -658、1 トラックあたり 21 / 17 / 7 件) が DB の +6 で確定すること、
+DB の値が候補にない・DB を取得できない・ドライブの登録がない場合に従来どおりであること、件数の多い候補より DB の値を優先する場合の記録を検証します。
 
 ### Android アプリ
 
@@ -963,6 +1019,7 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   file_naming  メタデータからのファイル名・フォルダ名・アルバム単位のファイル名 (使えない文字の置換)
   accuraterip  AccurateRip ディスク ID・チェックサム v1/v2・データベース応答の解析と照合・オフセットごとのチェックサム (スライド計算)
   offset_detect  読み取りオフセットの自動検出 (トラックの選択・一致の判定)、rip.log の出所の行、ドライブごとの保存形式
+  drive_offset_db  AccurateRip のドライブオフセット DB (DriveOffsets.bin) の解析・ドライブ名の照合・キャッシュの判定
   ripper    リトライ・セクタ分割・verify・C2 エラーの再読込を含むトラック読み取り、C2 / キャッシュ対策の rip.log 行
   drive_cache  ドライブキャッシュ対策 (FUA・追い出し・自動判定)
   clock     時計のインターフェース (キャッシュ判定の時間測定。テストでは擬似時間)
@@ -1029,7 +1086,7 @@ Android 版は USB ホスト API (`UsbDeviceConnection`) のファイルディ�
 - [x] 再読込 (`--verify`・リトライ・C2) でのドライブキャッシュ回避 (FUA・追い出し・自動判定、`--cache`、Android は詳細設定) — [#34](https://github.com/noribow/cdreader/issues/34)
   (実装済み・実機での動作確認待ち)
 - [x] 読み取りオフセットの自動検出・自動設定 (複数トラックの一致で確定、ドライブごとに保存、`rip --offset auto`・`offset --save`、
-  Android は詳細設定の「オフセットを自動検出」とリッピング前の確認) — [#37](https://github.com/noribow/cdreader/issues/37)
+  Android は詳細設定の「オフセットを自動検出」とリッピング前の確認、AccurateRip のドライブオフセット DB による確定と候補からの選択) — [#37](https://github.com/noribow/cdreader/issues/37)
   (実装済み・実機での動作確認待ち)
 - [x] CDDB 設定 (サーバー URL・連絡先メールアドレス、接続テスト、hello を拒否されたときの案内。`cdreader config` / `cddb-test`、
   Android は詳細設定の「CDDB」) — [#38](https://github.com/noribow/cdreader/issues/38)

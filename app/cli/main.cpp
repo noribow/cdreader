@@ -612,10 +612,10 @@ void printCandidates(const cdr::OffsetDetection& d) {
         const cdr::OffsetCandidate& c = all[i];
         std::string pressings;
         for (int p : c.pressings) pressings += (pressings.empty() ? "" : "+") + std::to_string(p);
+        if (!pressings.empty()) pressings = (c.pressings.size() == 1 ? ", pressing " : ", pressings ") + pressings;
         const bool db = d.driveDatabase.found() && d.driveDatabase.entry.offset == c.offset;
-        std::printf("  %zu. %+5d  %d track%s, confidence %d%s%s\n", i + 1, c.offset, c.tracks, c.tracks == 1 ? "" : "s",
-                    c.score(), pressings.empty() ? "" : (", pressing" + std::string(c.pressings.size() == 1 ? " " : "s ") + pressings).c_str(),
-                    db ? "  <- AccurateRip drive database" : "");
+        std::printf("  %d. %+5d  %d track%s, confidence %d%s%s\n", int(i + 1), c.offset, c.tracks,
+                    c.tracks == 1 ? "" : "s", c.score(), pressings.c_str(), db ? "  <- AccurateRip drive database" : "");
     }
 }
 
