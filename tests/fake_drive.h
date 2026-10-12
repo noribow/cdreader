@@ -95,6 +95,40 @@ public:
     }
     bool cached(uint32_t lba) const { return cache_.count(lba) != 0; }
 
+    // Read speed (#49). MODE SENSE page 2Ah reports maxSpeedKBps (bytes 8..9)
+    // and, with reportCurrentSpeed, readSpeedKBps (bytes 14..15). While
+    // readSpeedKBps is 0 (never set) a disc read costs discSectorMicros per
+    // sector, otherwise the time of 2352 bytes at that speed (1x: 13.3 ms).
+    uint16_t maxSpeedKBps = 0;
+    uint16_t readSpeedKBps = 0;
+    bool reportCurrentSpeed = true;
+    // SET CD SPEED (BBh): Accept sets readSpeedKBps to the request (0xFFFF:
+    // maxSpeedKBps), capped at maxSpeedKBps, or with supportedSpeeds to the
+    // fastest of them not above the request (the slowest when all are);
+    // Ignore accepts the command and changes nothing; Reject answers
+    // ILLEGAL REQUEST (invalid command operation code).
+    enum class SetSpeedMode { Accept, Ignore, Reject };
+    SetSpeedMode setSpeedMode = SetSpeedMode::Accept;
+    std::vector<uint16_t> supportedSpeeds;
+    int setSpeedCommands = 0;  // commandLog has the requested kB/s as the LBA of 0xBB entries
+    std::vector<uint8_t> lastSetSpeedCdb;
+    // GET PERFORMANCE (ACh) type 00h: one descriptor over the whole disc,
+    // from perfStartKBps to perfEndKBps; both 0: ILLEGAL REQUEST.
+    // performanceResponse, when set, is returned instead (garbage tests).
+    uint32_t perfStartKBps = 0;
+    uint32_t perfEndKBps = 0;
+    std::vector<uint8_t> performanceResponse;
+    std::vector<uint8_t> lastGetPerformanceCdb;
+    // Sectors that read correctly only at maxKBps or slower: faster (or at
+    // the speed never set) a read fails with a MEDIUM ERROR, or with c2
+    // returns wrong data flagged with C2 bits (bytes 1000..1015).
+    struct SpeedFault {
+        uint32_t maxKBps = 0;
+        bool c2 = false;
+    };
+    std::map<uint32_t, SpeedFault> speedFaults;
+    bool tooFast(const SpeedFault& f) const { return readSpeedKBps == 0 || readSpeedKBps > f.maxKBps; }
+
     // READ SUB-CHANNEL (42h), formats 02h / 03h. A code that is set is
     // returned with MCVal / TCVal = 1 as is (up to 13 / 12 bytes, so that
     // malformed codes can be tested); an unset one with the valid bit 0.

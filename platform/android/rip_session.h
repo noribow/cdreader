@@ -25,6 +25,7 @@
 #include "cdreader/disc_image.h"
 #include "cdreader/drive_cache.h"
 #include "cdreader/drive_offset_db.h"
+#include "cdreader/drive_speed.h"
 #include "cdreader/gaps.h"
 #include "cdreader/http.h"
 #include "cdreader/metadata.h"
@@ -65,6 +66,12 @@ struct RipSettings {
     CacheSetting cache = CacheSetting::Auto;
     // Where options.readOffsetSamples came from (#37), for rip.log.
     ReadOffsetSource offsetSource;
+    // Read speed (#49): SET CD SPEED before the rip when requested (the app
+    // leaves the drive at its speed), and slowdown on read errors (on by
+    // default in the app); beginRip() sets options.slowdown / speedKBps /
+    // currentSpeedKBps.
+    SpeedSetting speed;
+    bool slowdown = true;
 };
 
 struct RippedTrack {
@@ -109,7 +116,8 @@ class RipSession {
 public:
     explicit RipSession(CdDrive& drive) : drive_(drive) {}
 
-    // The clock of the cache detection (default: steadyClock()); tests use
+    // The clock of the cache detection and of the measured read speed
+    // (default: steadyClock()); tests use
     // the fake drive's simulated time. `clock` must outlive the session.
     void setClock(Clock& clock) { clock_ = &clock; }
 
@@ -153,10 +161,16 @@ public:
     // "NN - Title.<ext>" or "TrackNN.<ext>". Throws std::invalid_argument for an unknown format.
     std::string trackFileName(int number, const std::string& format);
 
+    // MODE SENSE page 2Ah and GET PERFORMANCE (#49): the drive's read speeds
+    // for the connection status. Never throws.
+    const DriveSpeedInfo& readDriveSpeed();
+    const DriveSpeedInfo& driveSpeed() const { return driveSpeed_; }
+
     // Starts a rip: validates the settings, forgets earlier rip results,
     // clears a pending cancel, checks C2 support and the drive cache (one
-    // MODE SENSE when either is wanted; the cache timing test of the Auto
-    // setting only once per disc) and reads the MCN / ISRCs and detects the
+    // MODE SENSE; the cache timing test of the Auto setting only once per
+    // disc), the read speed (GET PERFORMANCE, SET CD SPEED when
+    // settings.speed is requested) and reads the MCN / ISRCs and detects the
     // gaps if not done yet for this disc (settings.readDiscCodes /
     // detectGaps). Throws std::invalid_argument.
     void beginRip(const RipSettings& settings);
@@ -172,6 +186,10 @@ public:
     const DriveCacheCheck& cacheCheck() const { return cacheCheck_; }
     // Why FUA was given up during this rip (empty: it was not).
     const std::string& cacheFallback() const { return cacheFallback_; }
+    // The read speed set-up of beginRip() (#49).
+    const ReadSpeedSetup& speedSetup() const { return speedSetup_; }
+    // Why slowing down was given up during this rip (empty: it was not).
+    const std::string& slowdownFallback() const { return slowdownFallback_; }
 
     // Rips one audio track to `path` (a seekable local file: WAV, FLAC and Ogg
     // FLAC headers are patched when the file is closed), computing its AccurateRip
@@ -263,6 +281,9 @@ private:
     DriveCacheCheck cacheCheck_;
     std::optional<DriveCacheCheck> detectedCache_;  // Auto: the timing test of this disc
     std::string cacheFallback_;
+    DriveSpeedInfo driveSpeed_;
+    ReadSpeedSetup speedSetup_;
+    std::string slowdownFallback_;
     std::vector<RippedTrack> ripped_;
     std::optional<RippedImage> image_;
     AccurateRipReport accurateRip_;

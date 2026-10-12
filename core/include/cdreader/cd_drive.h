@@ -27,6 +27,12 @@ struct DriveCapabilities {
     // "Buffer Size Supported by Logical Unit" in KB (MMC page 2Ah bytes
     // 12..13, #34); 0 when the page is too short or the drive reports none.
     uint32_t bufferKB = 0;
+    // Read speeds in kB/s (1000 bytes; 1x = 176.4, #49): "Maximum Read Speed
+    // Supported" (bytes 8..9, obsolete since MMC-3 but still filled by most
+    // drives) and "Current Read Speed Selected" (bytes 14..15). 0 when the
+    // page is too short or the field is 0; see plausibleCdSpeed() for garbage.
+    uint32_t maxReadKBps = 0;
+    uint32_t currentReadKBps = 0;
     std::string error;        // why the page could not be read (valid == false)
 
     // Parses a MODE SENSE(10) response (8-byte header, block descriptors, page).
@@ -81,6 +87,17 @@ public:
     // MODE SENSE(10), page 2Ah. Never throws: a failure means "unknown"
     // (valid false), which callers treat as "no C2 pointers".
     DriveCapabilities readCapabilities();
+
+    // GET PERFORMANCE (ACh), data type 00h (performance data: read, nominal
+    // performance, 10% tolerance) from LBA 0, up to `maxDescriptors` 16-byte
+    // descriptors into `out` (8 + 16 * maxDescriptors bytes). Does not throw;
+    // see DiscPerformance::parse() (drive_speed.h).
+    ScsiResult getPerformance(uint8_t* out, uint16_t maxDescriptors);
+
+    // SET CD SPEED (BBh): read speed in kB/s (0xFFFF: as fast as possible)
+    // and write speed (0xFFFF: the drive's choice), rotational control 00b
+    // (CLV and non-pure CAV). Does not throw.
+    ScsiResult setCdSpeed(uint16_t readKBps, uint16_t writeKBps = 0xFFFF);
 
     // READ CD of `count` CD-DA sectors with sub-channel data (#25): each sector
     // is 2352 bytes of audio followed by subChannelBytesPerSector(selection)

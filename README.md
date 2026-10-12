@@ -28,6 +28,9 @@
   「疑わしい位置」(Suspicious position) として `rip.log` に記録 (既定で有効、`--no-c2` で無効)
 - **ドライブキャッシュ対策**: `--verify` の 2 回目・リトライ・C2 の再読込の前に、ドライブのキャッシュではなくディスクから
   読み直させる (FUA または追い出し。既定はドライブを試験して自動選択、`--cache` で指定)
+- **読み取り速度**: ドライブの最大・現在の読み取り速度とディスク上の速度範囲 (例: CAV 16x〜40x) を表示し、
+  リッピング中に実測した速度をトラックごとに `rip.log` に記録。`--speed` で読み取り速度を指定でき、
+  読み取りエラーや C2 エラーが残るセクタは速度を落として (8x → 4x) 読み直します (既定で有効、`--no-slowdown` で無効)
 - ドライブの読み取りオフセット補正 (`--offset`、EAC / AccurateRip と同じ値)
 - トラックごとの CRC32 と `rip.log` (TOC・結果) を出力
 - [AccurateRip](https://www.accuraterip.com/) データベースとの照合 (チェックサム v1 / v2、confidence を表示)
@@ -42,7 +45,7 @@
 ## 使い方 (Windows)
 
 ```
-cdreader drives                     光学ドライブの一覧 (C2 エラーポインタ対応の有無とキャッシュサイズも表示)
+cdreader drives                     光学ドライブの一覧 (C2 エラーポインタ対応の有無・キャッシュサイズ・読み取り速度も表示)
 cdreader toc D:                     TOC (トラック一覧)、MCN / ISRC と CDDB のディスク情報を表示
 cdreader rip D:                     全オーディオトラックを "アーティスト - アルバム"\ に保存
 cdreader rip D: -t 1,3-5 -o out     トラック 1,3,4,5 を out\ に保存
@@ -51,6 +54,8 @@ cdreader rip D: --offset 6          読み取りオフセット +6 サンプル�
 cdreader rip D: --offset auto       このドライブの保存済みオフセットを使う (なければ自動検出して保存)
 cdreader rip D: --no-c2             C2 エラーポインタを使わずに読み取る
 cdreader rip D: --verify --cache flush  2 回読み比較、キャッシュは追い出しで回避
+cdreader rip D: --speed 8           8 倍速で読み取る (傷の多いディスク向け)
+cdreader rip D: --no-slowdown       読み取りエラー時に速度を落とさない
 cdreader rip D: --single-file       全トラックを 1 つの WAV と CUE シートに保存
 cdreader rip D: -f flac             FLAC で保存
 cdreader rip D: -f oggflac          Ogg FLAC (.oga) で保存
@@ -88,6 +93,8 @@ cdreader cddb-test                  CDDB サーバーへの接続テスト
 | `-r, --retries <n>` | 読み取り失敗時のリトライ回数 (既定: 5)。C2 エラーのあるセクタの再読込回数の上限も兼ねます |
 | `--verify` | 全ブロックを 2 回読みして比較 (低速) |
 | `--no-c2` | C2 エラーポインタを使わない (既定では対応ドライブなら使います。「C2 エラーポインタ」の節を参照) |
+| `--speed <max\|N>` | リッピング前に読み取り速度を設定する (`SET CD SPEED`): `max` (最高速) または `N` 倍速 (1〜72、`8` または `8x`)。ドライブが応じたかを `rip.log` に記録します。既定ではコマンドを送らずドライブの速度のまま。「読み取り速度」の節を参照 |
+| `--no-slowdown` | 読み取りエラー・C2 エラーが残るセクタを速度を落として読み直す処理をしない (既定では行います) |
 | `--cache <mode>` | 再読込の前のドライブキャッシュ対策: `auto` (既定。ディスクごとにドライブを試験して選ぶ)・`fua`・`flush` (追い出し)・`none` (しない)。「ドライブキャッシュ対策」の節を参照 |
 | `--offset <n>` | 読み取りオフセット補正 (サンプル単位、負の値も可。既定: 0) |
 | `--offset auto` | このドライブの保存済みオフセットを使う。保存されていなければ AccurateRip で自動検出して保存してから読み取る (検出できなければリッピングせずに終了)。「読み取りオフセットの自動検出」の節を参照 |
@@ -309,6 +316,76 @@ Cache test (26 sectors): re-read 1.1 ms, after flush 24.5 ms, after FUA 23.8 ms
 - 追い出しは確実ですが低速です。FUA が効くドライブなら `--cache fua` の方が速く、キャッシュを持たないと分かっているドライブなら `--cache none` で構いません。
 - `cdreader drives` はキャッシュサイズのみを表示します (判定にはディスクと数秒の読み取りが必要なため、リッピング開始時に行います)。
 - 実機での動作確認はこれからです。
+
+### 読み取り速度
+
+([#49](https://github.com/noribow/cdreader/issues/49))
+
+**ドライブが報告する速度**: `cdreader drives`・`cdreader toc`・リッピング開始時 (と `rip.log`)、Android 版ではドライブ名の下に、
+次のように表示します:
+
+```
+Read speed: max 48x (8467 kB/s), current 24x; disc performance 16x-40x
+```
+
+- `max` / `current`: `MODE SENSE` ページ 2Ah の最大読み取り速度 (バイト 8〜9) と現在の読み取り速度 (バイト 14〜15)。
+  MMC-3 以降では廃止扱いのフィールドですが、多くのドライブはまだ値を入れています。
+- `disc performance`: `GET PERFORMANCE` (ACh、種類 00h・読み取り・公称性能) が返すディスク上の速度範囲。CAV のドライブは
+  外周ほど速いので `16x-40x`、CLV なら `24x` のように 1 つの値になります。ディスクが入っていないと表示されません。
+- 速度は kB/s (1000 バイト) で、1 倍速 = 176.4 kB/s (ドライブは 176 または 177 で報告します) として四捨五入した倍率で表示します。
+  0・0xFFFF・DVD の速度 (72 倍速を超える値) など CD としてありえない値は「不明」として扱い、表示しません。
+  何も分からなければ `Read speed: not reported by the drive` です。
+
+**実測の速度**: リッピング中、ドライブからの読み取りにかかった時間 (エンコードやファイル書き込みを除く。リトライ・再読込・キャッシュ対策を含む)
+から、トラックごとの速度を `rip.log` に、全体の平均を最後に記録します。Windows 版は進捗表示にも現在のトラックの速度を出します:
+
+```
+03 - Song.flac  CRC32 1A2B3C4D  retries 0  OK
+  Read speed: 23.8x (4198 kB/s)
+...
+Average read speed: 24.1x (4251 kB/s), 12 track(s) in 3:12
+```
+
+**速度の指定** (`--speed max|N`): リッピングの前 (キャッシュ判定の後) に `SET CD SPEED` (BBh。読み取り速度 = N × 176.4 kB/s の切り上げ、
+`max` は 0xFFFF、書き込み速度は 0xFFFF) を送り、`MODE SENSE` で現在の速度を読み直して結果を記録します:
+
+| `rip.log` | 意味 |
+| --- | --- |
+| `Read speed set to 8x (drive reports 8x)` | 設定できた (ドライブは対応する最も近い速度を選ぶので、`10x` を指定して `8x` になることもあります) |
+| `Read speed set to 8x (the drive does not report its current speed)` | 受け付けられたが、ドライブが現在の速度を報告しないため確認できない |
+| `Read speed: requested 8x, but the drive ignored the request (drive reports 24x)` | 受け付けたが速度が変わらなかった |
+| `Read speed: the drive rejected SET CD SPEED to 8x (...)` | 拒否された (ドライブの速度のまま読み取り、速度を落とす再読込も行いません) |
+
+リッピング後に速度は元に戻さず、指定した速度のままにします (多くのドライブはディスクの交換時に既定の速度に戻ります)。
+`--speed` を指定しなければ `SET CD SPEED` は送りません。
+
+**エラー時の減速** (既定で有効、`--no-slowdown` で無効。Android 版は「詳細設定」の「読み取りエラー時に速度を落として読み直す」):
+高速では読めないセクタも、回転を落とすと読めることがあります。次の場合、そのセクタを 8 倍速、それでもだめなら 4 倍速で読み直します
+(現在の速度以上の段階は飛ばします。`--speed 8` なら 4 倍速のみ、`--speed 4` 以下なら減速しません):
+
+- リトライとセクタ単位の再読込 (`--retries`) の後も読めないセクタ: 各速度で 2 回まで (`--verify` では一致する 2 回読みを 2 回まで)
+- C2 エラーの再読込 (`--retries` 回) で解決しなかったセクタ: 各速度で 2 回まで再読込 (速度を変えた後は、その速度で C2 エラーなしに読めるか、
+  同じデータが 2 回続けば解決)
+
+速度を落としたまま同じブロック (最大 26 セクタ) の残りを読み、ブロックの終わりで元の速度 (`--speed` の値、指定がなければ `max`) に戻します。
+エラーのない読み取りではコマンドは 1 つも増えません (減速なしと同じコマンド列)。ドライブが `SET CD SPEED` を拒否した場合は、
+そのディスクの残りでは減速を行わず、`rip.log` に記録します。`rip.log` の例:
+
+```
+Read speed: max 48x (8467 kB/s), current 24x; disc performance 16x-40x
+Read speed set to 24x (drive reports 24x)
+Slowdown on read errors: 8x, 4x
+...
+05 - Song.flac  CRC32 0A1B2C3D  retries 6  OK
+  Read speed: 19.7x (3475 kB/s)
+  Slowdown: 2 sector(s) re-read at 8x, 1 at 4x
+06 - Song.flac  CRC32 ...  retries 4  1 unreadable sector(s)
+  Slowdown: 1 sector(s) not recovered at lower speeds
+```
+
+`Slowdown given up: SET CD SPEED to 8x failed at LBA ... (...)` は、そのトラックの途中でドライブが減速を拒否したことを示します。
+
+注意: 速度の扱いはドライブ依存です (指定を無視する、近い速度に丸める、現在の速度を報告しないドライブがあります)。実機での動作確認はこれからです。
 
 ### FLAC 出力
 
@@ -773,7 +850,7 @@ SCSI/MMC コマンドを送ります)。
 
 1. ドライブに音楽 CD を入れ、端末に接続します。「cdreader を開きますか?」と表示されたら開きます
    (表示されない場合はアプリを起動して「ドライブに接続」を押し、USB へのアクセスを許可します)。
-2. ドライブ名とトラック一覧 (長さ) が表示されます。「CDDB で曲名を取得」がオン (既定) なら CDDB (gnudb.org) で検索し、
+2. ドライブ名と読み取り速度 (最大・現在・ディスク上の速度範囲。「読み取り速度」の節を参照)、トラック一覧 (長さ) が表示されます。「CDDB で曲名を取得」がオン (既定) なら CDDB (gnudb.org) で検索し、
    アーティスト・アルバム名・曲名を表示します。候補が複数あるときは一覧の上の選択欄で切り替えられます。
    ディスクを入れ替えたら「TOC を再読込」を押します。
 3. 「保存先フォルダ」で保存先を選びます (Storage Access Framework。選んだフォルダは次回以降も使われます)。
@@ -793,6 +870,7 @@ SCSI/MMC コマンドを送ります)。
      (「検出する」/「このまま続ける」。接続ごとに 1 回)
    - 「2 回読みして比較 (低速)」(Windows 版の `--verify`)
    - 「C2 エラーポインタを使う (対応ドライブのみ)」(既定でオン。オフにすると Windows 版の `--no-c2` と同じ。「C2 エラーポインタ」の節を参照)
+   - 「読み取りエラー時に速度を落として読み直す」(既定でオン。オフにすると Windows 版の `--no-slowdown` と同じ。「読み取り速度」の節を参照)
    - 「キャッシュ対策」: 自動 (既定) / FUA / 追い出し / なし (Windows 版の `--cache auto|fua|flush|none`。「ドライブキャッシュ対策」の節を参照)。
      自動ではディスクごとに最初のリッピング開始時に数秒かけてドライブを試験します
    - 「CDDB」([#38](https://github.com/noribow/cdreader/issues/38)。「CDDB 設定」の節を参照):
@@ -819,7 +897,7 @@ MCN / ISRC はリッピング開始時にディスクごとに 1 回読み取り
 プリギャップ・HTOA もリッピング開始時にディスクごとに 1 回検出し、`rip.log` に記録します
 (トラックごとのリッピングでは記録のみで、HTOA は保存しません。シングルファイルでは CUE シートの `INDEX 00` とイメージ先頭の HTOA になります)。
 `rip.log` には Windows 版と同じく、ドライブ・C2 対応状況・設定・TOC・CDDB の結果・トラックごとの CRC32 / リトライ回数 / 読めなかったセクタ数・
-C2 エラーの集計と疑わしい位置・読み取りオフセットとその出所 (手動・ドライブの保存値・自動検出と一致したトラック数)・キャッシュ対策 (判定結果・試験の時間・トラックごとの回数)・AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
+C2 エラーの集計と疑わしい位置・読み取りオフセットとその出所 (手動・ドライブの保存値・自動検出と一致したトラック数)・キャッシュ対策 (判定結果・試験の時間・トラックごとの回数)・読み取り速度 (ドライブの報告・実測・減速の結果)・AccurateRip の結果 (チェックサム v1 / v2、プレスごとの一致) が記録されます。
 読み取り中は「キャンセル」で中断できます。リトライ回数は 5 回固定です。
 
 ### シングルファイル (Android)
@@ -916,6 +994,12 @@ C2 を報告しない誤データは `--verify` か AccurateRip でしか分か�
 `--verify` の 2 回目・リトライ・セクタ単位の再読込・C2 の再読込を各方法で行ったとき、対策なしではキャッシュから一時的な誤データが
 「確認」されてしまい、対策ありではディスクから読み直して正しいデータになること、`none` (とキャッシュなしと判定された場合) の
 コマンド列が #33 と同じであること、途中で FUA を拒否された場合の追い出しへの切り替えを検証します。
+読み取り速度 (#49) では、仮想ドライブがページ 2Ah の速度、`GET PERFORMANCE` の応答 (CAV の範囲・不正な値)、`SET CD SPEED`
+(受け付ける・無視する・拒否する、対応速度への丸め)、速度に応じた 1 セクタの読み取り時間と、一定の速度以下でしか正しく読めないセクタ
+(読み取りエラーまたは C2 エラー) を再現します。ページ 2Ah と `GET PERFORMANCE` の解析と CDB、`SET CD SPEED` の CDB、`--speed` の解析、
+設定の結果 (適用・近い速度・無視・拒否・確認不能) と `rip.log` の書式、擬似時間による実測速度、8x / 4x への減速で読めるようになること
+(C2 エラーを含む)、ブロックの後で元の速度に戻ること、現在の速度以上の段階を飛ばすこと、拒否されたら以後は減速しないこと、
+減速なし (とエラーのないディスク) のコマンド列が変わらないこと、USB 経由の RipSession での表示・設定・減速・`rip.log` を検証します。
 環境変数 `CDREADER_TEST_OUTPUT` にディレクトリを指定すると、テストで作ったサンプル (タグ付き WAV、CUE、Ogg) をそこに残すので、
 ffprobe / MediaInfo / ExifTool / ogginfo などの外部ツールで確認できます。
 テストの一時ファイルは、テストプログラムごとにシステムの一時ディレクトリの下に作る専用のディレクトリ (`cdreader_test_<乱数>`) に書き、
@@ -1010,7 +1094,8 @@ cmake -S . -B build -DCDREADER_BUILD_JNI=ON && cmake --build build
 ```
 core/       プラットフォーム非依存のコア (Windows / Android で共有)
   scsi      ScsiTransport インターフェース、センスデータ解析
-  cd_drive  MMC コマンド (INQUIRY, TEST UNIT READY, READ TOC, READ CD, READ SUB-CHANNEL, MODE SENSE, READ(12) FUA)
+  cd_drive  MMC コマンド (INQUIRY, TEST UNIT READY, READ TOC, READ CD, READ SUB-CHANNEL, MODE SENSE, READ(12) FUA,
+            GET PERFORMANCE, SET CD SPEED)
   subchannel  サブチャンネル Q の MCN / ISRC 応答の解析・検証、ディスク全体の読み取り (DiscCodes)、セクタごとの Q フレームの解析
   gaps      プリギャップ (INDEX 00)・INDEX 02 以降・HTOA の検出 (Q の二分探索)
   toc       TOC 解析、CDDB ID
@@ -1020,9 +1105,10 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   accuraterip  AccurateRip ディスク ID・チェックサム v1/v2・データベース応答の解析と照合・オフセットごとのチェックサム (スライド計算)
   offset_detect  読み取りオフセットの自動検出 (トラックの選択・一致の判定)、rip.log の出所の行、ドライブごとの保存形式
   drive_offset_db  AccurateRip のドライブオフセット DB (DriveOffsets.bin) の解析・ドライブ名の照合・キャッシュの判定
-  ripper    リトライ・セクタ分割・verify・C2 エラーの再読込を含むトラック読み取り、C2 / キャッシュ対策の rip.log 行
+  ripper    リトライ・セクタ分割・verify・C2 エラーの再読込・エラー時の減速を含むトラック読み取り、C2 / キャッシュ対策 / 速度の rip.log 行
+  drive_speed  読み取り速度 (ページ 2Ah・GET PERFORMANCE の解析、SET CD SPEED の結果判定、実測速度の書式)
   drive_cache  ドライブキャッシュ対策 (FUA・追い出し・自動判定)
-  clock     時計のインターフェース (キャッシュ判定の時間測定。テストでは擬似時間)
+  clock     時計のインターフェース (キャッシュ判定・読み取り速度の時間測定。テストでは擬似時間)
   audio_writer  出力フォーマットの共通インターフェース (WAV など。コーデック・コンテナはここに追加)、エンコーダ設定
   metadata  アルバム / トラック情報 (タグ付け・ファイル名用)
   tags      RIFF INFO / ID3v2.4 / Vorbis コメントの生成

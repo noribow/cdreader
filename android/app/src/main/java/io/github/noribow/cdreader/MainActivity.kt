@@ -59,6 +59,8 @@ class MainActivity : Activity() {
         const val PREF_CDDB = "cddb"
         const val PREF_ACCURATERIP = "accurateRip"
         const val PREF_C2 = "useC2"
+        // Slowdown on read errors (#49).
+        const val PREF_SLOWDOWN = "slowdown"
         const val PREF_CACHE = "cacheMode"
         const val PREF_ADVANCED = "advancedOpen"
         // Single-file mode (#42): the whole selection as one file plus a .cue file.
@@ -101,6 +103,7 @@ class MainActivity : Activity() {
     private lateinit var buttonDetectOffset: Button
     private lateinit var checkVerify: CheckBox
     private lateinit var checkC2: CheckBox
+    private lateinit var checkSlowdown: CheckBox
     private lateinit var spinnerCache: Spinner
     private lateinit var switchSingleFile: Switch
     private lateinit var textAdvanced: TextView
@@ -197,6 +200,7 @@ class MainActivity : Activity() {
         buttonDetectOffset = findViewById(R.id.buttonDetectOffset)
         checkVerify = findViewById(R.id.checkVerify)
         checkC2 = findViewById(R.id.checkC2)
+        checkSlowdown = findViewById(R.id.checkSlowdown)
         spinnerCache = findViewById(R.id.spinnerCache)
         switchSingleFile = findViewById(R.id.switchSingleFile)
         textAdvanced = findViewById(R.id.textAdvanced)
@@ -233,6 +237,7 @@ class MainActivity : Activity() {
         checkCddb.isChecked = cddbEnabled
         checkAccurateRip.isChecked = prefs.getBoolean(PREF_ACCURATERIP, true)
         checkC2.isChecked = prefs.getBoolean(PREF_C2, true)
+        checkSlowdown.isChecked = prefs.getBoolean(PREF_SLOWDOWN, true)
         spinnerCache.setSelection(CacheMode.fromKey(prefs.getString(PREF_CACHE, null)).ordinal, false)
         switchSingleFile.isChecked = prefs.getBoolean(PREF_SINGLE_FILE, false)
         showAdvanced(prefs.getBoolean(PREF_ADVANCED, false))
@@ -265,6 +270,9 @@ class MainActivity : Activity() {
         }
         checkC2.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(PREF_C2, checked).apply()
+        }
+        checkSlowdown.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(PREF_SLOWDOWN, checked).apply()
         }
         switchSingleFile.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(PREF_SINGLE_FILE, checked).apply()
@@ -453,7 +461,12 @@ class MainActivity : Activity() {
         }
         if (!ready) throw IOException("ディスクが挿入されていないか、準備ができていません")
         val disc = s.readToc()
-        runOnUiThread { showToc(disc) }
+        // The drive's read speeds (#49) under its name, now that the disc is in.
+        val speed = runCatching { s.driveSpeed() }.getOrNull()
+        runOnUiThread {
+            showToc(disc)
+            if (speed != null && driveName.isNotEmpty()) textDrive.text = "$driveName\n読み取り速度: $speed"
+        }
         lookUp(s, cddbEnabled, 0)
     }
 
@@ -558,6 +571,7 @@ class MainActivity : Activity() {
         val sourceDetail = offsetDetail
         val verify = checkVerify.isChecked
         val useC2 = checkC2.isChecked
+        val slowdown = checkSlowdown.isChecked
         val cacheMode = selectedCacheMode()
         val format = selectedFormat()
         val accurateRip = checkAccurateRip.isChecked
@@ -585,7 +599,7 @@ class MainActivity : Activity() {
                 if (cacheMode == CacheMode.AUTO) runOnUiThread { setStatus("ドライブのキャッシュを確認しています…") }
                 // The drive database's offset for rip.log (#37); online only with AccurateRip enabled.
                 runCatching { s.lookupDriveOffsetDb(if (accurateRip) http else null) }
-                s.beginRip(format, offset, MAX_RETRIES, verify, useC2, cacheMode, source, sourceDetail)
+                s.beginRip(format, offset, MAX_RETRIES, verify, useC2, cacheMode, source, sourceDetail, slowdown)
                 val ripped = mutableListOf<Pair<Int, RipResult>>()
                 var imageResult: ImageResult? = null
                 val dir: Uri
@@ -1347,6 +1361,7 @@ class MainActivity : Activity() {
         buttonDetectOffset.text = getString(if (detecting) R.string.detect_offset_cancel else R.string.detect_offset)
         checkVerify.isEnabled = !busy
         checkC2.isEnabled = !busy
+        checkSlowdown.isEnabled = !busy
         spinnerCache.isEnabled = !busy
         switchSingleFile.isEnabled = !busy
         checkCddb.isEnabled = !busy

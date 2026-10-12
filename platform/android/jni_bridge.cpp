@@ -336,6 +336,18 @@ JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeDr
     }
 }
 
+// The drive's read speeds (#49), e.g. "max 48x (8467 kB/s), current 24x;
+// disc performance 16x-40x" (MODE SENSE page 2Ah and GET PERFORMANCE).
+JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeDriveSpeed(JNIEnv* env, jclass,
+                                                                                   jlong handle) {
+    try {
+        return toJava(env, session(handle)->rip.readDriveSpeed().summary());
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+        return nullptr;
+    }
+}
+
 JNIEXPORT jboolean JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeIsReady(JNIEnv*, jclass,
                                                                                   jlong handle) {
     return session(handle)->drive.isReady() ? JNI_TRUE : JNI_FALSE;
@@ -500,9 +512,10 @@ JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTrackFi
 // 1 saved for this drive, 2 auto-detected, 3 selected by the user from the
 // candidates of an ambiguous detection; `offsetDetail` the note
 // ("HL-DT-ST BD-RE BP71N (1.03); auto-detected: ..." / "2 of 2 tracks agreed, v2").
+// `slowdown` (#49): re-read sectors with read errors / C2 errors at lower speeds.
 JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(
     JNIEnv* env, jclass, jlong handle, jstring format, jint readOffset, jint maxRetries, jboolean verify,
-    jboolean useC2, jint cacheMode, jint offsetSource, jstring offsetDetail) {
+    jboolean useC2, jint cacheMode, jint offsetSource, jstring offsetDetail, jboolean slowdown) {
     try {
         cdr::RipSettings settings;
         if (!fromJava(env, format, settings.format)) return;
@@ -517,6 +530,7 @@ JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(
         settings.options.maxRetries = maxRetries;
         settings.options.verify = verify == JNI_TRUE;
         settings.useC2 = useC2 == JNI_TRUE;
+        settings.slowdown = slowdown == JNI_TRUE;
         switch (cacheMode) {
             case 0: settings.cache = cdr::CacheSetting::Auto; break;
             case 1: settings.cache = cdr::CacheSetting::Fua; break;

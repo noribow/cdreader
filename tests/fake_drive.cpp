@@ -271,10 +271,63 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
             page[0] = 0x2A;
             page[1] = 26;
             page[5] = uint8_t(0x01 | 0x02 | (c2Supported ? 0x10 : 0x00));  // CD-DA commands, accurate stream, C2
+            page[8] = uint8_t(maxSpeedKBps >> 8);
+            page[9] = uint8_t(maxSpeedKBps);
             page[12] = uint8_t(bufferKB >> 8);
             page[13] = uint8_t(bufferKB);
+            if (reportCurrentSpeed) {
+                page[14] = uint8_t(readSpeedKBps >> 8);
+                page[15] = uint8_t(readSpeedKBps);
+            }
             const size_t allocation = size_t(cdb[7]) << 8 | cdb[8];
             const size_t n = std::min({sizeof response, allocation, dataLength});
+            std::memcpy(out, response, n);
+            ok.transferred = n;
+            return ok;
+        }
+
+        case 0xBB: {  // SET CD SPEED
+            ++setSpeedCommands;
+            lastSetSpeedCdb.assign(cdb, cdb + 12);
+            const uint16_t request = uint16_t(cdb[2] << 8 | cdb[3]);
+            commandLog.back().lba = request;
+            if (setSpeedMode == SetSpeedMode::Reject) return checkCondition(0x5, 0x20, 0x00);
+            if (setSpeedMode == SetSpeedMode::Ignore) {
+                ok.transferred = 0;
+                return ok;
+            }
+            uint16_t speed = request == 0xFFFF ? maxSpeedKBps : request;
+            if (maxSpeedKBps && speed > maxSpeedKBps) speed = maxSpeedKBps;
+            if (!supportedSpeeds.empty()) {
+                uint16_t pick = *std::min_element(supportedSpeeds.begin(), supportedSpeeds.end());
+                for (uint16_t s : supportedSpeeds)
+                    if (s <= speed && s > pick) pick = s;
+                speed = pick;
+            }
+            readSpeedKBps = speed;
+            ok.transferred = 0;
+            return ok;
+        }
+
+        case 0xAC: {  // GET PERFORMANCE
+            lastGetPerformanceCdb.assign(cdb, cdb + 12);
+            if (cdb[10] != 0x00) return checkCondition(0x5, 0x24, 0x00);
+            if (!performanceResponse.empty()) {
+                const size_t n = std::min(performanceResponse.size(), dataLength);
+                std::memcpy(out, performanceResponse.data(), n);
+                ok.transferred = n;
+                return ok;
+            }
+            if (perfStartKBps == 0 && perfEndKBps == 0) return checkCondition(0x5, 0x20, 0x00);
+            if (!discPresent) return checkCondition(0x2, 0x3A, 0x00);
+            uint8_t response[8 + 16] = {};
+            putBe32(response, int32_t(sizeof response - 4));
+            putBe32(response + 8, 0);
+            putBe32(response + 12, int32_t(perfStartKBps));
+            putBe32(response + 16, int32_t(leadOut_ - 1));
+            putBe32(response + 20, int32_t(perfEndKBps));
+            const size_t allocation = size_t(cdb[8]) << 8 | cdb[9];
+            const size_t n = std::min({sizeof response, 8 + allocation * 16, dataLength});
             std::memcpy(out, response, n);
             ok.transferred = n;
             return ok;
@@ -343,7 +396,8 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
                 const int64_t distance = std::abs(int64_t(lba) - int64_t(head_));
                 simulatedMicros += distance > int64_t(seekDistance) ? seekMicros : accessMicros;
             }
-            simulatedMicros += uint64_t(count) * discSectorMicros;
+            simulatedMicros += uint64_t(count) * (readSpeedKBps ? uint64_t(cdr::kSectorBytes) * 1000 / readSpeedKBps
+                                                                : discSectorMicros);
             head_ = lba + count;
 
             for (uint32_t s = lba; s < lba + count; ++s) {
@@ -352,6 +406,9 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
                     if (it->second > 0) --it->second;
                     return checkCondition(0x3, 0x11, 0x05);  // L-EC uncorrectable error
                 }
+                auto sf = speedFaults.find(s);
+                if (sf != speedFaults.end() && !sf->second.c2 && tooFast(sf->second))
+                    return checkCondition(0x3, 0x11, 0x05);
             }
             for (uint32_t i = 0; i < count; ++i) {
                 const uint32_t s = lba + i;
@@ -374,6 +431,15 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
                         if (f.flagged) full[cdr::kSectorBytes + (b >> 3)] |= uint8_t(0x80 >> (b & 7));
                     }
                     if (f.flagged) full[cdr::kSectorBytes + 294] = 0xFF;  // block error byte
+                }
+                auto sf = speedFaults.find(s);
+                if (sf != speedFaults.end() && sf->second.c2 && tooFast(sf->second)) {
+                    const uint8_t noise = uint8_t(++c2Counter_ % 255 + 1);
+                    for (size_t b = 1000; b < 1016; ++b) {
+                        sector[b] ^= noise;
+                        full[cdr::kSectorBytes + (b >> 3)] |= uint8_t(0x80 >> (b & 7));
+                    }
+                    full[cdr::kSectorBytes + 294] = 0xFF;
                 }
                 std::memcpy(full, sector, cdr::kSectorBytes);
                 if (c2Bytes) std::memcpy(sector + cdr::kSectorBytes, full + cdr::kSectorBytes, c2Bytes);
