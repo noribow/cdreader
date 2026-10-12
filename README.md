@@ -30,7 +30,10 @@
   読み直させる (FUA または追い出し。既定はドライブを試験して自動選択、`--cache` で指定)
 - **読み取り速度**: ドライブの最大・現在の読み取り速度とディスク上の速度範囲 (例: CAV 16x〜40x) を表示し、
   リッピング中に実測した速度をトラックごとに `rip.log` に記録。`--speed` で読み取り速度を指定でき、
-  読み取りエラーや C2 エラーが残るセクタは速度を落として (8x → 4x) 読み直します (既定で有効、`--no-slowdown` で無効)
+  読み取りエラーが出たブロックはリトライを速度を落として (8x → 4x) 行い、C2 エラーが残るセクタも同様に読み直します (既定で有効、`--no-slowdown` で無効)
+- **AccurateRip による再読込**: 読み取りエラー (リトライ・C2・減速) があり AccurateRip と一致しなかったトラックを、
+  低速 (4x)・キャッシュ対策ありでもう一度読み、一致すればファイルを置き換えます (既定で有効、`--no-ar-reread` で無効)。
+  最後の要約は、読み取りエラーのあったトラックと AccurateRip で一致しないトラックを示します
 - ドライブの読み取りオフセット補正 (`--offset`、EAC / AccurateRip と同じ値)
 - トラックごとの CRC32 と `rip.log` (TOC・結果) を出力
 - [AccurateRip](https://www.accuraterip.com/) データベースとの照合 (チェックサム v1 / v2、confidence を表示)
@@ -56,6 +59,7 @@ cdreader rip D: --no-c2             C2 エラーポインタを使わずに読�
 cdreader rip D: --verify --cache flush  2 回読み比較、キャッシュは追い出しで回避
 cdreader rip D: --speed 8           8 倍速で読み取る (傷の多いディスク向け)
 cdreader rip D: --no-slowdown       読み取りエラー時に速度を落とさない
+cdreader rip D: --no-ar-reread      AccurateRip と一致しないトラックを読み直さない
 cdreader rip D: --single-file       全トラックを 1 つの WAV と CUE シートに保存
 cdreader rip D: -f flac             FLAC で保存
 cdreader rip D: -f oggflac          Ogg FLAC (.oga) で保存
@@ -94,7 +98,8 @@ cdreader cddb-test                  CDDB サーバーへの接続テスト
 | `--verify` | 全ブロックを 2 回読みして比較 (低速) |
 | `--no-c2` | C2 エラーポインタを使わない (既定では対応ドライブなら使います。「C2 エラーポインタ」の節を参照) |
 | `--speed <max\|N>` | リッピング前に読み取り速度を設定する (`SET CD SPEED`): `max` (最高速) または `N` 倍速 (1〜72、`8` または `8x`)。ドライブが応じたかを `rip.log` に記録します。既定ではコマンドを送らずドライブの速度のまま。「読み取り速度」の節を参照 |
-| `--no-slowdown` | 読み取りエラー・C2 エラーが残るセクタを速度を落として読み直す処理をしない (既定では行います) |
+| `--no-slowdown` | 読み取りエラー時に速度を落とさない (既定では、エラーの出たブロックのリトライと C2 エラーが残るセクタの再読込を 8x → 4x で行います)。AccurateRip による再読込も行わなくなります |
+| `--no-ar-reread` | AccurateRip による再読込をしない (既定では、読み取りエラーがあり AccurateRip と一致しないトラックを 4x で読み直します。「AccurateRip による再読込」の節を参照) |
 | `--cache <mode>` | 再読込の前のドライブキャッシュ対策: `auto` (既定。ディスクごとにドライブを試験して選ぶ)・`fua`・`flush` (追い出し)・`none` (しない)。「ドライブキャッシュ対策」の節を参照 |
 | `--offset <n>` | 読み取りオフセット補正 (サンプル単位、負の値も可。既定: 0) |
 | `--offset auto` | このドライブの保存済みオフセットを使う。保存されていなければ AccurateRip で自動検出して保存してから読み取る (検出できなければリッピングせずに終了)。「読み取りオフセットの自動検出」の節を参照 |
@@ -131,7 +136,10 @@ CDDB のオプション (`rip` と `toc` の両方で使えます。`--cddb-serv
 | `cddb-email` | CDDB の hello に送る連絡先メールアドレス (`user@host` 形式) |
 | `cddb-app-name` / `cddb-app-version` | hello に送るアプリ名 / バージョン (既定: `cdreader` / プログラムのバージョン。通常は変更不要) |
 
-終了コード: `0` 成功 / `1` エラー / `2` 読めないセクタ、または疑わしい位置 (C2) があった。
+終了コード: `0` 成功 / `1` エラー / `2` 読めないセクタ、疑わしい位置 (C2) があった、または読み取りエラー (リトライ・C2・減速) のあった
+トラックが AccurateRip と一致しなかった (再読込でも一致しなかった) ([#49](https://github.com/noribow/cdreader/issues/49))。
+読み取りエラーがあっても AccurateRip で一致を確認できた場合、読み取りエラーなしで AccurateRip と一致しないだけの場合 (別プレスなど)、
+AccurateRip で確認できない場合は `0` で、`rip.log` の最後の要約に記録します (「リッピング結果の要約」の節を参照)。
 
 ### CDDB とファイル名
 
@@ -360,16 +368,23 @@ Average read speed: 24.1x (4251 kB/s), 12 track(s) in 3:12
 `--speed` を指定しなければ `SET CD SPEED` は送りません。
 
 **エラー時の減速** (既定で有効、`--no-slowdown` で無効。Android 版は「詳細設定」の「読み取りエラー時に速度を落として読み直す」):
-高速では読めないセクタも、回転を落とすと読めることがあります。次の場合、そのセクタを 8 倍速、それでもだめなら 4 倍速で読み直します
+高速では読めないセクタも、回転を落とすと読めることがあります。また、ドライブによっては高速で一度読み取りエラーを出したあと、
+同じ速度のリトライではエラーも C2 も出さずに**誤ったデータ**を返すことがあります (実機の USB ドライブで確認。`retries 5  OK` なのに
+AccurateRip と一致しない)。そこで、次の場合に速度を 8 倍速、続いて 4 倍速に落とします
 (現在の速度以上の段階は飛ばします。`--speed 8` なら 4 倍速のみ、`--speed 4` 以下なら減速しません):
 
-- リトライとセクタ単位の再読込 (`--retries`) の後も読めないセクタ: 各速度で 2 回まで (`--verify` では一致する 2 回読みを 2 回まで)
+- ブロック (最大 26 セクタ) の読み取りが失敗したとき (`--verify` では 2 回の読み取りが一致しなかったとき): **最初の失敗の直後から**、
+  そのブロックのリトライ (`--retries` 回) を低い速度で行います。リトライは速度の段階に割り振ります
+  (`--retries 5` で 8x・4x なら 8x で 2 回、4x で 3 回。リトライが段階より少なければ速い段階から)。
+  それでも読めなければ、最も低い速度のままセクタ単位で読み直します。
 - C2 エラーの再読込 (`--retries` 回) で解決しなかったセクタ: 各速度で 2 回まで再読込 (速度を変えた後は、その速度で C2 エラーなしに読めるか、
   同じデータが 2 回続けば解決)
 
-速度を落としたまま同じブロック (最大 26 セクタ) の残りを読み、ブロックの終わりで元の速度 (`--speed` の値、指定がなければ `max`) に戻します。
-エラーのない読み取りではコマンドは 1 つも増えません (減速なしと同じコマンド列)。ドライブが `SET CD SPEED` を拒否した場合は、
-そのディスクの残りでは減速を行わず、`rip.log` に記録します。`rip.log` の例:
+ブロックの終わりで元の速度 (`--speed` の値、指定がなければ `max`) に戻します。
+エラーのない読み取りではコマンドは 1 つも増えません (減速なしと同じコマンド列)。`--retries 0` では減速しません。
+ドライブが `SET CD SPEED` を拒否した場合は、そのディスクの残りでは減速を行わず (リトライは現在の速度で続けます)、`rip.log` に記録します。
+`rip.log` の例 (`block(s)` は低い速度のリトライで読めたブロック (またはセクタ単位の読み直しのセクタ)、`C2 sector(s)` は低い速度で
+C2 エラーが解決したセクタ、`not recovered` は最も低い速度でも読めなかった・C2 エラーが残ったセクタの数です):
 
 ```
 Read speed: max 48x (8467 kB/s), current 24x; disc performance 16x-40x
@@ -378,7 +393,7 @@ Slowdown on read errors: 8x, 4x
 ...
 05 - Song.flac  CRC32 0A1B2C3D  retries 6  OK
   Read speed: 19.7x (3475 kB/s)
-  Slowdown: 2 sector(s) re-read at 8x, 1 at 4x
+  Slowdown: 2 block(s) re-read at 8x, 1 at 4x; 1 C2 sector(s) re-read at 4x
 06 - Song.flac  CRC32 ...  retries 4  1 unreadable sector(s)
   Slowdown: 1 sector(s) not recovered at lower speeds
 ```
@@ -575,7 +590,66 @@ AccurateRip v2 は v1 の計算上の弱点 (サンプル値と位置の積の�
 - チェックサムはオフセット補正後のデータで計算し、ディスク先頭のトラックの最初の 5 セクタ (正確には 2939 サンプル) と最後のトラックの最後の 5 セクタは計算から除外します。
 - confidence が高いほど、多くの人が同じデータを得ていることを示します。一致しない場合でも、プレスが異なる盤では正しくリッピングできていることがあります。
 - ディスクがデータベースにない (HTTP 404)、ネットワークに接続できないといった場合はメッセージを表示するだけで、リッピング結果や終了コードには影響しません。
+  一致しないトラックは、読み取りエラーがあった場合だけ終了コード `2` になります (下の「リッピング結果の要約」)。
 - `cdreader toc` でも AccurateRip ディスク ID を表示します。
+
+#### AccurateRip による再読込 ([#49](https://github.com/noribow/cdreader/issues/49))
+
+読み取りエラーのあったトラックは、リトライで「読めた」としても、ドライブがエラーも C2 も出さずに誤ったデータを返している場合があります
+(AccurateRip で初めて分かります)。そこで AccurateRip の照合の後、次のすべてに当てはまるトラックを**もう一度読み直します**
+(既定で有効、`--no-ar-reread` で無効。Android 版は「詳細設定」の「AccurateRip と一致しないトラックを低速で読み直す」):
+
+- AccurateRip にそのトラックの登録があり、登録数 2 以上のエントリがある (1 件だけの登録は誤ったリッピングの可能性もあるため対象外)
+- どのエントリとも一致しない (`Not accurate`)
+- 1 回目の読み取りで読み取りエラーがあった (リトライ・C2 エラー・減速のいずれか。読めないセクタ・疑わしい位置も含む)
+
+読み直しは減速の最も低い速度 (4x) で `SET CD SPEED` を送り (ドライブがすでにその速度以下なら送りません)、最初のブロックの前に
+ドライブのキャッシュ対策を行い、リトライ・C2・キャッシュ対策はリッピングと同じ設定で読みます。終わったら元の速度に戻します。
+減速が無効 (`--no-slowdown`、またはドライブが `SET CD SPEED` を拒否した) のときは読み直しません。
+
+- 読み直したデータが AccurateRip と一致すれば、そのデータでファイルを作り直して置き換えます (Android 版は保存先のファイルを上書き)。
+- 一致せず、1 回目と同じデータ (同じ CRC32) なら、別プレスの盤か盤の傷の可能性が高いと記録し、1 回目のファイルを残します。
+- 一致せず、1 回目と違うデータなら、両方の CRC32 を記録し、1 回目のファイルを残します。
+- シングルファイル (`--single-file`) ではイメージ全体を作り直す必要があるため読み直さず、その旨を記録します (トラック単位でリッピングし直してください)。
+
+`rip.log` (AccurateRip のブロックの、トラックの行の下):
+
+```
+Track 02  v1 ...  v2 ...  Not accurate (v2 0, v1 0 of 3 submissions; 0 of 1 pressings)
+          pressing 1: 9C8B7A69  confidence   3  no match
+          Re-read at 4x: accurately ripped (v2 3), CRC32 4DD6A5D7 (first read 73B017B1), file replaced
+Track 04  v1 ...  v2 ...  Not accurate (v2 0, v1 0 of 5 submissions; 0 of 1 pressings)
+          pressing 1: 1A2B3C4D  confidence   5  no match
+          Re-read at 4x: same data (CRC32 A789147B) - likely a different pressing or damage on the disc
+AccurateRip: 5 of 6 track(s) accurately ripped (v2: 5; 1 after a re-read), 6 track(s) in database
+```
+
+ほかに `Re-read at 4x: different data (CRC32 ..., first read ...), not accurate either; the first read was kept`、
+`Re-read at 4x failed: ...; the first read was kept`、`Re-read: not supported in single-file mode (...)` があります。
+読み直し自体にリトライなどがあった場合は `Re-read had read problems: ...` の行が続きます。
+設定は `rip.log` の先頭に `AccurateRip re-read: at 4x (tracks with read problems that do not match)` / `disabled` /
+`not possible without slowdown` と記録します。
+
+#### リッピング結果の要約
+
+`rip.log` の最後 (と Windows 版の画面) には、問題のあったトラックと結論を記録します:
+
+```
+Tracks with read problems: 2 (retries, slowdown), 3 (C2 errors), 4 (retries, slowdown)
+Re-read after AccurateRip: 2 track(s), 1 accurately ripped (track 2)
+1 track(s) not accurate in AccurateRip (track 4; read errors were retried)
+Finished with errors
+```
+
+| 最後の行 | 意味 | 終了コード |
+| --- | --- | --- |
+| `All tracks ripped without errors` | 読み取りエラーなし、AccurateRip で一致しないトラックなし | `0` |
+| `All tracks ripped; the read problems were resolved (AccurateRip confirms the tracks)` | 読み取りエラーはあったが、そのトラックはすべて AccurateRip と一致 (再読込で一致したものを含む) | `0` |
+| `Finished with warnings` | 読み取りエラーがあったが AccurateRip で確認できない (未登録・照会なし・失敗)、または読み取りエラーなしで一致しないトラックがある (別プレスなど) | `0` |
+| `Finished with errors` | 読めないセクタ・疑わしい位置がある (再読込で一致して置き換えたトラックを除く)、または読み取りエラーのあったトラックが AccurateRip と一致しない | `2` |
+
+`Tracks with read problems` の括弧内は `retries` (リトライ)・`C2 errors`・`slowdown` (減速)・`unreadable sectors`・`suspicious positions` です。
+以前は、リトライがあっても読めれば `All tracks ripped without errors` と記録していました。
 
 ### 読み取りオフセットの自動検出
 
@@ -873,6 +947,8 @@ SCSI/MMC コマンドを送ります)。
    - 「2 回読みして比較 (低速)」(Windows 版の `--verify`)
    - 「C2 エラーポインタを使う (対応ドライブのみ)」(既定でオン。オフにすると Windows 版の `--no-c2` と同じ。「C2 エラーポインタ」の節を参照)
    - 「読み取りエラー時に速度を落として読み直す」(既定でオン。オフにすると Windows 版の `--no-slowdown` と同じ。「読み取り速度」の節を参照)
+   - 「AccurateRip と一致しないトラックを低速で読み直す (読み取りエラーがあった場合)」(既定でオン。オフにすると Windows 版の `--no-ar-reread` と同じ。
+     上の項目がオフのときは使えません。「AccurateRip による再読込」の節を参照)。読み直したデータが一致すると、保存済みのファイルを上書きします
    - 「キャッシュ対策」: 自動 (既定) / FUA / 追い出し / なし (Windows 版の `--cache auto|fua|flush|none`。「ドライブキャッシュ対策」の節を参照)。
      自動ではディスクごとに最初のリッピング開始時に数秒かけてドライブを試験します
    - 「CDDB」([#38](https://github.com/noribow/cdreader/issues/38)。「CDDB 設定」の節を参照):
@@ -892,6 +968,9 @@ SCSI/MMC コマンドを送ります)。
    (例: `Track 01: 一致 (v2) v2 12 / v1 0 / 15 件, プレス 1/2` — 一致したチェックサムの版、v2 / v1 それぞれの一致件数、
    登録件数の合計、一致したプレス数 / そのトラックの登録があるプレス数)。ディスクが AccurateRip に登録されているのに
    1 トラックも一致しなかった場合は、読み取りオフセットが合っていない可能性が高いため、オフセットの自動検出を勧めるダイアログを表示します。
+   AccurateRip による再読込を行ったトラックは結果 (`Track 02: 4x で読み直し → 一致 (ファイルを置き換えました)` など) を、
+   最後に要約 (読み取りエラーのあったトラック、AccurateRip と一致しないトラック、結果: エラーなし / 一致を確認 / 注意あり / エラーあり) を表示し、
+   リッピング完了のメッセージも同じ結論になります。
 
 保存先フォルダの下に `アーティスト - アルバム/NN - 曲名.flac` (曲名が不明なら `cd_<CDDB ID>/TrackNN.flac`。Ogg FLAC は `.oga`、ALAC は `.m4a`、Opus は `.opus`、Vorbis は `.ogg`、MKA は `.mka`) と `rip.log` が作られます。
 ファイルにはタグ (曲名・アーティスト・アルバム・年・ジャンル・トラック番号・CDDB ID、ディスクに記録されていれば ISRC と MCN) が書き込まれます。
@@ -1002,6 +1081,13 @@ C2 を報告しない誤データは `--verify` か AccurateRip でしか分か�
 設定の結果 (適用・近い速度・無視・拒否・確認不能) と `rip.log` の書式、擬似時間による実測速度、8x / 4x への減速で読めるようになること
 (C2 エラーを含む)、ブロックの後で元の速度に戻ること、現在の速度以上の段階を飛ばすこと、拒否されたら以後は減速しないこと、
 減速なし (とエラーのないディスク) のコマンド列が変わらないこと、USB 経由の RipSession での表示・設定・減速・`rip.log` を検証します。
+#49 の実機の問題は、仮想ドライブの「高速では 1 回読み取りエラーを返し、その後はエラーも C2 もなく誤ったデータを返す (低速なら正しい)」
+セクタで再現し、最初のエラーの直後のリトライから減速すること (正しいデータになる。減速なしでは `OK` のまま誤ったデータになること)、
+リトライの速度の割り振り、ブロックの後で元の速度に戻ることを確かめます。AccurateRip による再読込は、4x でしか正しく読めないセクタ
+(リッピング中の 8x のリトライでは誤ったデータ) を USB 経由の RipSession で読み直して一致し、ファイルが正しい PCM になること、
+毎回同じ誤データ (`same data`)・毎回違う誤データ (`different data`)・書き込みの失敗・キャンセル (速度を戻すこと)、
+再読込の条件 (無効・減速なし・エラーのないトラック・登録数 1・照会失敗・シングルファイル)、FUA によるキャッシュ対策と速度のコマンド列、
+すでに 4x の場合・`SET CD SPEED` を拒否された場合、要約の行・結論・終了コード (#49 の実機の rip.log と同じ状況を含む) を検証します。
 環境変数 `CDREADER_TEST_OUTPUT` にディレクトリを指定すると、テストで作ったサンプル (タグ付き WAV、CUE、Ogg) をそこに残すので、
 ffprobe / MediaInfo / ExifTool / ogginfo などの外部ツールで確認できます。
 テストの一時ファイルは、テストプログラムごとにシステムの一時ディレクトリの下に作る専用のディレクトリ (`cdreader_test_<乱数>`) に書き、
@@ -1063,7 +1149,8 @@ C2 付き読み取りの転送サイズ 24 × 2646 バイト) を検証します
 (FLAC / Ogg FLAC / ALAC / WAV 出力とデコード結果の一致、ALAC (M4A) のタグ、Opus / Vorbis / MKA 出力のタグと `rip.log` の `Encoder:` 行、CDDB のタグ・ファイル名・フォルダ名、AccurateRip の v1 / v2 一致と件数、照会失敗時の継続、キャンセル、`rip.log`、C2 の有効・無効・非対応・切り替えと `rip.log` の C2 の行、キャッシュ対策の設定・ディスクごとに 1 回の判定・`none` でコマンドを送らないこと・FUA から追い出しへの切り替えと `rip.log` の行、USB 経由のオフセット自動検出 (オフセット 0 で不一致 → 検出 → 検出値でのリッピングで全トラック一致、互いにずれた 5 プレスの登録からの検出と `rip.log` の他プレスの候補)・照会失敗・未登録・キャンセルと `rip.log` のオフセットの出所の行、ドライブオフセット DB (偽の DriveOffsets.bin のダウンロードと保存、30 日以内は再取得しないこと、期限切れ時の再取得と失敗時の古いファイルの利用、DB による確定と `rip.log` の DB の行、候補からの選択の `rip.log`、手動値と DB の値の違いの表示)、設定した CDDB サーバー・連絡先メールアドレスでの問い合わせと、hello を拒否されたときの `rip.log` の `Hint:` 行)。
 
 読み取りオフセットの自動検出 (#37) は、仮想ドライブと偽の AccurateRip データ (各トラックを指定のオフセットで読んだチェックサム) で、正のオフセット (+6, +667)・負のオフセット (-1164, -472)・v1 / v2、トラックの選び方 (中間・登録件数・長さ・`-t`)、候補が割れる場合、互いにずれたプレス (5 プレスの登録で件数の合計による確定・件数が近いときの保留・プレスの登録がないトラック)、1 トラックだけ一致、一致なし、登録トラックが 1 つのディスク (件数による確定 / 保留)、未登録 (HTTP 404)・ネットワーク障害 (読み取りをしないこと)、キャンセルと進行状況、ディスクの最初・最後のトラックを ±3000 サンプルで端まで読むこと、保存形式の往復 (壊れた行の無視) と `rip.log` の行を検証します。
-AccurateRip のドライブオフセット DB は、合成した DriveOffsets.bin (末尾の半端なレコード・不正な名前・HTML・ノイズ・範囲外の登録数) の解析、
+AccurateRip のドライブオフセット DB は、合成した DriveOffsets.bin (末尾の半端なレコード・不正な名前・HTML・ノイズ・範囲外の登録数、
+登録数の後ろの値 (以前「一致率」と解釈していたもの) が何であっても使わないこと) の解析、
 ドライブ名の照合 (空白・大文字小文字・区切りの違い、別機種)、キャッシュの鮮度とダウンロード失敗時の扱い、
 件数で決まらない #37 のディスク (+6 / -145 / -658、1 トラックあたり 21 / 17 / 7 件) が DB の +6 で確定すること、
 DB の値が候補にない・DB を取得できない・ドライブの登録がない場合に従来どおりであること、件数の多い候補より DB の値を優先する場合の記録を検証します。
@@ -1108,6 +1195,7 @@ core/       プラットフォーム非依存のコア (Windows / Android で共
   offset_detect  読み取りオフセットの自動検出 (トラックの選択・一致の判定)、rip.log の出所の行、ドライブごとの保存形式
   drive_offset_db  AccurateRip のドライブオフセット DB (DriveOffsets.bin) の解析・ドライブ名の照合・キャッシュの判定
   ripper    リトライ・セクタ分割・verify・C2 エラーの再読込・エラー時の減速を含むトラック読み取り、C2 / キャッシュ対策 / 速度の rip.log 行
+  rip_summary  AccurateRip の結果の rip.log ブロック、AccurateRip による再読込、リッピング結果の要約と終了コード (CLI と Android で共有)
   drive_speed  読み取り速度 (ページ 2Ah・GET PERFORMANCE の解析、SET CD SPEED の結果判定、実測速度の書式)
   drive_cache  ドライブキャッシュ対策 (FUA・追い出し・自動判定)
   clock     時計のインターフェース (キャッシュ判定・読み取り速度の時間測定。テストでは擬似時間)

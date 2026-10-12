@@ -469,13 +469,21 @@ const TrackReread& RipSession::rereadTrack(int number, const std::filesystem::pa
             },
             clock_);
         writer->close();
-    } catch (...) {
+    } catch (const RipCancelled&) {
         std::error_code ec;
         std::filesystem::remove(path, ec);
         throw;
+    } catch (const std::exception& e) {
+        // The first read is saved: a failed re-read only keeps it (rip.log says why).
+        reread = {};
+        reread.track = number;
+        reread.firstCrc32 = first->result.crc32;
+        reread.speedFactor = accurateRipRereadSpeed(settings_.options);
+        reread.outcome = TrackReread::Outcome::Failed;
+        reread.error = e.what();
     }
     reread.replaced = reread.accurate();
-    if (!reread.replaced) {
+    if (!reread.replaced) {  // also after a failure
         std::error_code ec;
         std::filesystem::remove(path, ec);
     }

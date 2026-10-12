@@ -2110,6 +2110,23 @@ TEST(accuraterip_reread_not_in_single_file_mode) {
                         "errors\n"));
 }
 
+// A re-read that cannot be written: Failed, logged, the first read stays.
+TEST(accuraterip_reread_failure_keeps_the_first_read) {
+    RereadRig r;
+    r.rig.fake.speedFaults[310] = {706, false, 1};
+    r.ripAll(r.ripSettings());
+    const cdr::TrackReread& rr = r.rig.session.rereadTrack(2, r.dir.path / "missing" / "reread.wav");
+    CHECK(rr.outcome == cdr::TrackReread::Outcome::Failed);
+    CHECK(!rr.error.empty());
+    CHECK(!rr.replaced);
+    CHECK_EQ(r.rig.fake.readSpeedKBps, 8467);  // restored
+    CHECK(r.rig.session.accurateRipRereadTracks().empty());
+    const std::string log = r.rig.session.ripLog();
+    CHECK(contains(log, "\n          Re-read at 4x failed: "));
+    CHECK(contains(log, "; the first read was kept\n"));
+    CHECK_EQ(r.rig.session.summary().exitCode(), 2);
+}
+
 // Cancel during the re-read: RipCancelled, the file is gone, the first read stays.
 TEST(accuraterip_reread_cancel) {
     RereadRig r;

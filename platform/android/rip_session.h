@@ -252,7 +252,9 @@ public:
     // `path` stays: the caller puts it in place of the track's file (the
     // app copies it over the document). Otherwise the file is deleted and
     // the first read stays. The re-read goes into accurateRipReport() (rip.log,
-    // summary). Throws as ripTrack() (RipCancelled; the file is deleted).
+    // summary). Read or file errors give outcome Failed (the first read
+    // stays); throws RipCancelled after cancel() (the file is deleted, nothing
+    // recorded) and std::invalid_argument for a track not to be re-read.
     const TrackReread& rereadTrack(int number, const std::filesystem::path& path,
                                    const Ripper::Progress& progress = {});
 

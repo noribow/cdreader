@@ -512,10 +512,13 @@ JNIEXPORT jstring JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeTrackFi
 // 1 saved for this drive, 2 auto-detected, 3 selected by the user from the
 // candidates of an ambiguous detection; `offsetDetail` the note
 // ("HL-DT-ST BD-RE BP71N (1.03); auto-detected: ..." / "2 of 2 tracks agreed, v2").
-// `slowdown` (#49): re-read sectors with read errors / C2 errors at lower speeds.
+// `slowdown` (#49): retry blocks with read errors (and re-read sectors with
+// C2 errors) at lower speeds. `accurateRipReread` (#49): re-read tracks that
+// had read problems and do not match AccurateRip (nativeRereadTrack()).
 JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(
     JNIEnv* env, jclass, jlong handle, jstring format, jint readOffset, jint maxRetries, jboolean verify,
-    jboolean useC2, jint cacheMode, jint offsetSource, jstring offsetDetail, jboolean slowdown) {
+    jboolean useC2, jint cacheMode, jint offsetSource, jstring offsetDetail, jboolean slowdown,
+    jboolean accurateRipReread) {
     try {
         cdr::RipSettings settings;
         if (!fromJava(env, format, settings.format)) return;
@@ -531,6 +534,7 @@ JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(
         settings.options.verify = verify == JNI_TRUE;
         settings.useC2 = useC2 == JNI_TRUE;
         settings.slowdown = slowdown == JNI_TRUE;
+        settings.accurateRipReread = accurateRipReread == JNI_TRUE;
         switch (cacheMode) {
             case 0: settings.cache = cdr::CacheSetting::Auto; break;
             case 1: settings.cache = cdr::CacheSetting::Fua; break;
@@ -817,6 +821,89 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeCheck
             v.push_back(jint(t.pressings.size()));
         }
         return toJavaArray(env, v);
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+        return nullptr;
+    }
+}
+
+// AccurateRip-guided re-read (#49), after nativeCheckAccurateRip(): the
+// tracks to re-read (per-track rips only).
+JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRereadTracks(JNIEnv* env, jclass,
+                                                                                        jlong handle) {
+    const std::vector<int> tracks = session(handle)->rip.accurateRipRereadTracks();
+    return toJavaArray(env, std::vector<jint>(tracks.begin(), tracks.end()));
+}
+
+// Re-reads one of those tracks into a new local file at `path`, calling
+// listener.onProgress(done, total). Returns [outcome (0 accurate: the file
+// at `path` replaces the track's file, 1 same data, 2 different data,
+// 3 failed; the file is deleted unless accurate), speed (x, 0: the speed of
+// the rip), CRC32 of the re-read, CRC32 of the first read]. Throws
+// CancellationException after nativeCancel(), IllegalArgumentException for a
+// track that is not to be re-read, IOException on errors.
+JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRereadTrack(JNIEnv* env, jclass,
+                                                                                       jlong handle, jint trackNumber,
+                                                                                       jstring path, jobject listener) {
+    Session& s = *session(handle);
+    std::string outputPath;
+    if (!fromJava(env, path, outputPath)) return nullptr;
+    jmethodID onProgress = nullptr;
+    if (listener != nullptr) {
+        jclass cls = env->GetObjectClass(listener);
+        onProgress = env->GetMethodID(cls, "onProgress", "(II)V");
+        if (onProgress == nullptr) return nullptr;  // NoSuchMethodError pending
+    }
+    try {
+        const cdr::TrackReread& r =
+            s.rip.rereadTrack(trackNumber, std::filesystem::u8path(outputPath), [&](uint32_t done, uint32_t total) {
+                if (onProgress == nullptr) return;
+                env->CallVoidMethod(listener, onProgress, jint(done), jint(total));
+                if (env->ExceptionCheck()) throw JavaExceptionPending{};
+            });
+        using Outcome = cdr::TrackReread::Outcome;
+        const jint outcome = r.outcome == Outcome::Accurate        ? 0
+                             : r.outcome == Outcome::SameData      ? 1
+                             : r.outcome == Outcome::DifferentData ? 2
+                                                                   : 3;
+        return toJavaArray(env, std::vector<jint>{outcome, jint(r.speedFactor), jint(r.result.crc32),
+                                                  jint(r.firstCrc32)});
+    } catch (const cdr::RipCancelled&) {
+        throwJava(env, "java/util/concurrent/CancellationException", "rip cancelled");
+    } catch (const JavaExceptionPending&) {
+        // propagate the listener's exception
+    } catch (const std::invalid_argument& e) {
+        throwJava(env, "java/lang/IllegalArgumentException", e.what());
+    } catch (const std::exception& e) {
+        throwIo(env, e.what());
+    }
+    return nullptr;
+}
+
+// The end of the rip (#49), as at the end of rip.log: [verdict (0 clean,
+// 1 read problems resolved, 2 warnings, 3 errors), tracks with unreadable
+// sectors / suspicious positions, tracks with read problems, tracks not
+// accurate in AccurateRip, ... of them with read problems, re-read tracks,
+// ... of them accurate then (track lists comma separated), the summary lines
+// and the final line of rip.log (newline separated)].
+JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipSummary(JNIEnv* env, jclass,
+                                                                                         jlong handle) {
+    try {
+        const cdr::RipSummary sum = session(handle)->rip.summary();
+        auto list = [](const std::vector<int>& numbers) {
+            std::string s;
+            for (int n : numbers) s += (s.empty() ? "" : ",") + std::to_string(n);
+            return s;
+        };
+        std::vector<int> problems;
+        for (const auto& p : sum.problemTracks) problems.push_back(p.first);
+        std::string lines;
+        for (const std::string& l : sum.lines()) lines += l + "\n";
+        lines += sum.finalLine();
+        return toJavaArray(env, std::vector<std::string>{std::to_string(int(sum.verdict)), list(sum.errorTracks),
+                                                         list(problems), list(sum.notAccurate),
+                                                         list(sum.notAccurateWithProblems), list(sum.rereadTracks),
+                                                         list(sum.rereadAccurate), lines});
     } catch (const std::exception& e) {
         throwIo(env, e.what());
         return nullptr;

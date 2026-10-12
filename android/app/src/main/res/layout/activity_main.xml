@@ -142,6 +142,14 @@
                 android:checked="true"
                 android:text="@string/slowdown" />
 
+            <!-- AccurateRip-guided re-read (#49): needs the slowdown above. -->
+            <CheckBox
+                android:id="@+id/checkArReread"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:text="@string/ar_reread" />
+
             <!-- Drive cache defeat before re-reads (#34): 自動 / FUA / 追い出し / なし. -->
             <LinearLayout
                 android:layout_width="match_parent"
