@@ -104,10 +104,8 @@ data class DriveOffsetDb(
     val status: DriveDbStatus,
     /** FOUND: the offset listed for the drive model. */
     val offset: Int,
-    /** -1: unknown. */
+    /** -1: unknown (the layout of this field in DriveOffsets.bin is unverified). */
     val submissions: Int,
-    /** -1: unknown. */
-    val agreePercent: Int,
     /** The drive's name in the database. */
     val name: String,
     /** "AccurateRip drive database: +6 (1234 submissions)" (rip.log). */
@@ -522,7 +520,7 @@ class CdSession private constructor(private val handle: Long) : Closeable {
         val v = NativeCd.nativeLookupDriveOffsetDb(handle, http)
         return DriveOffsetDb(
             DriveDbStatus.entries.getOrElse(v[0].toInt()) { DriveDbStatus.NOT_CHECKED },
-            v[1].toInt(), v[2].toInt(), v[3].toInt(), v[4], v[5],
+            v[1].toInt(), v[2].toInt(), v[3], v[4],
         )
     }
 

@@ -684,9 +684,8 @@ JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeSetDriveOf
 
 // The drive's entry in the AccurateRip drive offset database (#37): the
 // stored file when fresh, otherwise downloaded with `httpGet` (null: only
-// the stored file). Returns driveOffsetDbFields() plus [3] the agreement
-// percentage (-1 unknown), [4] the name in the database, [5] the line for
-// rip.log. Never throws for network problems.
+// the stored file). Returns driveOffsetDbFields() plus [3] the name in the
+// database, [4] the line for rip.log. Never throws for network problems.
 JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeLookupDriveOffsetDb(JNIEnv* env, jclass,
                                                                                                 jlong handle,
                                                                                                 jobject httpGet) {
@@ -694,7 +693,7 @@ JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeLo
         JavaHttpClient http(env, httpGet);
         const cdr::DriveOffsetDbMatch& m = session(handle)->rip.lookupDriveOffsetDb(httpGet != nullptr ? &http : nullptr);
         std::vector<std::string> fields = driveOffsetDbFields(m);
-        fields.insert(fields.end(), {std::to_string(m.entry.agreePercent), m.entry.name, m.logLine()});
+        fields.insert(fields.end(), {m.entry.name, m.logLine()});
         return toJavaArray(env, fields);
     } catch (const std::exception& e) {
         throwIo(env, e.what());

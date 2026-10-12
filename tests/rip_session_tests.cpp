@@ -1316,9 +1316,9 @@ TEST(offset_detection_over_usb_drive_database) {
     std::string log = rig.session.ripLog();
     CHECK(contains(log, "\nRead offset correction: +6 samples (auto-detected: 1 of 1 track agreed, v1+v2, matches "
                         "AccurateRip drive database (1234 submissions); also -145 (17), -658 (7): other pressings)\n"));
-    CHECK(contains(log, "\n  AccurateRip drive database: +6 (1234 submissions, 100% agree)\n"));
+    CHECK(contains(log, "\n  AccurateRip drive database: +6 (1234 submissions)\n"));
     CHECK(contains(log, "\n  Confirmed by the AccurateRip drive database, which lists +6 for this drive\n"));
-    CHECK(contains(log, "\nAccurateRip drive database: +6 (1234 submissions, 100% agree)\nFormat: wav\n"));
+    CHECK(contains(log, "\nAccurateRip drive database: +6 (1234 submissions)\nFormat: wav\n"));
 
     // Fresh in the cache: not downloaded again (the server would fail now).
     http.driveOffsets = reply(500, "");
@@ -1369,7 +1369,7 @@ TEST(offset_detection_over_usb_drive_database) {
     rig.session.ripTrack(2, dir.path / "t.wav");
     log = rig.session.ripLog();
     CHECK(contains(log, "\nRead offset correction: 0 samples (manual)\n"));
-    CHECK(contains(log, "\nAccurateRip drive database: +6 (1234 submissions, 100% agree); differs from the read "
+    CHECK(contains(log, "\nAccurateRip drive database: +6 (1234 submissions); differs from the read "
                         "offset used\n"));
     CHECK(!contains(log, "Read offset detection"));
 

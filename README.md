@@ -655,7 +655,7 @@ Read offset correction: +6 samples (auto-detected: 1 of 1 track agreed, v1+v2, m
 Read offset correction: +6 samples (saved for drive HL-DT-ST BD-RE BP71N (1.03); auto-detected: 2 of 2 tracks agreed, v1+v2)
 Read offset correction: +6 samples (selected by user from candidates +6, -145, -658)
 Read offset correction: 0 samples (manual)
-AccurateRip drive database: +6 (1234 submissions, 100% agree); differs from the read offset used
+AccurateRip drive database: +6 (1234 submissions); differs from the read offset used
 ```
 
 (件数は説明用の例です。)
@@ -669,9 +669,11 @@ EAC・dBpoweramp・CUETools が使う、ドライブの機種ごとに登録さ�
 - **形式** (公式の仕様書はなく、同じファイルを読む CUETools の実装から): ヘッダなし、1 件 69 (0x45) バイトの固定長レコードの並び。
   先頭 2 バイトがオフセット (int16 リトルエンディアン、EAC / `--offset` と同じ符号)、続く 33 バイトがドライブ名
   (ASCII、NUL / 空白埋め。INQUIRY のベンダーとモデルを ` - ` でつないだもの。例: `HL-DT-ST - BD-RE  BP71N`)、残り 34 バイトがその他のデータです。
-  その他のデータの先頭は登録数 (int32) と一致率 (int32、%) と解釈していますが、**この部分は検証できていません**。
-  範囲外 (登録数 0〜1000 万、一致率 0〜100 以外) の値は「不明」とし、そうしたレコードが 1 割を超えるファイルでは全件「不明」として扱います
+  その他のデータの先頭 (int32) は登録数と解釈していますが、**この部分の配置は検証できていません**。
+  範囲外 (0〜1000 万以外) の値は「不明」とし、そうしたレコードが 1 割を超えるファイルでは全件「不明」として扱います
   (使うのは同名の登録が複数あるときの優先順位と表示だけです)。
+  その次の int32 は以前「一致率 (%)」と解釈して表示していましたが、実機の DB で登録 105 件に対して 0% となるなど意味が合わないため、
+  表示も判定にも使いません。
 - 壊れたデータへの対策: 末尾の半端なレコードは無視し、名前が空・制御文字を含むレコードは読み飛ばします。
   HTML (エラーページ) や大半が読めないファイルは丸ごと無効とし、保存もしません。
 - **ドライブの照合**: INQUIRY のベンダーとモデルで探します。大文字小文字と空白の違いは無視し、

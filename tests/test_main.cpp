@@ -2080,7 +2080,7 @@ TEST(offset_detect_cancel_and_progress) {
 namespace {
 
 // One DriveOffsets.bin record: int16 offset, 33-byte name, int32 submissions,
-// int32 percentage, padding to 69 bytes.
+// another int32 of unknown meaning (once read as a percentage), padding to 69 bytes.
 std::string driveRecord(int offset, const std::string& name, int32_t submissions = 100, int32_t percent = 100) {
     std::string r;
     r.push_back(char(uint8_t(offset & 0xff)));
@@ -2114,7 +2114,6 @@ cdr::DriveOffsetDbMatch dbListing(int offset, int submissions = 1234) {
     m.entry.offset = offset;
     m.entry.name = "FAKE - CD-ROM DRIVE";
     m.entry.submissions = submissions;
-    m.entry.agreePercent = 100;
     return m;
 }
 
@@ -2132,10 +2131,23 @@ TEST(drive_offset_db_parses_records) {
         CHECK_EQ(db.entries[0].offset, 667);
         CHECK(db.entries[0].name == "HL-DT-ST - BD-RE  BH16NS40");
         CHECK_EQ(db.entries[0].submissions, 2400);
-        CHECK_EQ(db.entries[0].agreePercent, 99);
         CHECK_EQ(db.entries[2].offset, -472);  // int16, sign extended
-        CHECK(db.entries[1].describe() == "+6 (1234 submissions, 100% agree)");
-        CHECK(db.entries[2].describe() == "-472 (3000 submissions, 98% agree)");
+        CHECK(db.entries[1].describe() == "+6 (1234 submissions)");
+        CHECK(db.entries[2].describe() == "-472 (3000 submissions)");
+    }
+    // The int32 after the submissions is not used (#49): a real file had 0
+    // there with 105 submissions ("0% agree"), others hold values far from
+    // any percentage. Neither is shown nor makes the submissions unknown.
+    {
+        std::string real;
+        for (int i = 0; i < 5; ++i) real += driveRecord(i, "V - M" + std::to_string(i), 50 + i, 70000 + i);
+        real += driveRecord(6, "BUFFALO - Optical Drive", 105, 0);
+        const cdr::DriveOffsetDb other = cdr::DriveOffsetDb::parse(real);
+        CHECK(other.valid());
+        CHECK_EQ(other.entries.size(), 6u);
+        for (const cdr::DriveOffsetDbEntry& entry : other.entries) CHECK(entry.submissions >= 50);
+        CHECK(other.entries.back().describe() == "+6 (105 submissions)");
+        CHECK(other.entries.back().describe().find('%') == std::string::npos);
     }
     // The entry with most submissions of the same name.
     const cdr::DriveOffsetDbEntry* e = db.find("HL-DT-ST", "BD-RE  BP71N");
@@ -2177,14 +2189,14 @@ TEST(drive_offset_db_parses_records) {
     // Mostly junk: rejected, even with one good record.
     CHECK(!cdr::DriveOffsetDb::parse(driveRecord(6, "OK - DRIVE") + noise.substr(0, 69 * 2)).valid());
 
-    // Submission / percentage fields that do not fit their meaning: unknown for the whole file.
+    // Submission fields that do not fit their meaning: unknown for the whole file.
     std::string odd;
     for (int i = 0; i < 5; ++i) odd += driveRecord(i, "V - M" + std::to_string(i), -5 - i, 1000 + i);
     odd += driveRecord(6, "HL-DT-ST - BD-RE  BP71N", 1234, 100);
     db = cdr::DriveOffsetDb::parse(odd);
     CHECK(db.valid());
     CHECK_EQ(db.entries.size(), 6u);
-    for (const cdr::DriveOffsetDbEntry& entry : db.entries) CHECK(entry.submissions == -1 && entry.agreePercent == -1);
+    for (const cdr::DriveOffsetDbEntry& entry : db.entries) CHECK(entry.submissions == -1);
     CHECK(db.entries.back().describe() == "+6");
 }
 
@@ -2213,9 +2225,9 @@ TEST(drive_offset_db_name_matching) {
     cdr::DriveOffsetDbMatch m = cdr::matchDriveOffsetDb(load, bp71n());
     CHECK(m.found());
     CHECK_EQ(m.entry.offset, 6);
-    CHECK(m.logLine() == "AccurateRip drive database: +6 (1234 submissions, 100% agree)");
+    CHECK(m.logLine() == "AccurateRip drive database: +6 (1234 submissions)");
     CHECK(m.logLine(6) == m.logLine());
-    CHECK(m.logLine(0) == "AccurateRip drive database: +6 (1234 submissions, 100% agree); differs from the read "
+    CHECK(m.logLine(0) == "AccurateRip drive database: +6 (1234 submissions); differs from the read "
                           "offset used");
     CHECK(m.agreementText() == "matches AccurateRip drive database (1234 submissions)");
     cdr::DriveInfo other = bp71n();
@@ -2347,7 +2359,7 @@ TEST(offset_detect_ambiguous_decided_by_drive_database) {
                            "also -145 (17), -658 (7): other pressings");
     CHECK((d.candidates == std::vector<int>{6, -145, -658}));
     const std::vector<std::string> lines = d.logLines();
-    CHECK(lines.size() >= 3 && lines[1] == "  AccurateRip drive database: +6 (1234 submissions, 100% agree)");
+    CHECK(lines.size() >= 3 && lines[1] == "  AccurateRip drive database: +6 (1234 submissions)");
     CHECK(!lines.empty() && lines[lines.size() - 2] ==
                                 "  Confirmed by the AccurateRip drive database, which lists +6 for this drive");
     CHECK(d.summary() == "Read offset +6 (1 of 1 track agreed, v1+v2, matches AccurateRip drive database (1234 "
@@ -2390,8 +2402,8 @@ TEST(offset_detect_drive_database_not_among_candidates) {
     CHECK(d.status == cdr::OffsetDetection::Status::Ambiguous);
     CHECK(!d.driveDatabaseIsCandidate());
     CHECK(!d.decidedByDriveDatabase);
-    CHECK(d.summary().find("Try another disc. The AccurateRip drive database lists +667 (1234 submissions, 100% "
-                           "agree) for this drive, which is not among the offsets found.") != std::string::npos);
+    CHECK(d.summary().find("Try another disc. The AccurateRip drive database lists +667 (1234 submissions) "
+                           "for this drive, which is not among the offsets found.") != std::string::npos);
 
     // Detected by submissions at another offset than the database's: kept, mentioned.
     FakeDrive clear = makeOffsetDisc();
@@ -2399,7 +2411,7 @@ TEST(offset_detect_drive_database_not_among_candidates) {
     CHECK(d.detected());
     CHECK_EQ(d.offset, 6);
     CHECK(!d.matchesDriveDatabase());
-    CHECK(d.summary().find("; the AccurateRip drive database lists +667 (1234 submissions, 100% agree)") !=
+    CHECK(d.summary().find("; the AccurateRip drive database lists +667 (1234 submissions)") !=
           std::string::npos);
     CHECK(d.agreement().find("drive database") == std::string::npos);
 
@@ -2438,7 +2450,7 @@ TEST(offset_detect_drive_database_not_among_candidates) {
     FakeDrive elsewhere = makeOffsetDisc();
     d = detectOn(elsewhere, p, o);
     CHECK(d.status == cdr::OffsetDetection::Status::NotEnough);
-    CHECK(d.summary().find("lists +6 (1234 submissions, 100% agree) for this drive, which is not among") !=
+    CHECK(d.summary().find("lists +6 (1234 submissions) for this drive, which is not among") !=
           std::string::npos);
 
     // The disc lookup failed: the database is still reported.
@@ -2451,7 +2463,7 @@ TEST(offset_detect_drive_database_not_among_candidates) {
     CHECK(d.status == cdr::OffsetDetection::Status::LookupFailed);
     CHECK(d.driveDatabase.found());
     CHECK(d.summary() == "AccurateRip lookup failed: no network. The AccurateRip drive database lists +6 (1234 "
-                         "submissions, 100% agree) for this drive.");
+                         "submissions) for this drive.");
 }
 
 TEST(offset_source_log_lines) {
