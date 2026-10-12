@@ -36,66 +36,6 @@ std::string hex32(uint32_t v) {
 
 }  // namespace
 
-// --- AccurateRipReport -------------------------------------------------------
-
-int AccurateRipReport::accurateTracks() const {
-    int n = 0;
-    for (const AccurateRipTrackResult& t : tracks) n += t.accurate() ? 1 : 0;
-    return n;
-}
-
-int AccurateRipReport::tracksInDatabase() const {
-    int n = 0;
-    for (const AccurateRipTrackResult& t : tracks) n += t.inDatabase() ? 1 : 0;
-    return n;
-}
-
-std::vector<std::string> AccurateRipReport::logLines() const {
-    std::vector<std::string> lines;
-    const bool found = status == Status::Found;
-    lines.push_back("AccurateRip (disc id " + id.toString() + ")" +
-                    (found ? ", " + std::to_string(pressings) + " pressing(s) in database" : std::string()));
-    std::map<std::string, int> byVersion;  // accurate tracks per matched checksum version
-    for (const AccurateRipTrackResult& r : tracks) {
-        char buf[96];
-        std::snprintf(buf, sizeof buf, "Track %02d  v1 %s  v2 %s  ", r.track, hex32(r.v1).c_str(), hex32(r.v2).c_str());
-        lines.push_back(buf + (found ? r.describe() : std::string()));
-        for (const AccurateRipPressingMatch& p : r.pressings) {
-            std::snprintf(buf, sizeof buf, "          pressing %d: %s  confidence %3d  %s", p.pressing,
-                          hex32(p.checksum).c_str(), p.confidence,
-                          p.version == 2 ? "v2 match" : p.version == 1 ? "v1 match" : "no match");
-            lines.push_back(buf);
-        }
-        if (r.accurate()) ++byVersion[r.matchedVersion()];
-    }
-
-    switch (status) {
-        case Status::Disabled:
-            lines.push_back("AccurateRip: lookup disabled");
-            break;
-        case Status::NotFound:
-            lines.push_back("AccurateRip: this disc is not in the database (no rips submitted yet)");
-            break;
-        case Status::Error:
-            lines.push_back("AccurateRip: lookup failed: " + error);
-            break;
-        case Status::Found: {
-            std::string versions;
-            for (const auto& [version, count] : byVersion)
-                versions += (versions.empty() ? "" : ", ") + version + ": " + std::to_string(count);
-            const int accurate = accurateTracks();
-            const int inDatabase = tracksInDatabase();
-            lines.push_back("AccurateRip: " + std::to_string(accurate) + " of " + std::to_string(tracks.size()) +
-                            " track(s) accurately ripped" + (versions.empty() ? "" : " (" + versions + ")") + ", " +
-                            std::to_string(inDatabase) + " track(s) in database");
-            if (accurate == 0 && inDatabase > 0)
-                lines.push_back("Hint: no track matched. Check the read offset.");
-            break;
-        }
-    }
-    return lines;
-}
-
 // --- RipSession --------------------------------------------------------------
 
 const DriveInfo& RipSession::driveInfo() {
@@ -183,6 +123,7 @@ const Toc& RipSession::readToc() {
     ripped_.clear();
     image_.reset();
     accurateRip_ = {};
+    accurateRipPressings_.clear();
     accurateRipChecked_ = false;
     detection_.reset();
     return *toc_;
@@ -288,6 +229,7 @@ void RipSession::beginRip(const RipSettings& settings) {
     ripped_.clear();
     image_.reset();
     accurateRip_ = {};
+    accurateRipPressings_.clear();
     accurateRipChecked_ = false;
     cancelled_ = false;
     if (settings.readDiscCodes && !discCodes_.read) readDiscCodes();
@@ -467,33 +409,84 @@ const AccurateRipReport& RipSession::checkAccurateRip(HttpClient* http) {
     accurateRipChecked_ = true;
 
     AccurateRipLookup lookup;
-    if (http == nullptr) {
-        accurateRip_.status = AccurateRipReport::Status::Disabled;
-    } else {
+    if (http != nullptr) {
         try {
             lookup = lookupAccurateRip(*http, accurateRip_.id);
         } catch (const std::exception& e) {  // lookupAccurateRip does not throw; be safe anyway
             lookup = {};
             lookup.error = e.what();
         }
-        switch (lookup.status) {
-            case AccurateRipLookup::Status::Found:
-                accurateRip_.status = AccurateRipReport::Status::Found;
-                break;
-            case AccurateRipLookup::Status::NotFound:
-                accurateRip_.status = AccurateRipReport::Status::NotFound;
-                break;
-            case AccurateRipLookup::Status::Error:
-                accurateRip_.status = AccurateRipReport::Status::Error;
-                accurateRip_.error = lookup.error;
-                break;
-        }
-        accurateRip_.pressings = lookup.pressings.size();
     }
-    for (const RippedTrack& r : ripped_)
-        accurateRip_.tracks.push_back(matchAccurateRip(lookup.pressings, accurateRipEntryIndex(t, r.track),
+    accurateRip_.setLookup(lookup, http != nullptr);
+    accurateRipPressings_ = std::move(lookup.pressings);
+    for (const RippedTrack& r : ripped_) {
+        accurateRip_.tracks.push_back(matchAccurateRip(accurateRipPressings_, accurateRipEntryIndex(t, r.track),
                                                        r.track.number, r.accurateRipV1, r.accurateRipV2));
+        // An image cannot take a re-read of one of its tracks: say so instead.
+        if (image_ && settings_.accurateRipReread && accurateRipRereadSpeed(settings_.options) > 0 &&
+            wantsAccurateRipReread(accurateRip_.tracks.back(), r.result))
+            accurateRip_.rereads[r.track.number] = TrackReread::notSupported(r.track.number);
+    }
     return accurateRip_;
+}
+
+std::vector<int> RipSession::accurateRipRereadTracks() const {
+    std::vector<int> tracks;
+    if (!accurateRipChecked_ || image_ || accurateRip_.status != AccurateRipReport::Status::Found) return tracks;
+    if (!settings_.accurateRipReread || accurateRipRereadSpeed(settings_.options) == 0) return tracks;
+    for (size_t i = 0; i < ripped_.size() && i < accurateRip_.tracks.size(); ++i) {
+        const int number = ripped_[i].track.number;
+        if (accurateRip_.reread(number) == nullptr && wantsAccurateRipReread(accurateRip_.tracks[i], ripped_[i].result))
+            tracks.push_back(number);
+    }
+    return tracks;
+}
+
+const TrackReread& RipSession::rereadTrack(int number, const std::filesystem::path& path,
+                                           const Ripper::Progress& progress) {
+    if (cancelled_) throw RipCancelled();
+    const std::vector<int> wanted = accurateRipRereadTracks();
+    if (std::find(wanted.begin(), wanted.end(), number) == wanted.end())
+        throw std::invalid_argument("track " + std::to_string(number) + " is not to be re-read");
+    const Toc& t = toc();
+    const RippedTrack* first = nullptr;
+    for (const RippedTrack& r : ripped_)
+        if (r.track.number == number) first = &r;
+    TrackReread reread;
+    try {
+        std::unique_ptr<AudioWriter> writer = createAudioWriter(settings_.format, settings_.encoder);
+        if (!writer) throw std::invalid_argument("unknown format '" + settings_.format + "'");
+        writer->open(path, trackMetadata(number));
+        reread = rereadForAccurateRip(
+            drive_, t, settings_.options, first->track, accurateRipPressings_, first->result.crc32,
+            [&](const uint8_t* pcm, size_t bytes) {
+                if (cancelled_) throw RipCancelled();
+                writer->write(pcm, bytes);
+            },
+            [&](uint32_t done, uint32_t total) {
+                if (cancelled_) throw RipCancelled();
+                if (progress) progress(done, total);
+            },
+            clock_);
+        writer->close();
+    } catch (...) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        throw;
+    }
+    reread.replaced = reread.accurate();
+    if (!reread.replaced) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    return accurateRip_.rereads[number] = std::move(reread);
+}
+
+RipSummary RipSession::summary() const {
+    std::vector<RippedTrackResult> tracks;
+    if (image_ && image_->htoa) tracks.push_back({0, &image_->htoa->result});
+    for (const RippedTrack& r : ripped_) tracks.push_back({r.track.number, &r.result});
+    return summarizeRip(tracks, accurateRipChecked_ ? &accurateRip_ : nullptr);
 }
 
 int RipSession::problemTracks() const {
@@ -513,6 +506,7 @@ std::string RipSession::ripLog() {
     for (const std::string& l : speedSetup_.logLines()) log << l << "\n";
     log << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
+        << accurateRipRereadLogLine(settings_.accurateRipReread, options) << "\n"
         << readOffsetLogLine(options.readOffsetSamples, settings_.offsetSource) << "\n";
     // The detection behind an auto-detected offset, or the candidates the
     // user chose from (#37); otherwise the drive database's offset, if known.
@@ -590,7 +584,11 @@ std::string RipSession::ripLog() {
         for (const std::string& l : accurateRip_.logLines()) log << l << "\n";
     }
 
-    log << "\n" << (problemTracks() ? "Finished with errors" : "All tracks ripped without errors") << "\n";
+    // The summary (#49): problems, AccurateRip, the verdict.
+    const RipSummary sum = summary();
+    log << "\n";
+    for (const std::string& l : sum.lines()) log << l << "\n";
+    log << sum.finalLine() << "\n";
     return log.str();
 }
 

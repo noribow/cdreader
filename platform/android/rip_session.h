@@ -30,6 +30,7 @@
 #include "cdreader/http.h"
 #include "cdreader/metadata.h"
 #include "cdreader/offset_detect.h"
+#include "cdreader/rip_summary.h"
 #include "cdreader/ripper.h"
 #include "cdreader/subchannel.h"
 #include "cdreader/toc.h"
@@ -72,6 +73,11 @@ struct RipSettings {
     // currentSpeedKBps.
     SpeedSetting speed;
     bool slowdown = true;
+    // AccurateRip-guided re-read (#49, on by default; the app's 詳細設定):
+    // after checkAccurateRip(), tracks that had read problems and do not
+    // match the database are read again slowly (rereadTrack()). Only with
+    // slowdown (no re-read without it) and in per-track mode.
+    bool accurateRipReread = true;
 };
 
 struct RippedTrack {
@@ -90,26 +96,6 @@ struct RippedImage {
     bool embeddedCueSheet = false;
     std::optional<RippedTrack> htoa;  // the HTOA part (no AccurateRip checksums: the database has none)
     uint32_t crc32 = 0;               // CRC32 of all the PCM in the image
-};
-
-struct AccurateRipReport {
-    enum class Status {
-        Disabled,  // the lookup was turned off
-        Found,
-        NotFound,  // no rip of this disc has been submitted
-        Error,     // network or protocol failure (see error)
-    };
-    Status status = Status::Disabled;
-    std::string error;
-    AccurateRipDiscId id;
-    size_t pressings = 0;  // records in the database file
-    std::vector<AccurateRipTrackResult> tracks;  // one per ripped track, in rip order
-
-    int accurateTracks() const;
-    int tracksInDatabase() const;
-
-    // The AccurateRip block of rip.log, in the same format as the Windows CLI.
-    std::vector<std::string> logLines() const;
 };
 
 class RipSession {
@@ -252,8 +238,29 @@ public:
     const AccurateRipReport& checkAccurateRip(HttpClient* http);
     const AccurateRipReport& accurateRipReport() const { return accurateRip_; }
 
+    // AccurateRip-guided re-read (#49). After checkAccurateRip(): the
+    // per-track rips that AccurateRip says are not accurate although the
+    // database has an entry with >= 2 submissions for them, and that had
+    // read problems (retries, C2 errors, slowdown), not re-read yet. Empty
+    // when settings.accurateRipReread or slowdown is off (also after the
+    // drive rejected SET CD SPEED), the disc is not in the database, or for
+    // an image (its tracks are logged as "not supported in single-file mode").
+    std::vector<int> accurateRipRereadTracks() const;
+    // Reads track `number` again (rereadForAccurateRip(): slowly, drive cache
+    // defeated) into a new file at `path` in the format of the rip. When it
+    // matches AccurateRip the result has replaced = true and the file at
+    // `path` stays: the caller puts it in place of the track's file (the
+    // app copies it over the document). Otherwise the file is deleted and
+    // the first read stays. The re-read goes into accurateRipReport() (rip.log,
+    // summary). Throws as ripTrack() (RipCancelled; the file is deleted).
+    const TrackReread& rereadTrack(int number, const std::filesystem::path& path,
+                                   const Ripper::Progress& progress = {});
+
     // Tracks with unreadable sectors or suspicious positions (C2).
     int problemTracks() const;
+    // The end of the rip (#49): problems, AccurateRip and the verdict, as at
+    // the end of ripLog().
+    RipSummary summary() const;
 
     // rip.log for the current rip (drive, settings, TOC, CDDB, tracks,
     // AccurateRip), in the format of the Windows CLI.
@@ -287,6 +294,7 @@ private:
     std::vector<RippedTrack> ripped_;
     std::optional<RippedImage> image_;
     AccurateRipReport accurateRip_;
+    std::vector<AccurateRipPressing> accurateRipPressings_;  // of the last lookup
     bool accurateRipChecked_ = false;
     std::optional<OffsetDetection> detection_;
     std::filesystem::path driveOffsetDbCache_;

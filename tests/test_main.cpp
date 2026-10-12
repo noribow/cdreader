@@ -41,6 +41,7 @@
 #include "cdreader/offset_detect.h"
 #include "cdreader/ogg_flac_writer.h"
 #include "cdreader/resampler.h"
+#include "cdreader/rip_summary.h"
 #include "cdreader/ripper.h"
 #include "cdreader/scsi.h"
 #include "cdreader/subchannel.h"
@@ -7732,6 +7733,263 @@ TEST(slowdown_disabled_keeps_the_command_sequence) {
         CHECK_EQ(clean2.setSpeedCommands, 0);
     }
 }
+
+// --- AccurateRip-guided re-read and the summary (#49) ---------------------------
+
+namespace {
+
+// The right v1 / v2 of a track of makeSpeedDisc(), and a database that lists
+// the v2 of every track with `confidence` submissions.
+std::vector<cdr::AccurateRipPressing> speedDiscDatabase(int confidence) {
+    FakeDrive fake = makeSpeedDisc();
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::AccurateRipPressing p;
+    p.id = cdr::AccurateRipDiscId::fromToc(toc);
+    for (const cdr::Track& t : toc.tracks) {
+        cdr::Ripper ripper(drive, toc, cdr::RipOptions{});
+        cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, t);
+        ripper.ripTrack(t, [&](const uint8_t* d, size_t n) { ar.update(d, n); });
+        p.tracks.push_back({uint8_t(confidence), ar.v2(), 0});
+    }
+    return {p};
+}
+
+struct Reread {
+    cdr::TrackReread r;
+    std::vector<uint8_t> bytes;
+};
+
+Reread rereadSpeedDisc(FakeDrive& fake, const cdr::RipOptions& o, uint32_t firstCrc = 0x12345678) {
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    fake.commandLog.clear();
+    Reread out;
+    out.r = cdr::rereadForAccurateRip(drive, toc, o, *toc.findTrack(2), speedDiscDatabase(5), firstCrc,
+                                      [&](const uint8_t* p, size_t n) { out.bytes.insert(out.bytes.end(), p, p + n); });
+    return out;
+}
+
+}  // namespace
+
+TEST(accuraterip_reread_policy) {
+    cdr::RipOptions o;
+    CHECK_EQ(cdr::accurateRipRereadSpeed(o), 0);  // slowdown off
+    o.slowdown = true;
+    CHECK_EQ(cdr::accurateRipRereadSpeed(o), 4);
+    o.slowdownSpeeds = {16, 2, 8};
+    CHECK_EQ(cdr::accurateRipRereadSpeed(o), 2);
+    o.slowdownSpeeds.clear();
+    CHECK_EQ(cdr::accurateRipRereadSpeed(o), 0);
+    o.slowdownSpeeds = {8, 4};
+    CHECK(cdr::accurateRipRereadLogLine(true, o) ==
+          "AccurateRip re-read: at 4x (tracks with read problems that do not match)");
+    CHECK(cdr::accurateRipRereadLogLine(false, o) == "AccurateRip re-read: disabled");
+    o.slowdown = false;
+    CHECK(cdr::accurateRipRereadLogLine(true, o) == "AccurateRip re-read: not possible without slowdown");
+
+    // Not accurate, entries with >= 2 submissions, read problems.
+    cdr::AccurateRipTrackResult ar;
+    ar.track = 2;
+    ar.totalConfidence = 3;
+    ar.pressings = {{1, 0xAAAA, 1, 0}, {2, 0xBBBB, 2, 0}};
+    cdr::TrackRipResult retried;
+    retried.retries = 1;
+    CHECK(cdr::wantsAccurateRipReread(ar, retried));
+    CHECK(!cdr::wantsAccurateRipReread(ar, cdr::TrackRipResult{}));  // no read problems
+    cdr::TrackRipResult c2;
+    c2.c2ErrorSectors = 1;
+    CHECK(cdr::wantsAccurateRipReread(ar, c2));
+    cdr::TrackRipResult slowed;
+    slowed.slowdownC2Sectors[8] = 1;
+    CHECK(cdr::wantsAccurateRipReread(ar, slowed));
+    cdr::AccurateRipTrackResult weak = ar;
+    weak.pressings = {{1, 0xAAAA, 1, 0}, {2, 0xBBBB, 1, 0}};
+    weak.totalConfidence = 2;
+    CHECK(!cdr::wantsAccurateRipReread(weak, retried));  // one submission each
+    cdr::AccurateRipTrackResult accurate = ar;
+    accurate.v2Confidence = 2;
+    CHECK(!cdr::wantsAccurateRipReread(accurate, retried));
+    CHECK(!cdr::wantsAccurateRipReread(cdr::AccurateRipTrackResult{}, retried));  // not in the database
+}
+
+// The re-read at 4x: SET CD SPEED 4x, the cache defeated before the first
+// block (FUA), back to the rip's speed; the data matches the database.
+TEST(accuraterip_reread_reads_slowly_without_the_cache) {
+    FakeDrive fake = makeSpeedDisc();
+    fake.speedFaults[310] = {706, false, 0};  // wrong without an error above 4x
+    cdr::RipOptions o = slowdownOptions(2);
+    o.cacheDefeat = cdr::CacheDefeat::Fua;
+    const Reread r = rereadSpeedDisc(fake, o);
+    CHECK(r.r.outcome == cdr::TrackReread::Outcome::Accurate);
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK_EQ(r.r.speedFactor, 4);
+    CHECK_EQ(r.r.track, 2);
+    CHECK_EQ(r.r.accurateRip.v2Confidence, 5);
+    CHECK(!r.r.replaced);  // the caller replaces the file
+    CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{706, 0xFFFF}));
+    // SET CD SPEED, READ(12) FUA, then the first block.
+    CHECK(fake.commandLog.size() > 3 && fake.commandLog[0].opcode == 0xBB && fake.commandLog[1].opcode == 0xA8 &&
+          fake.commandLog[2].opcode == 0xBE && fake.commandLog[2].lba == 300);
+    CHECK_EQ(fake.fuaCommands, 1);  // only before the first block
+    CHECK_EQ(fake.readSpeedKBps, k48x);
+    r.r.logLines();
+
+    // The same at full speed: wrong, and (another CRC) different data.
+    FakeDrive fast = makeSpeedDisc();
+    fast.speedFaults[310] = {706, false, 0};
+    fast.setSpeedMode = FakeDrive::SetSpeedMode::Ignore;
+    const Reread w = rereadSpeedDisc(fast, slowdownOptions(2));
+    CHECK(w.r.outcome == cdr::TrackReread::Outcome::DifferentData);
+    char line[160];
+    std::snprintf(line, sizeof line,
+                  "          Re-read at 4x: different data (CRC32 %08X, first read 12345678), not accurate either; the "
+                  "first read was kept",
+                  w.r.result.crc32);
+    CHECK(w.r.logLines() == std::vector<std::string>{line});
+    // ... or the same data as the first read.
+    FakeDrive same = makeSpeedDisc();
+    same.speedFaults[310] = {706, false, 0};
+    same.setSpeedMode = FakeDrive::SetSpeedMode::Ignore;
+    const Reread s = rereadSpeedDisc(same, slowdownOptions(2), w.r.result.crc32);
+    CHECK(s.r.outcome == cdr::TrackReread::Outcome::SameData);
+}
+
+TEST(accuraterip_reread_speed_cases) {
+    // Already at 4x (--speed 4): no SET CD SPEED, "at the current speed".
+    FakeDrive four = makeSpeedDisc();
+    four.readSpeedKBps = 706;
+    cdr::RipOptions o = slowdownOptions(2);
+    o.speedKBps = 706;
+    o.currentSpeedKBps = 706;
+    const Reread r = rereadSpeedDisc(four, o);
+    CHECK_EQ(four.setSpeedCommands, 0);
+    CHECK_EQ(r.r.speedFactor, 0);
+    CHECK(r.r.outcome == cdr::TrackReread::Outcome::Accurate);
+    r.r.logLines();
+    CHECK(r.r.logLines()[0].find("          Re-read at the current speed: accurately ripped (v2 5), CRC32 ") == 0);
+
+    // A drive that rejects SET CD SPEED: Failed, nothing read.
+    FakeDrive reject = makeSpeedDisc();
+    reject.setSpeedMode = FakeDrive::SetSpeedMode::Reject;
+    const Reread f = rereadSpeedDisc(reject, slowdownOptions(2));
+    CHECK(f.r.outcome == cdr::TrackReread::Outcome::Failed);
+    CHECK(f.bytes.empty());
+    CHECK_EQ(reject.readCommands, 0);
+    CHECK(f.r.logLines().size() == 1 &&
+          f.r.logLines()[0].find("          Re-read at 4x failed: SET CD SPEED to 4x failed (SCSI status 0x02") == 0);
+    CHECK(f.r.logLines()[0].find("; the first read was kept") != std::string::npos);
+
+    // A re-read with problems of its own says so.
+    FakeDrive bad = makeSpeedDisc();
+    bad.failuresBySector[320] = 1;
+    const Reread b = rereadSpeedDisc(bad, slowdownOptions(2));
+    CHECK(b.r.outcome == cdr::TrackReread::Outcome::Accurate);
+    CHECK(b.r.logLines().size() == 2 &&
+          b.r.logLines()[1] == "          Re-read had read problems: retries (retries 1, OK)");
+    CHECK(cdr::TrackReread::notSupported(3).logLines() ==
+          std::vector<std::string>{"          Re-read: not supported in single-file mode (rip the track on its own "
+                                   "to re-read it)"});
+}
+
+TEST(rip_summary_verdicts_and_lines) {
+    auto ar = [](int track, bool inDb, bool accurate) {
+        cdr::AccurateRipTrackResult r;
+        r.track = track;
+        r.totalConfidence = inDb ? 5 : 0;
+        r.v2Confidence = accurate ? 5 : 0;
+        return r;
+    };
+    cdr::TrackRipResult clean, retried, c2, unreadable;
+    retried.retries = 5;
+    c2.c2ErrorSectors = 1;
+    c2.c2Rereads = 1;
+    unreadable.unreadableSectors = 1;
+    unreadable.retries = 2;
+
+    // Clean, no AccurateRip.
+    cdr::RipSummary s = cdr::summarizeRip({{1, &clean}, {2, &clean}}, nullptr);
+    CHECK(s.verdict == cdr::RipSummary::Verdict::Clean);
+    CHECK(s.lines().empty());
+    CHECK(s.finalLine() == "All tracks ripped without errors");
+    CHECK_EQ(s.exitCode(), 0);
+
+    // The real rip of #49: tracks 2 and 4 retried and not accurate, track 3 with a recovered C2 error, accurate.
+    cdr::AccurateRipReport report;
+    report.status = cdr::AccurateRipReport::Status::Found;
+    report.tracks = {ar(1, true, true), ar(2, true, false), ar(3, true, true), ar(4, true, false)};
+    s = cdr::summarizeRip({{1, &clean}, {2, &retried}, {3, &c2}, {4, &retried}}, &report);
+    CHECK(s.verdict == cdr::RipSummary::Verdict::Errors);
+    CHECK_EQ(s.exitCode(), 2);
+    CHECK(s.lines() == (std::vector<std::string>{"Tracks with read problems: 2 (retries), 3 (C2 errors), 4 (retries)",
+                                                 "2 track(s) not accurate in AccurateRip (tracks 2, 4; read errors "
+                                                 "were retried)"}));
+    CHECK(s.finalLine() == "Finished with errors");
+
+    // Both re-read, one matched (and replaced).
+    cdr::TrackReread good;
+    good.track = 2;
+    good.outcome = cdr::TrackReread::Outcome::Accurate;
+    good.replaced = true;
+    cdr::TrackReread same;
+    same.track = 4;
+    same.outcome = cdr::TrackReread::Outcome::SameData;
+    report.rereads = {{2, good}, {4, same}};
+    s = cdr::summarizeRip({{1, &clean}, {2, &retried}, {3, &c2}, {4, &retried}}, &report);
+    CHECK(s.lines() == (std::vector<std::string>{"Tracks with read problems: 2 (retries), 3 (C2 errors), 4 (retries)",
+                                                 "Re-read after AccurateRip: 2 track(s), 1 accurately ripped (track 2)",
+                                                 "1 track(s) not accurate in AccurateRip (track 4; read errors were "
+                                                 "retried)"}));
+    CHECK_EQ(s.exitCode(), 2);
+    CHECK_EQ(report.accurateTracks(), 3);
+
+    // All re-read tracks match: resolved.
+    report.rereads[4].outcome = cdr::TrackReread::Outcome::Accurate;
+    s = cdr::summarizeRip({{1, &clean}, {2, &retried}, {3, &c2}, {4, &retried}}, &report);
+    CHECK(s.verdict == cdr::RipSummary::Verdict::Resolved);
+    CHECK_EQ(s.exitCode(), 0);
+    CHECK(s.lines() == (std::vector<std::string>{"Tracks with read problems: 2 (retries), 3 (C2 errors), 4 (retries)",
+                                                 "Re-read after AccurateRip: 2 track(s), 2 accurately ripped (tracks "
+                                                 "2, 4)"}));
+    CHECK(s.finalLine() == "All tracks ripped; the read problems were resolved (AccurateRip confirms the tracks)");
+
+    // The same reasons: one list.
+    s = cdr::summarizeRip({{2, &retried}, {4, &retried}}, nullptr);
+    CHECK(s.lines() == std::vector<std::string>{"Tracks with read problems: 2, 4 (retries)"});
+    CHECK(s.verdict == cdr::RipSummary::Verdict::Warnings);
+    CHECK(s.finalLine() == "Finished with warnings");
+
+    // Unreadable sectors: errors, unless an accurate re-read replaced the file.
+    cdr::AccurateRipReport one;
+    one.status = cdr::AccurateRipReport::Status::Found;
+    one.tracks = {ar(1, true, false)};
+    s = cdr::summarizeRip({{0, &clean}, {1, &unreadable}}, &one);
+    CHECK(s.errorTracks == std::vector<int>{1});
+    CHECK(s.lines().front() == "Tracks with unreadable sectors or suspicious positions: 1");
+    CHECK(s.lines()[1] == "Tracks with read problems: 1 (retries, unreadable sectors)");
+    CHECK(s.lines()[2] == "1 track(s) not accurate in AccurateRip (track 1; read errors were retried)");
+    good.track = 1;
+    one.rereads = {{1, good}};
+    s = cdr::summarizeRip({{0, &clean}, {1, &unreadable}}, &one);
+    CHECK(s.errorTracks.empty());
+    CHECK(s.verdict == cdr::RipSummary::Verdict::Resolved);
+
+    // Not accurate without read problems; problems in part of the not accurate tracks.
+    cdr::AccurateRipReport two;
+    two.status = cdr::AccurateRipReport::Status::Found;
+    two.tracks = {ar(1, true, false), ar(2, true, false), ar(3, false, false)};
+    s = cdr::summarizeRip({{1, &clean}, {2, &c2}, {3, &retried}}, &two);
+    CHECK(s.notAccurate == (std::vector<int>{1, 2}));
+    CHECK(s.lines().back() == "2 track(s) not accurate in AccurateRip (tracks 1, 2; read problems in 2)");
+    CHECK_EQ(s.exitCode(), 2);
+    s = cdr::summarizeRip({{1, &clean}}, &two);
+    CHECK(s.verdict == cdr::RipSummary::Verdict::Warnings);
+    CHECK(s.lines() == (std::vector<std::string>{"2 track(s) not accurate in AccurateRip (tracks 1, 2)"}));
+    // Not found / failed lookups say nothing about accuracy.
+    two.status = cdr::AccurateRipReport::Status::NotFound;
+    CHECK(cdr::summarizeRip({{1, &clean}}, &two).verdict == cdr::RipSummary::Verdict::Clean);
+}
+
 
 int main() {
     for (auto& [name, fn] : registry()) {

@@ -33,6 +33,7 @@
 #include "cdreader/gaps.h"
 #include "cdreader/metadata.h"
 #include "cdreader/offset_detect.h"
+#include "cdreader/rip_summary.h"
 #include "cdreader/ripper.h"
 #include "cdreader/settings_store.h"
 #include "cdreader/subchannel.h"
@@ -228,6 +229,14 @@ void printUsage() {
         "                        the block. Drives that reject SET CD SPEED rip\n"
         "                        without it\n"
         "      --no-accuraterip  Do not look up the AccurateRip database after ripping\n"
+        "      --no-ar-reread    Do not re-read tracks that do not match AccurateRip.\n"
+        "                        By default a track that had read problems (retries,\n"
+        "                        C2 errors, slowdown) and does not match although the\n"
+        "                        database has 2 or more submissions for it is read\n"
+        "                        once more at the slowest slowdown speed (4x) with the\n"
+        "                        drive cache defeated; if that read matches, it\n"
+        "                        replaces the file. Needs slowdown (not with\n"
+        "                        --no-slowdown); not in --single-file mode\n"
         "      --single-file     Rip the tracks into one file (an image of the disc);\n"
         "                        the CUE sheet then marks the track positions. FLAC\n"
         "                        and Ogg FLAC images also carry the CUE sheet inside\n"
@@ -640,17 +649,72 @@ struct ArTrack {
     cdr::Track track;
     uint32_t v1 = 0;
     uint32_t v2 = 0;
+    std::string fileName;      // per-track mode: the file in the output folder
+    cdr::TrackMetadata metadata;
+    cdr::TrackRipResult result;
 };
 
-// Looks up the rip in the AccurateRip database and prints the per-track
-// verdicts to the console and the log. Failures only produce a message.
-void reportAccurateRip(const cdr::Toc& toc, const std::vector<ArTrack>& tracks, bool lookup, char letter,
-                       std::ostream& log) {
-    const cdr::AccurateRipDiscId id = cdr::AccurateRipDiscId::fromToc(toc);
-    auto line = [&](const std::string& text) {
-        std::printf("%s\n", text.c_str());
-        log << text << "\n";
+// "Track 02  re-reading at 4x   37%" on the console.
+cdr::Ripper::Progress rereadProgress(int track, int factor) {
+    auto lastPercent = std::make_shared<int>(-1);
+    return [=](uint32_t done, uint32_t total) {
+        const int percent = total ? int(uint64_t(done) * 100 / total) : 100;
+        if (percent == *lastPercent) return;
+        *lastPercent = percent;
+        std::printf("\rTrack %02d  re-reading at %dx  %3d%%", track, factor, percent);
+        std::fflush(stdout);
     };
+}
+
+// The AccurateRip-guided re-read of one per-track file (#49): read into
+// "<file>.reread" next to it; when AccurateRip confirms the re-read it
+// replaces the file, otherwise it is deleted. Never throws for read or file
+// errors (outcome Failed).
+cdr::TrackReread rereadTrackFile(cdr::CdDrive& drive, const cdr::Toc& toc, const cdr::RipOptions& options,
+                                 const ArTrack& t, const std::vector<cdr::AccurateRipPressing>& pressings,
+                                 const fs::path& dir, const std::string& format, const cdr::EncoderSettings& encoder) {
+    const fs::path target = dir / fs::u8path(t.fileName);
+    fs::path temp = target;
+    temp += ".reread";
+    cdr::TrackReread rr;
+    std::error_code ec;
+    try {
+        std::unique_ptr<cdr::AudioWriter> writer = cdr::createAudioWriter(format, encoder);
+        writer->open(temp, t.metadata);
+        rr = cdr::rereadForAccurateRip(
+            drive, toc, options, t.track, pressings, t.result.crc32,
+            [&](const uint8_t* pcm, size_t bytes) { writer->write(pcm, bytes); },
+            rereadProgress(t.track.number, cdr::accurateRipRereadSpeed(options)), &cdr::steadyClock());
+        writer->close();
+        std::printf("\r%-40s\r", "");
+        if (rr.accurate()) {
+            // Copy over the first read (rename does not replace on every runtime).
+            fs::copy_file(temp, target, fs::copy_options::overwrite_existing);
+            rr.replaced = true;
+        }
+    } catch (const std::exception& e) {
+        std::printf("\n");
+        rr = {};
+        rr.track = t.track.number;
+        rr.firstCrc32 = t.result.crc32;
+        rr.speedFactor = cdr::accurateRipRereadSpeed(options);
+        rr.outcome = cdr::TrackReread::Outcome::Failed;
+        rr.error = e.what();
+    }
+    fs::remove(temp, ec);
+    return rr;
+}
+
+// Looks up the rip in the AccurateRip database, re-reads the tracks that
+// had read problems and do not match (#49; `reread`: the setting, the
+// options of the rip as they are now), and prints the AccurateRip block to
+// the console and the log. Failures only produce a message.
+cdr::AccurateRipReport reportAccurateRip(cdr::CdDrive& drive, const cdr::Toc& toc, const std::vector<ArTrack>& tracks,
+                                         bool lookup, bool reread, const cdr::RipOptions& options, bool singleFile,
+                                         const fs::path& dir, const std::string& format,
+                                         const cdr::EncoderSettings& encoder, char letter, std::ostream& log) {
+    cdr::AccurateRipReport report;
+    report.id = cdr::AccurateRipDiscId::fromToc(toc);
     std::printf("\n");
     log << "\n";
 
@@ -659,52 +723,31 @@ void reportAccurateRip(const cdr::Toc& toc, const std::vector<ArTrack>& tracks, 
         std::printf("Looking up AccurateRip database...\r");
         std::fflush(stdout);
         cdr::win::WinHttpClient http(std::string("cdreader/") + kVersion);
-        result = cdr::lookupAccurateRip(http, id);
+        result = cdr::lookupAccurateRip(http, report.id);
     }
-    const bool found = result.status == cdr::AccurateRipLookup::Status::Found;
+    report.setLookup(result, lookup);
+    for (const ArTrack& t : tracks)
+        report.tracks.push_back(cdr::matchAccurateRip(result.pressings, cdr::accurateRipEntryIndex(toc, t.track),
+                                                      t.track.number, t.v1, t.v2));
 
-    line("AccurateRip (disc id " + id.toString() + ")" +
-         (found ? ", " + std::to_string(result.pressings.size()) + " pressing(s) in database" : std::string()));
-    int accurate = 0;
-    int inDatabase = 0;
-    std::map<std::string, int> byVersion;  // accurate tracks per matched checksum version
-    for (const ArTrack& t : tracks) {
-        const cdr::AccurateRipTrackResult r =
-            cdr::matchAccurateRip(result.pressings, cdr::accurateRipEntryIndex(toc, t.track), t.track.number, t.v1, t.v2);
-        char buf[96];
-        std::snprintf(buf, sizeof buf, "Track %02d  v1 %s  v2 %s  ", t.track.number, hex32(t.v1).c_str(),
-                      hex32(t.v2).c_str());
-        line(buf + (found ? r.describe() : std::string()));
-        // Per pressing: its checksum, how many submissions stand behind it and
-        // which of our checksums (if any) it equals.
-        for (const cdr::AccurateRipPressingMatch& p : r.pressings) {
-            std::snprintf(buf, sizeof buf, "          pressing %d: %s  confidence %3d  %s", p.pressing,
-                          hex32(p.checksum).c_str(), p.confidence,
-                          p.version == 2 ? "v2 match" : p.version == 1 ? "v1 match" : "no match");
-            line(buf);
+    if (report.status == cdr::AccurateRipReport::Status::Found && reread && cdr::accurateRipRereadSpeed(options) > 0) {
+        for (size_t i = 0; i < tracks.size(); ++i) {
+            const ArTrack& t = tracks[i];
+            if (!cdr::wantsAccurateRipReread(report.tracks[i], t.result)) continue;
+            report.rereads[t.track.number] =
+                singleFile ? cdr::TrackReread::notSupported(t.track.number)
+                           : rereadTrackFile(drive, toc, options, t, result.pressings, dir, format, encoder);
         }
-        accurate += r.accurate() ? 1 : 0;
-        inDatabase += r.inDatabase() ? 1 : 0;
-        if (r.accurate()) ++byVersion[r.matchedVersion()];
     }
 
-    if (!lookup) {
-        line("AccurateRip: lookup disabled (--no-accuraterip)");
-    } else if (result.status == cdr::AccurateRipLookup::Status::NotFound) {
-        line("AccurateRip: this disc is not in the database (no rips submitted yet)");
-    } else if (!found) {
-        line("AccurateRip: lookup failed: " + result.error);
-    } else {
-        std::string versions;
-        for (const auto& [version, count] : byVersion)
-            versions += (versions.empty() ? "" : ", ") + version + ": " + std::to_string(count);
-        line("AccurateRip: " + std::to_string(accurate) + " of " + std::to_string(tracks.size()) +
-             " track(s) accurately ripped" + (versions.empty() ? "" : " (" + versions + ")") + ", " +
-             std::to_string(inDatabase) + " track(s) in database");
-        if (accurate == 0 && inDatabase > 0)
-            line(std::string("Hint: no track matched. Check the read offset (--offset), e.g. with 'cdreader offset ") +
-                 letter + ": --save' or 'rip --offset auto'.");
+    const std::string hint = std::string("Hint: no track matched. Check the read offset (--offset), e.g. with "
+                                         "'cdreader offset ") +
+                             letter + ": --save' or 'rip --offset auto'.";
+    for (const std::string& l : report.logLines("AccurateRip: lookup disabled (--no-accuraterip)", hint)) {
+        std::printf("%s\n", l.c_str());
+        log << l << "\n";
     }
+    return report;
 }
 
 int cmdRip(const std::vector<std::string>& args) {
@@ -724,6 +767,7 @@ int cmdRip(const std::vector<std::string>& args) {
     bool useC2 = true;
     cdr::SpeedSetting speed;
     bool slowdown = true;
+    bool arReread = true;
     cdr::CacheSetting cacheSetting = cdr::CacheSetting::Auto;
     cdr::EncoderSettings encoder;
     bool offsetAuto = false;
@@ -763,6 +807,7 @@ int cmdRip(const std::vector<std::string>& args) {
         }
         else if (parseCddbOption(args, i, cddb)) continue;
         else if (a == "--no-accuraterip") accurateRip = false;
+        else if (a == "--no-ar-reread") arReread = false;
         else if (a == "--single-file") singleFile = true;
         else throw UsageError("unknown option '" + a + "'");
     }
@@ -940,6 +985,7 @@ int cmdRip(const std::vector<std::string>& args) {
     for (const std::string& l : speedLines) log << l << "\n";
     log << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
+        << cdr::accurateRipRereadLogLine(arReread, options) << (arReread ? "" : " (--no-ar-reread)") << "\n"
         << cdr::readOffsetLogLine(options.readOffsetSamples, offsetSource) << "\n";
     for (const std::string& l : detectionLog) log << l << "\n";
     if (driveDb.status != cdr::DriveOffsetDbMatch::Status::NotChecked)
@@ -970,8 +1016,8 @@ int cmdRip(const std::vector<std::string>& args) {
     ripper.setClock(cdr::steadyClock());
     uint64_t readSectors = 0, readMicros = 0;  // measured read speed (#49)
     size_t timedTracks = 0;
-    int problems = 0;
     std::vector<ArTrack> arTracks;
+    std::vector<std::pair<int, cdr::TrackRipResult>> results;  // every track / part, for the summary
     std::unique_ptr<cdr::AudioWriter> writer;
     cdr::Crc32 imageCrc;
     std::vector<std::string> trackFiles;
@@ -993,11 +1039,12 @@ int cmdRip(const std::vector<std::string>& args) {
     for (const cdr::Track& t : parts) {
         const bool htoa = t.number == 0;
         std::string name;
+        cdr::TrackMetadata metadata;
         if (singleFile) {
             name = cdr::DiscImagePlan::partName(t);
         } else {
             writer = cdr::createAudioWriter(format, encoder);
-            cdr::TrackMetadata metadata = album.forTrack(t.number, toc.lastTrack);
+            metadata = album.forTrack(t.number, toc.lastTrack);
             if (htoa && !album.title.empty()) metadata.title = "Hidden Track";  // "00 - Hidden Track"; else Track00
             name = cdr::trackFileBaseName(metadata) + "." + extension;
             writer->open(dir / fs::u8path(name), metadata);
@@ -1044,8 +1091,8 @@ int cmdRip(const std::vector<std::string>& args) {
             ++timedTracks;
         }
         for (const std::string& l : cdr::trackRipLogLines(name, r)) log << l << "\n";
-        if (!r.clean()) ++problems;
-        if (!htoa) arTracks.push_back({t, ar.v1(), ar.v2()});
+        if (!htoa) arTracks.push_back({t, ar.v1(), ar.v2(), singleFile ? std::string() : name, metadata, r});
+        results.emplace_back(t.number, std::move(r));
     }
     if (singleFile) {
         writer->close();
@@ -1068,11 +1115,36 @@ int cmdRip(const std::vector<std::string>& args) {
         std::printf("CUE sheet: %s\n", cueName.c_str());
     }
 
-    reportAccurateRip(toc, arTracks, accurateRip, letter, log);
+    // The options as the rip ends: the drive may have rejected C2 reads,
+    // FUA or SET CD SPEED on the way (then no re-read either).
+    cdr::RipOptions now = options;
+    now.useC2 = ripper.c2Active();
+    now.cacheDefeat = ripper.cacheDefeat();
+    now.slowdown = ripper.slowdownActive();
+    const cdr::AccurateRipReport report = reportAccurateRip(*d.drive, toc, arTracks, accurateRip, arReread, now,
+                                                            singleFile, dir, format, encoder, letter, log);
 
-    log << "\n" << (problems ? "Finished with errors" : "All tracks ripped without errors") << "\n";
-    std::printf("\n%s\n", problems ? "Finished with errors - see rip.log" : "Done.");
-    return problems ? 2 : 0;
+    // The summary (#49): exit code 2 for unreadable sectors / suspicious
+    // positions and for tracks that do not match AccurateRip after read problems.
+    std::vector<cdr::RippedTrackResult> summaryTracks;
+    for (const auto& [number, r] : results) summaryTracks.push_back({number, &r});
+    const cdr::RipSummary summary = cdr::summarizeRip(summaryTracks, &report);
+    log << "\n";
+    std::printf("\n");
+    for (const std::string& l : summary.lines()) {
+        log << l << "\n";
+        std::printf("%s\n", l.c_str());
+    }
+    log << summary.finalLine() << "\n";
+    switch (summary.verdict) {
+        case cdr::RipSummary::Verdict::Clean: std::printf("Done.\n"); break;
+        case cdr::RipSummary::Verdict::Resolved:
+            std::printf("Done. The read problems were resolved (AccurateRip confirms the tracks).\n");
+            break;
+        case cdr::RipSummary::Verdict::Warnings: std::printf("Finished with warnings - see rip.log\n"); break;
+        case cdr::RipSummary::Verdict::Errors: std::printf("Finished with errors - see rip.log\n"); break;
+    }
+    return summary.exitCode();
 }
 
 // Detects the read offset (#37): reads a few tracks and compares their
