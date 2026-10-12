@@ -708,7 +708,13 @@ TEST(accuraterip_reports_v1_and_v2_matches) {
     CHECK(contains(log, "Folder: Various - Album_ Live"));
     CHECK(contains(log, "01 - Opening.flac  CRC32 "));
     CHECK(contains(log, "Track  2  LBA     300  00:02.00  audio  Guest / \xE5\xA4\x9C\xE6\x98\x8E\xE3\x81\x91"));
-    CHECK(contains(log, "\nAll tracks ripped without errors\n"));
+    // Track 3 does not match, without read problems (#49): no clean verdict,
+    // but no error either (a different pressing, most likely).
+    CHECK(contains(log, "\n\n1 track(s) not accurate in AccurateRip (track 3)\nFinished with warnings\n"));
+    CHECK(!contains(log, "without errors"));
+    CHECK(rig.session.summary().verdict == cdr::RipSummary::Verdict::Warnings);
+    CHECK_EQ(rig.session.summary().exitCode(), 0);
+    CHECK(rig.session.accurateRipRereadTracks().empty());  // no read problems: no re-read
 }
 
 TEST(accuraterip_no_match_hints_at_offset) {
@@ -1316,9 +1322,9 @@ TEST(offset_detection_over_usb_drive_database) {
     std::string log = rig.session.ripLog();
     CHECK(contains(log, "\nRead offset correction: +6 samples (auto-detected: 1 of 1 track agreed, v1+v2, matches "
                         "AccurateRip drive database (1234 submissions); also -145 (17), -658 (7): other pressings)\n"));
-    CHECK(contains(log, "\n  AccurateRip drive database: +6 (1234 submissions, 100% agree)\n"));
+    CHECK(contains(log, "\n  AccurateRip drive database: +6 (1234 submissions)\n"));
     CHECK(contains(log, "\n  Confirmed by the AccurateRip drive database, which lists +6 for this drive\n"));
-    CHECK(contains(log, "\nAccurateRip drive database: +6 (1234 submissions, 100% agree)\nFormat: wav\n"));
+    CHECK(contains(log, "\nAccurateRip drive database: +6 (1234 submissions)\nFormat: wav\n"));
 
     // Fresh in the cache: not downloaded again (the server would fail now).
     http.driveOffsets = reply(500, "");
@@ -1369,7 +1375,7 @@ TEST(offset_detection_over_usb_drive_database) {
     rig.session.ripTrack(2, dir.path / "t.wav");
     log = rig.session.ripLog();
     CHECK(contains(log, "\nRead offset correction: 0 samples (manual)\n"));
-    CHECK(contains(log, "\nAccurateRip drive database: +6 (1234 submissions, 100% agree); differs from the read "
+    CHECK(contains(log, "\nAccurateRip drive database: +6 (1234 submissions); differs from the read "
                         "offset used\n"));
     CHECK(!contains(log, "Read offset detection"));
 
@@ -1801,7 +1807,7 @@ TEST(read_speed_and_slowdown_over_usb) {
     const cdr::RippedTrack t = rig.session.ripTrack(2, dir.path / "2.wav");
     CHECK(t.result.clean());
     CHECK_EQ(t.result.crc32, referenceRip(2).crc32);
-    CHECK(t.result.slowdownRecovered == (std::map<int, uint32_t>{{4, 1}}));
+    CHECK(t.result.slowdownBlocks == (std::map<int, uint32_t>{{4, 1}}));
     CHECK_EQ(int(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xBB))), 2);
     CHECK_EQ(rig.fake.readSpeedKBps, 1412);  // back at the --speed setting
     CHECK(t.result.readMicros > 0);
@@ -1809,7 +1815,7 @@ TEST(read_speed_and_slowdown_over_usb) {
     const std::string log = rig.session.ripLog();
     CHECK(contains(log, "\nRead speed: max 48x (8467 kB/s), current 24x; disc performance 16x-40x\n"
                         "Read speed set to 8x (drive reports 8x)\nSlowdown on read errors: 4x\nMode: burst"));
-    CHECK(contains(log, "  OK\n" + speedLine(t.result) + "  Slowdown: 1 sector(s) re-read at 4x\n"));
+    CHECK(contains(log, "  OK\n" + speedLine(t.result) + "  Slowdown: 1 block(s) re-read at 4x\n"));
     CHECK(contains(log, "\nAverage read speed: " + cdr::formatMeasuredSpeed(150, t.result.readMicros) +
                             ", 1 track(s) in 0:00\n"));
 }
@@ -1830,7 +1836,7 @@ TEST(slowdown_fallback_lasts_for_the_rest_of_the_rip) {
     rig.device.opcodes.clear();
     const cdr::RippedTrack t2 = rig.session.ripTrack(2, dir.path / "2.wav");
     CHECK_EQ(t2.result.unreadableSectors, 1u);
-    CHECK(rig.session.slowdownFallback().find("SET CD SPEED to 8x failed at LBA 310 (") == 0);
+    CHECK(rig.session.slowdownFallback().find("SET CD SPEED to 8x failed at LBA 300 (") == 0);
     CHECK(t2.result.slowdownFallback == rig.session.slowdownFallback());
     CHECK(!rig.session.ripSettings().options.slowdown);
     CHECK_EQ(int(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xBB))), 1);
@@ -1840,7 +1846,7 @@ TEST(slowdown_fallback_lasts_for_the_rest_of_the_rip) {
     CHECK_EQ(int(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xBB))), 1);
     const std::string log = rig.session.ripLog();
     CHECK(contains(log, "\nSlowdown on read errors: 8x, 4x\n"));
-    CHECK(contains(log, "  Slowdown given up: SET CD SPEED to 8x failed at LBA 310 ("));
+    CHECK(contains(log, "  Slowdown given up: SET CD SPEED to 8x failed at LBA 300 ("));
 
     CHECK(cdr::parseSpeedSetting("max", s.speed));
     rig.session.beginRip(s);
@@ -1868,6 +1874,276 @@ TEST(slowdown_disabled_over_usb) {
     CHECK_EQ(rig.fake.setSpeedCommands, 0);
     CHECK(contains(rig.session.ripLog(), "\nSlowdown on read errors: disabled\n"));
     CHECK(!contains(rig.session.ripLog(), "  Slowdown"));
+}
+
+// --- AccurateRip-guided re-read and the summary (#49) ---------------------------
+
+namespace {
+
+// A 48x drive at 24x whose disc has a problem sector in track 2 (LBA 310);
+// the database knows the right checksums of all three tracks (5 submissions).
+struct RereadRig {
+    Rig rig;
+    FakeHttp http;
+    cdr::AccurateRipDiscId id;
+    TempDir dir;
+    RereadRig() {
+        rig.fake.maxSpeedKBps = 8467;
+        rig.fake.readSpeedKBps = 4234;
+        id = cdr::AccurateRipDiscId::fromToc(rig.session.toc());
+        const Reference t1 = referenceRip(1), t2 = referenceRip(2), t3 = referenceRip(3);
+        http.accurateRip = reply(200, dbar(id, {{{5, t1.v2}, {5, t2.v2}, {5, t3.v2}}}));
+    }
+    cdr::RipSettings ripSettings() const {
+        cdr::RipSettings s = settings("wav");
+        s.readDiscCodes = false;
+        s.detectGaps = false;
+        s.cache = cdr::CacheSetting::None;
+        return s;
+    }
+    void ripAll(const cdr::RipSettings& s) {
+        rig.session.beginRip(s);
+        for (int n = 1; n <= 3; ++n) rig.session.ripTrack(n, dir.path / ("t" + std::to_string(n) + ".wav"));
+        rig.session.checkAccurateRip(&http);
+    }
+};
+
+}  // namespace
+
+// The drive of #49: after one read error at full speed the sector comes back
+// wrong without an error, right only at 4x. The rip's slowdown stops at 8x
+// (the retry there "works"), AccurateRip says track 2 is not accurate, the
+// re-read at 4x matches and replaces the file.
+TEST(accuraterip_reread_replaces_a_silently_wrong_track) {
+    RereadRig r;
+    r.rig.fake.speedFaults[310] = {706, false, 1};
+    r.ripAll(r.ripSettings());
+    const cdr::RippedTrack& first = r.rig.session.rippedTracks()[1];
+    CHECK(first.result.clean());  // "OK" ...
+    CHECK_EQ(first.result.retries, 1u);
+    CHECK(first.result.crc32 != referenceRip(2).crc32);  // ... but wrong
+    CHECK(r.rig.session.accurateRipReport().tracks.size() == 3 &&
+          !r.rig.session.accurateRipReport().tracks[1].accurate());
+    CHECK(r.rig.session.accurateRipRereadTracks() == std::vector<int>{2});
+
+    r.rig.device.opcodes.clear();
+    r.rig.fake.commandLog.clear();
+    std::vector<uint32_t> progress;
+    const cdr::TrackReread& rr =
+        r.rig.session.rereadTrack(2, r.dir.path / "reread.wav", [&](uint32_t done, uint32_t) { progress.push_back(done); });
+    CHECK(rr.outcome == cdr::TrackReread::Outcome::Accurate);
+    CHECK(rr.replaced);
+    CHECK_EQ(rr.speedFactor, 4);
+    CHECK_EQ(rr.result.crc32, referenceRip(2).crc32);
+    CHECK_EQ(rr.firstCrc32, first.result.crc32);
+    CHECK(wavPcm(readFile(r.dir.path / "reread.wav")) == referenceRip(2).pcm);  // the caller copies it over
+    CHECK(!progress.empty() && progress.back() == 150u);
+    // 4x for the re-read, then back to the drive's own speed.
+    std::vector<uint32_t> speeds;
+    for (const FakeDrive::Command& c : r.rig.fake.commandLog)
+        if (c.opcode == 0xBB) speeds.push_back(c.lba);
+    CHECK(speeds == (std::vector<uint32_t>{706, 0xFFFF}));
+    CHECK(r.rig.session.accurateRipRereadTracks().empty());  // done
+
+    const cdr::RipSummary sum = r.rig.session.summary();
+    CHECK(sum.verdict == cdr::RipSummary::Verdict::Resolved);
+    CHECK_EQ(sum.exitCode(), 0);
+    CHECK(sum.notAccurate.empty());
+    CHECK(sum.rereadAccurate == std::vector<int>{2});
+
+    const std::string log = r.rig.session.ripLog();
+    CHECK(contains(log, "\nMode: burst, retries 2\nAccurateRip re-read: at 4x (tracks with read problems that do not "
+                        "match)\nRead offset correction"));
+    char line[200];
+    std::snprintf(line, sizeof line,
+                  "\n          Re-read at 4x: accurately ripped (v2 5), CRC32 %08X (first read %08X), file replaced\n",
+                  rr.result.crc32, first.result.crc32);
+    CHECK(contains(log, line));
+    CHECK(contains(log, "AccurateRip: 3 of 3 track(s) accurately ripped (v2: 3; 1 after a re-read), 3 track(s) in "
+                        "database\n"));
+    CHECK(contains(log, "\n\nTracks with read problems: 2 (retries, slowdown)\nRe-read after AccurateRip: 1 track(s), "
+                        "1 accurately ripped (track 2)\nAll tracks ripped; the read problems were resolved "
+                        "(AccurateRip confirms the tracks)\n"));
+    CHECK(!contains(log, "without errors"));
+}
+
+// The same wrong data on every read (a different pressing, or damage): the
+// re-read says so, the first read stays, the rip ends with errors.
+TEST(accuraterip_reread_same_data_keeps_the_first_read) {
+    RereadRig r;
+    FakeDrive::C2Fault wrong;
+    wrong.flagged = false;
+    wrong.varying = false;
+    r.rig.fake.c2Faults[330] = wrong;          // silently wrong at every speed
+    r.rig.fake.failuresBySector[320] = 1;      // one read error: retried
+    r.ripAll(r.ripSettings());
+    const uint32_t firstCrc = r.rig.session.rippedTracks()[1].result.crc32;
+    CHECK(r.rig.session.accurateRipRereadTracks() == std::vector<int>{2});
+    const cdr::TrackReread& rr = r.rig.session.rereadTrack(2, r.dir.path / "reread.wav");
+    CHECK(rr.outcome == cdr::TrackReread::Outcome::SameData);
+    CHECK(!rr.replaced);
+    CHECK(!fs::exists(r.dir.path / "reread.wav"));
+    CHECK_EQ(rr.result.crc32, firstCrc);
+
+    const cdr::RipSummary sum = r.rig.session.summary();
+    CHECK(sum.verdict == cdr::RipSummary::Verdict::Errors);
+    CHECK_EQ(sum.exitCode(), 2);
+    const std::string log = r.rig.session.ripLog();
+    char line[200];
+    std::snprintf(line, sizeof line,
+                  "\n          Re-read at 4x: same data (CRC32 %08X) - likely a different pressing or damage on the disc\n",
+                  firstCrc);
+    CHECK(contains(log, line));
+    CHECK(contains(log, "AccurateRip: 2 of 3 track(s) accurately ripped (v2: 2), 3 track(s) in database\n"));
+    CHECK(contains(log, "\n\nTracks with read problems: 2 (retries, slowdown)\nRe-read after AccurateRip: 1 track(s), "
+                        "none accurately ripped\n1 track(s) not accurate in AccurateRip (track 2; read errors were "
+                        "retried)\nFinished with errors\n"));
+}
+
+// Wrong data that changes from read to read: other data, not accurate
+// either; the first read stays.
+TEST(accuraterip_reread_different_data_keeps_the_first_read) {
+    RereadRig r;
+    FakeDrive::C2Fault wrong;
+    wrong.flagged = false;  // varying: other wrong data every time
+    r.rig.fake.c2Faults[330] = wrong;
+    r.rig.fake.failuresBySector[320] = 1;
+    r.ripAll(r.ripSettings());
+    const uint32_t firstCrc = r.rig.session.rippedTracks()[1].result.crc32;
+    const cdr::TrackReread& rr = r.rig.session.rereadTrack(2, r.dir.path / "reread.wav");
+    CHECK(rr.outcome == cdr::TrackReread::Outcome::DifferentData);
+    CHECK(!rr.replaced);
+    CHECK(!fs::exists(r.dir.path / "reread.wav"));
+    CHECK(rr.result.crc32 != firstCrc);
+    char line[200];
+    std::snprintf(line, sizeof line,
+                  "\n          Re-read at 4x: different data (CRC32 %08X, first read %08X), not accurate either; the "
+                  "first read was kept\n",
+                  rr.result.crc32, firstCrc);
+    CHECK(contains(r.rig.session.ripLog(), line));
+    CHECK_EQ(r.rig.session.summary().exitCode(), 2);
+}
+
+// Off (the app's setting, or without slowdown), clean tracks, a single
+// lookup without the disc, and images: no re-read.
+TEST(accuraterip_reread_only_when_wanted) {
+    {
+        RereadRig r;
+        r.rig.fake.speedFaults[310] = {706, false, 1};
+        cdr::RipSettings s = r.ripSettings();
+        s.accurateRipReread = false;
+        r.ripAll(s);
+        CHECK(r.rig.session.accurateRipRereadTracks().empty());
+        bool threw = false;
+        try {
+            r.rig.session.rereadTrack(2, r.dir.path / "x.wav");
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        CHECK(threw);
+        const std::string log = r.rig.session.ripLog();
+        CHECK(contains(log, "\nAccurateRip re-read: disabled\n"));
+        CHECK(contains(log, "\n1 track(s) not accurate in AccurateRip (track 2; read errors were retried)\n"
+                            "Finished with errors\n"));
+    }
+    {
+        // Without slowdown: the retry at full speed gets the wrong data as well; no re-read.
+        RereadRig r;
+        r.rig.fake.speedFaults[310] = {706, false, 1};
+        cdr::RipSettings s = r.ripSettings();
+        s.slowdown = false;
+        r.ripAll(s);
+        CHECK_EQ(r.rig.fake.setSpeedCommands, 0);
+        CHECK(r.rig.session.accurateRipRereadTracks().empty());
+        CHECK(contains(r.rig.session.ripLog(), "\nAccurateRip re-read: not possible without slowdown\n"));
+        CHECK_EQ(r.rig.session.summary().exitCode(), 2);
+    }
+    {
+        // A clean rip: nothing to re-read, the old verdict.
+        RereadRig r;
+        r.ripAll(r.ripSettings());
+        CHECK(r.rig.session.accurateRipRereadTracks().empty());
+        CHECK(r.rig.session.summary().verdict == cdr::RipSummary::Verdict::Clean);
+        CHECK(contains(r.rig.session.ripLog(), "track(s) in database\n\nAll tracks ripped without errors\n"));
+    }
+    {
+        // One submission only: not trusted enough for a re-read.
+        RereadRig r;
+        r.http.accurateRip = reply(200, dbar(r.id, {{{1, referenceRip(1).v2}, {1, referenceRip(2).v2},
+                                                       {1, referenceRip(3).v2}}}));
+        r.rig.fake.speedFaults[310] = {706, false, 1};
+        r.ripAll(r.ripSettings());
+        CHECK(r.rig.session.accurateRipRereadTracks().empty());
+    }
+    {
+        // Lookup failed: no re-read; read problems without AccurateRip are a warning.
+        RereadRig r;
+        r.http.accurateRip = reply(503, "");
+        r.rig.fake.failuresBySector[320] = 1;
+        r.ripAll(r.ripSettings());
+        CHECK(r.rig.session.accurateRipRereadTracks().empty());
+        const cdr::RipSummary sum = r.rig.session.summary();
+        CHECK(sum.verdict == cdr::RipSummary::Verdict::Warnings);
+        CHECK_EQ(sum.exitCode(), 0);
+        CHECK(contains(r.rig.session.ripLog(), "\nTracks with read problems: 2 (retries, slowdown)\nFinished with "
+                                               "warnings\n"));
+    }
+}
+
+// Single-file mode: the image cannot take a re-read of one track; rip.log says so.
+TEST(accuraterip_reread_not_in_single_file_mode) {
+    RereadRig r;
+    r.rig.fake.speedFaults[310] = {706, false, 1};
+    r.rig.session.beginRip(r.ripSettings());
+    r.rig.session.ripImage({}, r.dir.path / "image.wav", r.dir.path / "image.cue");
+    r.rig.session.checkAccurateRip(&r.http);
+    CHECK(r.rig.session.accurateRipRereadTracks().empty());
+    const cdr::TrackReread* rr = r.rig.session.accurateRipReport().reread(2);
+    CHECK(rr != nullptr && rr->outcome == cdr::TrackReread::Outcome::NotSupported);
+    const cdr::RipSummary sum = r.rig.session.summary();
+    CHECK(sum.rereadTracks.empty());
+    CHECK_EQ(sum.exitCode(), 2);
+    const std::string log = r.rig.session.ripLog();
+    CHECK(contains(log, "\n          Re-read: not supported in single-file mode (rip the track on its own to re-read "
+                        "it)\n"));
+    CHECK(contains(log, "\n1 track(s) not accurate in AccurateRip (track 2; read errors were retried)\nFinished with "
+                        "errors\n"));
+}
+
+// A re-read that cannot be written: Failed, logged, the first read stays.
+TEST(accuraterip_reread_failure_keeps_the_first_read) {
+    RereadRig r;
+    r.rig.fake.speedFaults[310] = {706, false, 1};
+    r.ripAll(r.ripSettings());
+    const cdr::TrackReread& rr = r.rig.session.rereadTrack(2, r.dir.path / "missing" / "reread.wav");
+    CHECK(rr.outcome == cdr::TrackReread::Outcome::Failed);
+    CHECK(!rr.error.empty());
+    CHECK(!rr.replaced);
+    CHECK_EQ(r.rig.fake.readSpeedKBps, 8467);  // restored
+    CHECK(r.rig.session.accurateRipRereadTracks().empty());
+    const std::string log = r.rig.session.ripLog();
+    CHECK(contains(log, "\n          Re-read at 4x failed: "));
+    CHECK(contains(log, "; the first read was kept\n"));
+    CHECK_EQ(r.rig.session.summary().exitCode(), 2);
+}
+
+// Cancel during the re-read: RipCancelled, the file is gone, the first read stays.
+TEST(accuraterip_reread_cancel) {
+    RereadRig r;
+    r.rig.fake.speedFaults[310] = {706, false, 1};
+    r.ripAll(r.ripSettings());
+    bool cancelled = false;
+    try {
+        r.rig.session.rereadTrack(2, r.dir.path / "reread.wav", [&](uint32_t done, uint32_t) {
+            if (done > 0) r.rig.session.cancel();
+        });
+    } catch (const cdr::RipCancelled&) {
+        cancelled = true;
+    }
+    CHECK(cancelled);
+    CHECK(!fs::exists(r.dir.path / "reread.wav"));
+    CHECK(r.rig.session.accurateRipReport().reread(2) == nullptr);
+    CHECK_EQ(r.rig.fake.readSpeedKBps, 8467);  // speed restored (max)
 }
 
 int main() {

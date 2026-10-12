@@ -61,6 +61,8 @@ class MainActivity : Activity() {
         const val PREF_C2 = "useC2"
         // Slowdown on read errors (#49).
         const val PREF_SLOWDOWN = "slowdown"
+        // AccurateRip-guided re-read (#49).
+        const val PREF_AR_REREAD = "accurateRipReread"
         const val PREF_CACHE = "cacheMode"
         const val PREF_ADVANCED = "advancedOpen"
         // Single-file mode (#42): the whole selection as one file plus a .cue file.
@@ -104,6 +106,7 @@ class MainActivity : Activity() {
     private lateinit var checkVerify: CheckBox
     private lateinit var checkC2: CheckBox
     private lateinit var checkSlowdown: CheckBox
+    private lateinit var checkArReread: CheckBox
     private lateinit var spinnerCache: Spinner
     private lateinit var switchSingleFile: Switch
     private lateinit var textAdvanced: TextView
@@ -158,6 +161,8 @@ class MainActivity : Activity() {
     private var metadata: DiscMetadata? = null
     private var outputTree: Uri? = null
     private var ripping = false
+    // The user cancelled during the AccurateRip-guided re-read (#49).
+    private var rereadCancelled = false
     private var busy = false
     private var testingCddb = false
     // The "set a contact e-mail address" dialog was shown for the current settings.
@@ -201,6 +206,7 @@ class MainActivity : Activity() {
         checkVerify = findViewById(R.id.checkVerify)
         checkC2 = findViewById(R.id.checkC2)
         checkSlowdown = findViewById(R.id.checkSlowdown)
+        checkArReread = findViewById(R.id.checkArReread)
         spinnerCache = findViewById(R.id.spinnerCache)
         switchSingleFile = findViewById(R.id.switchSingleFile)
         textAdvanced = findViewById(R.id.textAdvanced)
@@ -238,6 +244,8 @@ class MainActivity : Activity() {
         checkAccurateRip.isChecked = prefs.getBoolean(PREF_ACCURATERIP, true)
         checkC2.isChecked = prefs.getBoolean(PREF_C2, true)
         checkSlowdown.isChecked = prefs.getBoolean(PREF_SLOWDOWN, true)
+        checkArReread.isChecked = prefs.getBoolean(PREF_AR_REREAD, true)
+        checkArReread.isEnabled = checkSlowdown.isChecked
         spinnerCache.setSelection(CacheMode.fromKey(prefs.getString(PREF_CACHE, null)).ordinal, false)
         switchSingleFile.isChecked = prefs.getBoolean(PREF_SINGLE_FILE, false)
         showAdvanced(prefs.getBoolean(PREF_ADVANCED, false))
@@ -273,6 +281,10 @@ class MainActivity : Activity() {
         }
         checkSlowdown.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(PREF_SLOWDOWN, checked).apply()
+            checkArReread.isEnabled = checked && !ripping  // the re-read needs slowdown
+        }
+        checkArReread.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean(PREF_AR_REREAD, checked).apply()
         }
         switchSingleFile.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean(PREF_SINGLE_FILE, checked).apply()
@@ -572,6 +584,7 @@ class MainActivity : Activity() {
         val verify = checkVerify.isChecked
         val useC2 = checkC2.isChecked
         val slowdown = checkSlowdown.isChecked
+        val arReread = checkArReread.isChecked
         val cacheMode = selectedCacheMode()
         val format = selectedFormat()
         val accurateRip = checkAccurateRip.isChecked
@@ -579,6 +592,7 @@ class MainActivity : Activity() {
 
         ripping = true
         cancelRequested = false
+        rereadCancelled = false
         setBusy(true)
         buttonRip.isEnabled = true
         buttonRip.text = getString(R.string.cancel)
@@ -599,8 +613,11 @@ class MainActivity : Activity() {
                 if (cacheMode == CacheMode.AUTO) runOnUiThread { setStatus("ドライブのキャッシュを確認しています…") }
                 // The drive database's offset for rip.log (#37); online only with AccurateRip enabled.
                 runCatching { s.lookupDriveOffsetDb(if (accurateRip) http else null) }
-                s.beginRip(format, offset, MAX_RETRIES, verify, useC2, cacheMode, source, sourceDetail, slowdown)
+                s.beginRip(
+                    format, offset, MAX_RETRIES, verify, useC2, cacheMode, source, sourceDetail, slowdown, arReread,
+                )
                 val ripped = mutableListOf<Pair<Int, RipResult>>()
+                val documents = mutableMapOf<Int, Uri>()  // per-track files, for the re-read (#49)
                 var imageResult: ImageResult? = null
                 val dir: Uri
                 if (image != null) {
@@ -621,24 +638,32 @@ class MainActivity : Activity() {
                                 setStatus("$label  ${permille / 10}%")
                             }
                         }
-                        copyToDocument(temp, createDocument(dir, mimeType(format), s.trackFileName(track.number, format)))
+                        val document = createDocument(dir, mimeType(format), s.trackFileName(track.number, format))
+                        copyToDocument(temp, document)
+                        documents[track.number] = document
                         ripped += track.number to r
                     }
                 }
-                val problems = ripped.count { !it.second.clean }
                 if (accurateRip) runOnUiThread { setStatus("AccurateRip データベースを照会しています…") }
                 val summary = s.checkAccurateRip(accurateRip, http)
+                // AccurateRip-guided re-read (#49): tracks that had read problems and do not match.
+                val rereads = rereadTracks(s, documents, temp)
+                val ripSummary = s.summary()
                 val log = s.ripLog()
                 writeText(createDocument(dir, "application/octet-stream", "rip.log"), log)
                 results = (if (image != null && imageResult != null) describeImage(image, imageResult) + "\n" else "") +
                     describeC2(s.c2Status(), ripped) + "\n" + describeCache(s.cacheStatus(), ripped) + "\n" +
-                    describeAccurateRip(summary)
+                    describeAccurateRip(summary) + describeRereads(rereads) + "\n" + describeSummary(ripSummary)
                 // The disc is in AccurateRip but nothing matched: most likely the offset (#37).
                 suggestDetection = summary.status == AccurateRipStatus.FOUND && summary.accurateTracks == 0 &&
                     summary.tracksInDatabase > 0
                 val what = if (image != null) "${selected.size} トラックを 1 ファイルに保存" else "${selected.size} トラック"
-                message = if (problems == 0) "完了しました ($what)"
-                else "完了しましたが、$problems トラックに読めないセクタまたは疑わしい位置がありました (rip.log を参照)"
+                message = when (ripSummary.verdict) {
+                    RipVerdict.CLEAN -> "完了しました ($what)"
+                    RipVerdict.RESOLVED -> "完了しました ($what)。読み取りエラーのあったトラックも AccurateRip で一致しました"
+                    RipVerdict.WARNINGS -> "完了しましたが、注意があります ($what。下の結果と rip.log を参照)"
+                    RipVerdict.ERRORS -> "完了しましたが、エラーがあります ($what。下の結果と rip.log を参照)"
+                } + (if (rereadCancelled) " (読み直しは中止しました)" else "")
             } catch (e: CancellationException) {
                 message = "キャンセルしました"
             } catch (e: Exception) {
@@ -665,6 +690,87 @@ class MainActivity : Activity() {
             }
             if (suggestDetection && toc != null) suggestOffsetDetection()
         }
+    }
+
+    // --- AccurateRip-guided re-read and the summary (#49) -----------------------
+
+    /**
+     * Worker thread: re-reads the tracks the session asks for (per-track rips,
+     * after [CdSession.checkAccurateRip]) into [temp]; a re-read that matches
+     * AccurateRip is copied over the track's document. Returns the results by track.
+     */
+    private fun rereadTracks(s: CdSession, documents: Map<Int, Uri>, temp: File): List<Pair<Int, RereadResult>> {
+        val results = mutableListOf<Pair<Int, RereadResult>>()
+        try {
+            for (number in s.rereadTracks()) {
+                if (cancelRequested) throw CancellationException()
+                val document = documents[number] ?: continue
+                val label = "トラック $number を低速で読み直しています (AccurateRip 不一致)"
+                runOnUiThread { setStatus("$label…") }
+                val r = try {
+                    s.rereadTrack(number, temp.path) { done, total ->
+                        val permille = if (total > 0) (1000L * done / total).toInt() else 0
+                        runOnUiThread {
+                            progress.progress = permille
+                            setStatus("$label  ${permille / 10}%")
+                        }
+                    }
+                } catch (e: IOException) {
+                    // The first read is saved: keep it, go on with the next track.
+                    RereadResult(RereadOutcome.FAILED, 0, 0, 0)
+                }
+                if (r.outcome == RereadOutcome.ACCURATE) {
+                    // Over the first read ("wt": providers may not truncate with "w").
+                    copyToDocument(temp, document, mode = "wt", deleteOnFailure = false, cancellable = false)
+                }
+                temp.delete()
+                results += number to r
+            }
+        } catch (e: CancellationException) {
+            // The tracks are saved already: stop re-reading, still write rip.log.
+            rereadCancelled = true
+        }
+        return results
+    }
+
+    // e.g. "Track 02: 4x で読み直し → 一致 (ファイルを置き換えました)"
+    private fun describeRereads(rereads: List<Pair<Int, RereadResult>>): String {
+        if (rereads.isEmpty()) return ""
+        val lines = rereads.map { (number, r) ->
+            val speed = if (r.speedFactor > 0) "${r.speedFactor}x" else "現在の速度"
+            val outcome = when (r.outcome) {
+                RereadOutcome.ACCURATE -> "一致 (ファイルを置き換えました)"
+                RereadOutcome.SAME_DATA -> "同じデータ (CRC32 %08X)。別プレスか盤の傷の可能性".format(r.crc32)
+                RereadOutcome.DIFFERENT_DATA ->
+                    "異なるデータ (CRC32 %08X、1 回目 %08X) で不一致。1 回目を残しました".format(r.crc32, r.firstCrc32)
+                RereadOutcome.FAILED -> "読み直せませんでした (rip.log を参照)。1 回目を残しました"
+            }
+            "Track %02d: %s で読み直し → %s".format(number, speed, outcome)
+        }
+        return "\n" + lines.joinToString("\n")
+    }
+
+    // The verdict of the rip in Japanese (rip.log has it in English).
+    private fun describeSummary(sum: RipSummaryInfo): String {
+        fun tracks(list: List<Int>) = list.joinToString(", ")
+        val lines = mutableListOf<String>()
+        if (sum.errorTracks.isNotEmpty())
+            lines += "読めないセクタ・疑わしい位置のあるトラック: ${tracks(sum.errorTracks)}"
+        if (sum.problemTracks.isNotEmpty())
+            lines += "読み取りエラー (リトライ・C2・減速) のあったトラック: ${tracks(sum.problemTracks)}"
+        if (sum.notAccurate.isNotEmpty()) {
+            var line = "AccurateRip と一致しないトラック: ${tracks(sum.notAccurate)}"
+            if (sum.notAccurateWithProblems.isNotEmpty())
+                line += " (うち読み取りエラーあり: ${tracks(sum.notAccurateWithProblems)})"
+            lines += line
+        }
+        lines += when (sum.verdict) {
+            RipVerdict.CLEAN -> "結果: エラーなし"
+            RipVerdict.RESOLVED -> "結果: 読み取りエラーはありましたが、AccurateRip で一致を確認しました"
+            RipVerdict.WARNINGS -> "結果: 注意あり (AccurateRip で確認できないトラック、または別プレスの可能性)"
+            RipVerdict.ERRORS -> "結果: エラーあり"
+        }
+        return lines.joinToString("\n")
     }
 
     // --- Single-file mode (#42) -----------------------------------------------
@@ -858,7 +964,7 @@ class MainActivity : Activity() {
         // Detection consulted the drive offset database (online): keep its answer for the label.
         if (d.driveDbStatus == DriveDbStatus.FOUND || driveDb?.status != DriveDbStatus.FOUND)
             if (d.driveDbStatus != DriveDbStatus.NOT_CHECKED)
-                driveDb = DriveOffsetDb(d.driveDbStatus, d.driveDbOffset, d.driveDbSubmissions, -1, "", d.driveDbLogLine)
+                driveDb = DriveOffsetDb(d.driveDbStatus, d.driveDbOffset, d.driveDbSubmissions, "", d.driveDbLogLine)
         if (d.status == OffsetDetectStatus.DETECTED) {
             val db = if (d.matchesDriveDb) ", ドライブ DB と一致" else ""
             val agreed = "${d.agreeingTracks}/${d.testedTracks} トラック一致, ${d.version}$db"
@@ -1250,15 +1356,23 @@ class MainActivity : Activity() {
     // (providers may hand out non-seekable pipes).
     // A cancel during the copy (a disc image takes a while) or a failure
     // deletes the document again.
-    private fun copyToDocument(source: File, document: Uri) {
+    // The AccurateRip re-read (#49) replaces a track's document: mode "wt", not
+    // deleted on failure and not cancelled half way (that would leave neither read).
+    private fun copyToDocument(
+        source: File,
+        document: Uri,
+        mode: String = "w",
+        deleteOnFailure: Boolean = true,
+        cancellable: Boolean = true,
+    ) {
         try {
-            val pfd = contentResolver.openFileDescriptor(document, "w") ?: throw IOException("cannot open $document")
+            val pfd = contentResolver.openFileDescriptor(document, mode) ?: throw IOException("cannot open $document")
             pfd.use {
                 FileOutputStream(it.fileDescriptor).use { out ->
                     FileInputStream(source).use { input ->
                         val buffer = ByteArray(1 shl 16)
                         while (true) {
-                            if (cancelRequested) throw CancellationException()
+                            if (cancellable && cancelRequested) throw CancellationException()
                             val n = input.read(buffer)
                             if (n < 0) break
                             out.write(buffer, 0, n)
@@ -1267,7 +1381,7 @@ class MainActivity : Activity() {
                 }
             }
         } catch (e: Exception) {
-            deleteDocument(document)
+            if (deleteOnFailure) deleteDocument(document)
             throw e
         }
     }
@@ -1362,6 +1476,7 @@ class MainActivity : Activity() {
         checkVerify.isEnabled = !busy
         checkC2.isEnabled = !busy
         checkSlowdown.isEnabled = !busy
+        checkArReread.isEnabled = !busy && checkSlowdown.isChecked
         spinnerCache.isEnabled = !busy
         switchSingleFile.isEnabled = !busy
         checkCddb.isEnabled = !busy

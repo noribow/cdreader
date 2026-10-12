@@ -40,7 +40,6 @@ std::string DriveOffsetDbEntry::describe() const {
     std::string s = signedNumber(offset);
     std::string extra;
     if (submissions >= 0) extra = std::to_string(submissions) + (submissions == 1 ? " submission" : " submissions");
-    if (agreePercent >= 0) extra += (extra.empty() ? "" : ", ") + std::to_string(agreePercent) + "% agree";
     return extra.empty() ? s : s + " (" + extra + ")";
 }
 
@@ -55,7 +54,7 @@ DriveOffsetDb DriveOffsetDb::parse(const std::string& bytes) {
         return db;
     }
     db.records = bytes.size() / kDriveOffsetRecordSize;
-    size_t implausible = 0;  // records whose submission / percentage fields are out of range
+    size_t implausible = 0;  // records whose submission field is out of range
     const auto* data = reinterpret_cast<const unsigned char*>(bytes.data());
     for (size_t r = 0; r < db.records; ++r) {
         const unsigned char* rec = data + r * kDriveOffsetRecordSize;
@@ -78,11 +77,10 @@ DriveOffsetDb DriveOffsetDb::parse(const std::string& bytes) {
         }
         const unsigned char* misc = name + kDriveOffsetNameSize;
         const int32_t submissions = le32(misc);
-        const int32_t percent = le32(misc + 4);
-        const bool plausible = submissions >= 0 && submissions <= kMaxSubmissions && percent >= 0 && percent <= 100;
-        if (plausible) {
+        // The int32 after it (once read as "percentage agree") is not used:
+        // its meaning is unknown (see drive_offset_db.h).
+        if (submissions >= 0 && submissions <= kMaxSubmissions) {
             e.submissions = int(submissions);
-            e.agreePercent = int(percent);
         } else {
             ++implausible;
         }
@@ -94,10 +92,10 @@ DriveOffsetDb DriveOffsetDb::parse(const std::string& bytes) {
         db.entries.clear();
         return db;
     }
-    // The submission / percentage layout is not documented: when it does not
-    // fit the file, use none of it rather than some numbers that mean nothing.
+    // The submission layout is not documented: when it does not fit the
+    // file, use none of it rather than some numbers that mean nothing.
     if (implausible * 10 > db.entries.size())
-        for (DriveOffsetDbEntry& e : db.entries) e.submissions = e.agreePercent = -1;
+        for (DriveOffsetDbEntry& e : db.entries) e.submissions = -1;
     return db;
 }
 

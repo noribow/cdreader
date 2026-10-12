@@ -56,6 +56,7 @@ add_library(cdreader_core STATIC
   core/src/ogg.cpp
   core/src/ogg_flac_writer.cpp
   core/src/resampler.cpp
+  core/src/rip_summary.cpp
   core/src/ripper.cpp
   core/src/scsi.cpp
   core/src/settings_store.cpp

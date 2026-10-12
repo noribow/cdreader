@@ -61,6 +61,7 @@ object NativeCd {
         offsetSource: Int,
         offsetDetail: String,
         slowdown: Boolean,
+        accurateRipReread: Boolean,
     )
     @JvmStatic external fun nativeRipTrack(handle: Long, track: Int, path: String, listener: RipProgressListener?): IntArray
     @JvmStatic external fun nativeImageFileNames(handle: Long, format: String, tracks: IntArray): Array<String>
@@ -76,6 +77,9 @@ object NativeCd {
     @JvmStatic external fun nativeLookupDriveOffsetDb(handle: Long, http: HttpGet?): Array<String>
     @JvmStatic external fun nativeCheckAccurateRip(handle: Long, enabled: Boolean, http: HttpGet?): IntArray
     @JvmStatic external fun nativeAccurateRipError(handle: Long): String
+    @JvmStatic external fun nativeRereadTracks(handle: Long): IntArray
+    @JvmStatic external fun nativeRereadTrack(handle: Long, track: Int, path: String, listener: RipProgressListener?): IntArray
+    @JvmStatic external fun nativeRipSummary(handle: Long): Array<String>
     @JvmStatic external fun nativeC2Status(handle: Long): Int
     @JvmStatic external fun nativeCacheStatus(handle: Long): IntArray
     @JvmStatic external fun nativeRipLog(handle: Long): String
@@ -104,10 +108,8 @@ data class DriveOffsetDb(
     val status: DriveDbStatus,
     /** FOUND: the offset listed for the drive model. */
     val offset: Int,
-    /** -1: unknown. */
+    /** -1: unknown (the layout of this field in DriveOffsets.bin is unverified). */
     val submissions: Int,
-    /** -1: unknown. */
-    val agreePercent: Int,
     /** The drive's name in the database. */
     val name: String,
     /** "AccurateRip drive database: +6 (1234 submissions)" (rip.log). */
@@ -309,6 +311,54 @@ data class RipResult(
     val clean: Boolean get() = unreadableSectors == 0 && suspiciousSectors == 0
 }
 
+/** Outcome of an AccurateRip-guided re-read (#49), in the order of the native codes. */
+enum class RereadOutcome {
+    /** Matches AccurateRip: the re-read file replaces the track's file. */
+    ACCURATE,
+    /** The same data again: a different pressing or damage. */
+    SAME_DATA,
+    /** Other data, not accurate either: the first read stays. */
+    DIFFERENT_DATA,
+    FAILED,
+}
+
+/** Result of [CdSession.rereadTrack]. */
+data class RereadResult(
+    val outcome: RereadOutcome,
+    /** The speed of the re-read (x); 0: the speed of the rip. */
+    val speedFactor: Int,
+    val crc32: Int,
+    val firstCrc32: Int,
+)
+
+/** Verdict at the end of a rip (#49), in the order of the native codes. */
+enum class RipVerdict {
+    /** No read problems, no track AccurateRip says is not accurate. */
+    CLEAN,
+    /** Read problems, but AccurateRip confirms every track that had them. */
+    RESOLVED,
+    /** Read problems AccurateRip cannot confirm, or tracks not accurate without read problems. */
+    WARNINGS,
+    /** Unreadable sectors / suspicious positions, or not accurate after read problems. */
+    ERRORS,
+}
+
+/** The end of a rip (#49), see [CdSession.summary]. */
+data class RipSummaryInfo(
+    val verdict: RipVerdict,
+    /** Unreadable sectors or suspicious positions. */
+    val errorTracks: List<Int>,
+    /** Retries, C2 errors or slowdown. */
+    val problemTracks: List<Int>,
+    /** In the AccurateRip database, not accurate (after the re-read). */
+    val notAccurate: List<Int>,
+    val notAccurateWithProblems: List<Int>,
+    val rereadTracks: List<Int>,
+    val rereadAccurate: List<Int>,
+    /** The summary at the end of rip.log (English, newline separated). */
+    val logText: String,
+)
+
 /** File names of a single-file rip (#42), see [CdSession.imageFileNames]. */
 data class ImageNames(
     /** "Artist - Album.flac", or "CDImage.flac" without CDDB data. */
@@ -458,7 +508,8 @@ class CdSession private constructor(private val handle: Long) : Closeable {
      * [useC2]: read with C2 error pointers when the drive supports them.
      * [cacheMode]: drive cache defeat; [CacheMode.AUTO] tests the drive once per disc (a few seconds).
      * [offsetSource] / [offsetDetail]: where [readOffset] came from, for rip.log (#37).
-     * [slowdown]: re-read sectors with read / C2 errors at lower speeds (#49).
+     * [slowdown]: retry blocks with read errors (and re-read sectors with C2 errors) at lower speeds (#49).
+     * [accurateRipReread]: re-read tracks that had read problems and do not match AccurateRip (#49, [rereadTrack]).
      */
     fun beginRip(
         format: String,
@@ -470,9 +521,10 @@ class CdSession private constructor(private val handle: Long) : Closeable {
         offsetSource: OffsetSource,
         offsetDetail: String,
         slowdown: Boolean,
+        accurateRipReread: Boolean,
     ) = NativeCd.nativeBeginRip(
         handle, format, readOffset, maxRetries, verify, useC2, cacheMode.code, offsetSource.code, offsetDetail,
-        slowdown,
+        slowdown, accurateRipReread,
     )
 
     /**
@@ -522,7 +574,7 @@ class CdSession private constructor(private val handle: Long) : Closeable {
         val v = NativeCd.nativeLookupDriveOffsetDb(handle, http)
         return DriveOffsetDb(
             DriveDbStatus.entries.getOrElse(v[0].toInt()) { DriveDbStatus.NOT_CHECKED },
-            v[1].toInt(), v[2].toInt(), v[3].toInt(), v[4], v[5],
+            v[1].toInt(), v[2].toInt(), v[3], v[4],
         )
     }
 
@@ -602,6 +654,34 @@ class CdSession private constructor(private val handle: Long) : Closeable {
             AccurateRipTrack(v[i], v[i + 1], v[i + 2], v[i + 3], v[i + 4], v[i + 5], v[i + 6])
         }
         return AccurateRipSummary(status, v[1], v[2], v[3], tracks, NativeCd.nativeAccurateRipError(handle))
+    }
+
+    /**
+     * AccurateRip-guided re-read (#49), after [checkAccurateRip]: the tracks
+     * that had read problems and do not match although the database has 2 or
+     * more submissions for them (per-track rips only; empty when disabled).
+     */
+    fun rereadTracks(): List<Int> = NativeCd.nativeRereadTracks(handle).toList()
+
+    /**
+     * Reads [track] again slowly into the local file [path]. ACCURATE: the
+     * file at [path] replaces the track's file (copy it over the document);
+     * otherwise it is deleted. Throws java.util.concurrent.CancellationException
+     * after [cancel], IOException on errors.
+     */
+    fun rereadTrack(track: Int, path: String, listener: RipProgressListener?): RereadResult {
+        val v = NativeCd.nativeRereadTrack(handle, track, path, listener)
+        return RereadResult(RereadOutcome.entries.getOrElse(v[0]) { RereadOutcome.FAILED }, v[1], v[2], v[3])
+    }
+
+    /** The end of the rip (#49): problems, AccurateRip and the verdict, as at the end of rip.log. */
+    fun summary(): RipSummaryInfo {
+        val v = NativeCd.nativeRipSummary(handle)
+        fun list(s: String) = s.split(",").filter { it.isNotEmpty() }.map { it.toInt() }
+        return RipSummaryInfo(
+            RipVerdict.entries.getOrElse(v[0].toInt()) { RipVerdict.ERRORS },
+            list(v[1]), list(v[2]), list(v[3]), list(v[4]), list(v[5]), list(v[6]), v[7],
+        )
     }
 
     /** rip.log text of the current rip (same layout as the Windows CLI). */

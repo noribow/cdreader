@@ -16,15 +16,16 @@
 //                   and product joined by " - ", e.g. "HL-DT-ST - BD-RE  BP71N"
 //                   (CUETools compares it with vendor.TrimEnd() + " - " +
 //                   product.TrimEnd())
-//   +35  34 bytes   other data. Read here as int32 LE submission count at +35
-//                   and int32 LE "percentage agree" at +39 (the columns of
-//                   accuraterip.com/driveoffsets.htm). This part is NOT
-//                   verified against a published description: values outside
-//                   0..10,000,000 / 0..100 are treated as unknown (-1), and
-//                   when many records have such values the interpretation is
-//                   dropped for the whole file. Nothing but the "prefer the
-//                   entry with most submissions" tie-break and the log text
-//                   depends on it.
+//   +35  34 bytes   other data, layout UNVERIFIED (no published description).
+//                   The int32 LE at +35 is read as the submission count (the
+//                   column of accuraterip.com/driveoffsets.htm); values outside
+//                   0..10,000,000 are treated as unknown (-1), and when many
+//                   records have such values it is dropped for the whole
+//                   file. Nothing but the "prefer the entry with most
+//                   submissions" tie-break and the log text depends on it.
+//                   The int32 at +39 was once read as the "percentage agree"
+//                   column, but real files hold values that do not fit
+//                   (0% with 105 submissions): it is ignored, as is the rest.
 //
 // Offset and name are what other software relies on; the parser is
 // defensive: a trailing partial record is ignored, records with an empty or
@@ -52,10 +53,9 @@ inline constexpr int64_t kDriveOffsetDbMaxAgeSeconds = 30LL * 24 * 60 * 60;
 struct DriveOffsetDbEntry {
     int offset = 0;
     std::string name;       // as in the file, trailing NULs / spaces removed
-    int submissions = -1;   // -1: unknown
-    int agreePercent = -1;  // -1: unknown
+    int submissions = -1;   // -1: unknown (the field's layout is unverified)
 
-    // "+6 (1234 submissions, 100% agree)", parts left out when unknown.
+    // "+6 (1234 submissions)"; "+6" when the submissions are unknown.
     std::string describe() const;
 };
 
@@ -125,7 +125,7 @@ struct DriveOffsetDbMatch {
     bool found() const { return status == Status::Found; }
     // "+6 (1234 submissions)" / "drive not listed" / "unavailable (no network)" / "not checked".
     std::string describe() const;
-    // "AccurateRip drive database: +6 (1234 submissions, 100% agree)".
+    // "AccurateRip drive database: +6 (1234 submissions)".
     std::string logLine() const;
     // rip.log: logLine(), with "; differs from the read offset used" when
     // the database lists another offset than `readOffsetUsed`.
