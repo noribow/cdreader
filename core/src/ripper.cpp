@@ -120,6 +120,48 @@ std::vector<std::string> cacheLogLines(const TrackRipResult& r) {
     return lines;
 }
 
+std::vector<std::string> slowdownLogLines(const TrackRipResult& r) {
+    std::vector<std::string> lines;
+    if (!r.slowdownRecovered.empty() || r.slowdownFailed) {
+        std::string line;
+        // Fastest speed first: "2 sector(s) re-read at 8x, 1 at 4x".
+        for (auto it = r.slowdownRecovered.rbegin(); it != r.slowdownRecovered.rend(); ++it)
+            line += line.empty() ? std::to_string(it->second) + " sector(s) re-read at " + std::to_string(it->first) + "x"
+                                 : ", " + std::to_string(it->second) + " at " + std::to_string(it->first) + "x";
+        if (r.slowdownFailed)
+            line += (line.empty() ? "" : ", ") + std::to_string(r.slowdownFailed) +
+                    (line.empty() ? " sector(s) not recovered at lower speeds" : " not recovered");
+        lines.push_back("  Slowdown: " + line);
+    }
+    if (!r.slowdownFallback.empty()) lines.push_back("  Slowdown given up: " + r.slowdownFallback);
+    return lines;
+}
+
+std::vector<int> slowdownSteps(const RipOptions& options) {
+    // The speed now: the lower of the one set and the one reported.
+    uint32_t now = options.speedKBps == kMaxSpeedKBps ? 0 : options.speedKBps;
+    if (options.currentSpeedKBps && (now == 0 || options.currentSpeedKBps < now)) now = options.currentSpeedKBps;
+    std::vector<int> steps;
+    for (int factor : options.slowdownSpeeds) {
+        if (factor <= 0 || factor > kMaxSpeedFactor) continue;
+        if (now && speedFactor(now) <= factor) continue;  // not slower than now
+        if (!steps.empty() && steps.back() <= factor) continue;  // descending only
+        steps.push_back(factor);
+    }
+    return steps;
+}
+
+std::string slowdownLogLine(const RipOptions& options, const std::string& unavailable) {
+    const std::string head = "Slowdown on read errors: ";
+    if (!options.slowdown) return head + "disabled";
+    if (!unavailable.empty()) return head + "not possible (" + unavailable + ")";
+    const std::vector<int> steps = slowdownSteps(options);
+    if (steps.empty()) return head + "none below the current speed";
+    std::string list;
+    for (int f : steps) list += (list.empty() ? "" : ", ") + std::to_string(f) + "x";
+    return head + list;
+}
+
 std::vector<std::string> trackRipLogLines(const std::string& name, const TrackRipResult& r) {
     char crc[16];
     std::snprintf(crc, sizeof crc, "%08X", r.crc32);
@@ -127,8 +169,10 @@ std::vector<std::string> trackRipLogLines(const std::string& name, const TrackRi
     if (r.paddedSamples)
         first += "  (" + std::to_string(r.paddedSamples) + " samples outside the disc padded with silence)";
     std::vector<std::string> lines = {first};
+    if (r.readMicros) lines.push_back("  Read speed: " + formatMeasuredSpeed(r.sectors, r.readMicros));
     for (std::string& l : c2LogLines(r)) lines.push_back(std::move(l));
     for (std::string& l : cacheLogLines(r)) lines.push_back(std::move(l));
+    for (std::string& l : slowdownLogLines(r)) lines.push_back(std::move(l));
     return lines;
 }
 
@@ -146,7 +190,9 @@ TrackRipResult Ripper::ripTrack(const Track& track, const SampleSink& sink, cons
     result.sectors = track.lengthSectors;
     result.c2 = c2Active_;
     result.cacheDefeat = cacheDefeat_;
+    result.slowdown = slowdownActive_;
     const std::string cacheFallbackBefore = cacheFallbackReason_;
+    trackReadMicros_ = 0;
 
     const Toc::LbaRange readable = toc_.audioRange(track);
     readable_ = readable;
@@ -187,7 +233,9 @@ TrackRipResult Ripper::ripTrack(const Track& track, const SampleSink& sink, cons
         // READ CD with C2 bits moves 2646 bytes per sector: fewer per command.
         const uint32_t blockSectors = c2Active_ ? kMaxSectorsPerC2Read : kMaxSectorsPerRead;
         const uint32_t count = std::min(blockSectors, sectorsToRead - sectorsDone);
+        const uint64_t started = clock_ ? clock_->nowMicros() : 0;
         readSpan(firstSector + sectorsDone, count, buffer.data(), result);
+        if (clock_) trackReadMicros_ += clock_->nowMicros() - started;
         mapUnresolved();
         sectorsDone += count;
 
@@ -203,6 +251,8 @@ TrackRipResult Ripper::ripTrack(const Track& track, const SampleSink& sink, cons
     result.suspiciousSectors.assign(suspicious.begin(), suspicious.end());
     if (result.c2 && !c2Active_) result.c2Fallback = c2FallbackReason_;
     if (cacheFallbackReason_ != cacheFallbackBefore) result.cacheFallback = cacheFallbackReason_;
+    if (result.slowdown && !slowdownActive_) result.slowdownFallback = slowdownFallbackReason_;
+    result.readMicros = trackReadMicros_;
     return result;
 }
 
@@ -214,6 +264,54 @@ void Ripper::readSpan(int64_t lba, uint32_t count, uint8_t* out, TrackRipResult&
     std::memset(out, 0, size_t(count) * kSectorBytes);
     if (begin < end)
         readRange(uint32_t(begin), uint32_t(end - begin), out + size_t(begin - lba) * kSectorBytes, false, result);
+    // Slowed down for a problem in this block: back to the speed of the rip.
+    if (slowedKBps_) restoreSpeed(uint32_t(std::max<int64_t>(begin, 0)));
+}
+
+// --- Slowdown on read errors (#49) --------------------------------------------
+
+std::vector<int> Ripper::currentSlowdownSteps() const {
+    RipOptions now = options_;
+    if (slowedKBps_) now.speedKBps = slowedKBps_;
+    return slowdownSteps(now);
+}
+
+// SET CD SPEED; a drive that fails it cannot slow down: given up for the
+// rest of the disc (the speed it reads at stays unknown, so no restore).
+bool Ripper::setSpeed(uint16_t kBps, uint32_t lba) {
+    const ScsiResult r = drive_.setCdSpeed(kBps);
+    if (r.ok()) return true;
+    slowdownActive_ = false;
+    slowedKBps_ = 0;
+    slowdownFallbackReason_ = "SET CD SPEED to " + (kBps == kMaxSpeedKBps ? std::string("max") : formatSpeed(kBps)) +
+                              " failed at LBA " + std::to_string(lba) + " (" + r.describe() +
+                              "), no slowdown from there on";
+    return false;
+}
+
+void Ripper::restoreSpeed(uint32_t lba) {
+    slowedKBps_ = 0;
+    setSpeed(options_.speedKBps, lba);
+}
+
+// A sector that stayed unreadable at the rip's speed: reads it at each
+// lower speed (two attempts each) until one works. True when it did; the
+// data and C2 bits are in `out` / `c2`. The speed stays lowered until the
+// end of the block (readSpan restores it).
+bool Ripper::slowDownForSector(uint32_t lba, uint8_t* out, uint8_t* c2, TrackRipResult& result) {
+    if (!slowdownActive_) return false;
+    bool tried = false;
+    for (int factor : currentSlowdownSteps()) {
+        if (!setSpeed(speedKBps(factor), lba)) break;
+        slowedKBps_ = speedKBps(factor);
+        tried = true;
+        if (readBlock(lba, 1, out, c2, true, result, std::min(options_.maxRetries, 1))) {
+            ++result.slowdownRecovered[factor];
+            return true;
+        }
+    }
+    if (tried) ++result.slowdownFailed;
+    return false;
 }
 
 // Makes the drive read [lba, lba + count) from the disc on the next read
@@ -274,7 +372,7 @@ bool Ripper::readOnce(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, b
 // consecutive reads return identical data (their C2 bits are combined).
 // Every read but the first (unless `reread`) defeats the drive cache.
 bool Ripper::readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, bool reread,
-                       TrackRipResult& result) {
+                       TrackRipResult& result, int retries) {
     const size_t bytes = size_t(count) * kSectorBytes;
     std::vector<uint8_t> check, checkC2;
     if (options_.verify) {
@@ -282,7 +380,7 @@ bool Ripper::readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, 
         checkC2.resize(size_t(count) * kC2BytesPerSector);
     }
 
-    for (int attempt = 0; attempt <= options_.maxRetries; ++attempt) {
+    for (int attempt = 0; attempt <= retries; ++attempt) {
         if (attempt > 0) ++result.retries;
         if (!readOnce(lba, count, out, c2, reread || attempt > 0, result)) continue;
         if (!options_.verify) return true;
@@ -302,7 +400,9 @@ bool Ripper::readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, 
 // read defeats the drive cache.
 void Ripper::readRange(uint32_t lba, uint32_t count, uint8_t* out, bool reread, TrackRipResult& result) {
     std::vector<uint8_t> c2(size_t(count) * kC2BytesPerSector);
-    if (readBlock(lba, count, out, c2.data(), reread, result)) {
+    const bool ok = readBlock(lba, count, out, c2.data(), reread, result, options_.maxRetries) ||
+                    (count == 1 && slowDownForSector(lba, out, c2.data(), result));
+    if (ok) {
         for (uint32_t i = 0; i < count; ++i) {
             const uint8_t* bits = c2.data() + size_t(i) * kC2BytesPerSector;
             if (!anyBit(bits)) continue;
@@ -326,45 +426,77 @@ void Ripper::readRange(uint32_t lba, uint32_t count, uint8_t* out, bool reread, 
 //   returns the same data every time (or reports false C2 errors), so more
 //   reads are unlikely to change anything. In verify mode both must be
 //   re-reads; otherwise the read that flagged the sector counts as well.
-// When the budget runs out the read with the fewest C2 errors is kept and
-// the sector is recorded as unresolved (suspicious positions).
+// Without such an end, with slowdown (#49) the same is tried at each lower
+// speed (budget 2 re-reads; a speed change needs two identical reads at the
+// new speed). When the budget runs out the read with the fewest C2 errors
+// is kept and the sector is recorded as unresolved (suspicious positions).
+struct Ripper::C2Reread {
+    std::vector<uint8_t> best, bestC2, prev;
+    size_t bestBits = 0;
+    size_t prevBits = 0;
+    bool prevValid = false;
+};
+
 void Ripper::rereadC2Sector(uint32_t lba, uint8_t* out, const uint8_t* c2, TrackRipResult& result) {
-    std::vector<uint8_t> best(out, out + kSectorBytes);
-    std::vector<uint8_t> bestC2(c2, c2 + kC2BytesPerSector);
-    size_t bestBits = countBits(c2);
-    std::vector<uint8_t> prev = best;
-    size_t prevBits = bestBits;
-    bool prevValid = !options_.verify;
+    C2Reread state;
+    state.best.assign(out, out + kSectorBytes);
+    state.bestC2.assign(c2, c2 + kC2BytesPerSector);
+    state.bestBits = countBits(c2);
+    state.prev = state.best;
+    state.prevBits = state.bestBits;
+    state.prevValid = !options_.verify;
+    if (rereadC2Loop(lba, out, state, options_.maxRetries, result)) return;
+
+    if (slowdownActive_ && c2Active_ && options_.maxRetries > 0) {
+        bool tried = false;
+        for (int factor : currentSlowdownSteps()) {
+            if (!setSpeed(speedKBps(factor), lba)) break;
+            slowedKBps_ = speedKBps(factor);
+            tried = true;
+            state.prevValid = false;
+            if (rereadC2Loop(lba, out, state, std::min(options_.maxRetries, 2), result)) {
+                ++result.slowdownRecovered[factor];
+                return;
+            }
+            if (!c2Active_) break;
+        }
+        if (tried) ++result.slowdownFailed;
+    }
+    std::memcpy(out, state.best.data(), kSectorBytes);
+    ++result.c2Unresolved;
+    unresolved_.push_back({lba, std::move(state.bestC2)});
+}
+
+// Up to `budget` re-reads of a C2 sector; true (and the sector in `out`)
+// when one of the ends above was reached.
+bool Ripper::rereadC2Loop(uint32_t lba, uint8_t* out, C2Reread& st, int budget, TrackRipResult& result) {
     std::vector<uint8_t> cur(kSectorBytes);
     std::vector<uint8_t> curC2(kC2BytesPerSector);
-
-    for (int k = 0; k < options_.maxRetries && c2Active_; ++k) {
+    for (int k = 0; k < budget && c2Active_; ++k) {
         ++result.c2Rereads;
         if (!readOnce(lba, 1, cur.data(), curC2.data(), true, result)) {
-            prevValid = false;
+            st.prevValid = false;
             continue;
         }
         if (!c2Active_) break;  // fell back to plain reads: this one has no C2 bits
         const size_t bits = countBits(curC2.data());
-        if (bits < bestBits) {
-            best = cur;
-            bestC2 = curC2;
-            bestBits = bits;
+        if (bits < st.bestBits) {
+            st.best = cur;
+            st.bestC2 = curC2;
+            st.bestBits = bits;
         }
-        const bool same = prevValid && cur == prev;
+        const bool same = st.prevValid && cur == st.prev;
         if ((bits == 0 && !options_.verify) || same) {
             std::memcpy(out, cur.data(), kSectorBytes);
-            if (bits == 0 || prevBits == 0) ++result.c2Recovered;
+            if (bits == 0 || st.prevBits == 0) ++result.c2Recovered;
             else ++result.c2Matched;
-            return;
+            return true;
         }
-        prev.swap(cur);
-        prevBits = bits;
-        prevValid = true;
+        st.prev.swap(cur);
+        st.prevBits = bits;
+        st.prevValid = true;
     }
-    std::memcpy(out, best.data(), kSectorBytes);
-    ++result.c2Unresolved;
-    unresolved_.push_back({lba, std::move(bestC2)});
+    return false;
 }
 
 }  // namespace cdr

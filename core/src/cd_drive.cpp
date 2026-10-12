@@ -127,6 +127,10 @@ DriveCapabilities DriveCapabilities::parse(const uint8_t* data, size_t length) {
     // Bytes 12..13: buffer size in KB, when the page (length byte + 2) and
     // the response reach that far.
     if (data[page + 1] >= 12 && page + 14 <= end) caps.bufferKB = uint32_t(data[page + 12]) << 8 | data[page + 13];
+    // Bytes 8..9 / 14..15: maximum / current read speed in kB/s (#49).
+    if (data[page + 1] >= 8 && page + 10 <= end) caps.maxReadKBps = uint32_t(data[page + 8]) << 8 | data[page + 9];
+    if (data[page + 1] >= 14 && page + 16 <= end)
+        caps.currentReadKBps = uint32_t(data[page + 14]) << 8 | data[page + 15];
     return caps;
 }
 
@@ -142,6 +146,31 @@ DriveCapabilities CdDrive::readCapabilities() {
         return caps;
     }
     return DriveCapabilities::parse(data.data(), std::min(r.transferred, data.size()));
+}
+
+ScsiResult CdDrive::getPerformance(uint8_t* out, uint16_t maxDescriptors) {
+    // Byte 1: data type for type 00h: tolerance 10b (bits 4..3), write 0
+    // (read performance), except 00b (nominal performance).
+    const uint8_t cdb[12] = {
+        0xAC, 0x10,
+        0, 0, 0, 0,  // starting LBA
+        0, 0,
+        uint8_t(maxDescriptors >> 8), uint8_t(maxDescriptors),
+        0x00,  // type: performance data
+        0,
+    };
+    const size_t bytes = 8 + size_t(maxDescriptors) * 16;
+    return transport_.execute(cdb, sizeof cdb, out, bytes, DataDirection::In, kCommandTimeout);
+}
+
+ScsiResult CdDrive::setCdSpeed(uint16_t readKBps, uint16_t writeKBps) {
+    const uint8_t cdb[12] = {
+        0xBB, 0x00,
+        uint8_t(readKBps >> 8), uint8_t(readKBps),
+        uint8_t(writeKBps >> 8), uint8_t(writeKBps),
+        0, 0, 0, 0, 0, 0,
+    };
+    return transport_.execute(cdb, sizeof cdb, nullptr, 0, DataDirection::None, kCommandTimeout);
 }
 
 ScsiResult CdDrive::readSubChannel(SubChannelFormat format, int track, uint8_t* out, size_t length, bool msf) {
