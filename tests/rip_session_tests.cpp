@@ -1801,7 +1801,7 @@ TEST(read_speed_and_slowdown_over_usb) {
     const cdr::RippedTrack t = rig.session.ripTrack(2, dir.path / "2.wav");
     CHECK(t.result.clean());
     CHECK_EQ(t.result.crc32, referenceRip(2).crc32);
-    CHECK(t.result.slowdownRecovered == (std::map<int, uint32_t>{{4, 1}}));
+    CHECK(t.result.slowdownBlocks == (std::map<int, uint32_t>{{4, 1}}));
     CHECK_EQ(int(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xBB))), 2);
     CHECK_EQ(rig.fake.readSpeedKBps, 1412);  // back at the --speed setting
     CHECK(t.result.readMicros > 0);
@@ -1809,7 +1809,7 @@ TEST(read_speed_and_slowdown_over_usb) {
     const std::string log = rig.session.ripLog();
     CHECK(contains(log, "\nRead speed: max 48x (8467 kB/s), current 24x; disc performance 16x-40x\n"
                         "Read speed set to 8x (drive reports 8x)\nSlowdown on read errors: 4x\nMode: burst"));
-    CHECK(contains(log, "  OK\n" + speedLine(t.result) + "  Slowdown: 1 sector(s) re-read at 4x\n"));
+    CHECK(contains(log, "  OK\n" + speedLine(t.result) + "  Slowdown: 1 block(s) re-read at 4x\n"));
     CHECK(contains(log, "\nAverage read speed: " + cdr::formatMeasuredSpeed(150, t.result.readMicros) +
                             ", 1 track(s) in 0:00\n"));
 }
@@ -1830,7 +1830,7 @@ TEST(slowdown_fallback_lasts_for_the_rest_of_the_rip) {
     rig.device.opcodes.clear();
     const cdr::RippedTrack t2 = rig.session.ripTrack(2, dir.path / "2.wav");
     CHECK_EQ(t2.result.unreadableSectors, 1u);
-    CHECK(rig.session.slowdownFallback().find("SET CD SPEED to 8x failed at LBA 310 (") == 0);
+    CHECK(rig.session.slowdownFallback().find("SET CD SPEED to 8x failed at LBA 300 (") == 0);
     CHECK(t2.result.slowdownFallback == rig.session.slowdownFallback());
     CHECK(!rig.session.ripSettings().options.slowdown);
     CHECK_EQ(int(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xBB))), 1);
@@ -1840,7 +1840,7 @@ TEST(slowdown_fallback_lasts_for_the_rest_of_the_rip) {
     CHECK_EQ(int(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xBB))), 1);
     const std::string log = rig.session.ripLog();
     CHECK(contains(log, "\nSlowdown on read errors: 8x, 4x\n"));
-    CHECK(contains(log, "  Slowdown given up: SET CD SPEED to 8x failed at LBA 310 ("));
+    CHECK(contains(log, "  Slowdown given up: SET CD SPEED to 8x failed at LBA 300 ("));
 
     CHECK(cdr::parseSpeedSetting("max", s.speed));
     rig.session.beginRip(s);

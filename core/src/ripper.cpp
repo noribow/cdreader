@@ -120,21 +120,45 @@ std::vector<std::string> cacheLogLines(const TrackRipResult& r) {
     return lines;
 }
 
+namespace {
+
+// "2 block(s) re-read at 8x, 1 at 4x", fastest speed first.
+std::string perSpeed(const std::map<int, uint32_t>& counts, const std::string& what) {
+    std::string text;
+    for (auto it = counts.rbegin(); it != counts.rend(); ++it)
+        text += text.empty() ? std::to_string(it->second) + " " + what + " re-read at " + std::to_string(it->first) + "x"
+                             : ", " + std::to_string(it->second) + " at " + std::to_string(it->first) + "x";
+    return text;
+}
+
+}  // namespace
+
 std::vector<std::string> slowdownLogLines(const TrackRipResult& r) {
     std::vector<std::string> lines;
-    if (!r.slowdownRecovered.empty() || r.slowdownFailed) {
-        std::string line;
-        // Fastest speed first: "2 sector(s) re-read at 8x, 1 at 4x".
-        for (auto it = r.slowdownRecovered.rbegin(); it != r.slowdownRecovered.rend(); ++it)
-            line += line.empty() ? std::to_string(it->second) + " sector(s) re-read at " + std::to_string(it->first) + "x"
-                                 : ", " + std::to_string(it->second) + " at " + std::to_string(it->first) + "x";
+    if (r.slowedDown()) {
+        std::vector<std::string> parts;
+        if (!r.slowdownBlocks.empty()) parts.push_back(perSpeed(r.slowdownBlocks, "block(s)"));
+        if (!r.slowdownC2Sectors.empty()) parts.push_back(perSpeed(r.slowdownC2Sectors, "C2 sector(s)"));
         if (r.slowdownFailed)
-            line += (line.empty() ? "" : ", ") + std::to_string(r.slowdownFailed) +
-                    (line.empty() ? " sector(s) not recovered at lower speeds" : " not recovered");
+            parts.push_back(std::to_string(r.slowdownFailed) + " sector(s) not recovered at lower speeds");
+        std::string line;
+        for (const std::string& p : parts) line += (line.empty() ? "" : "; ") + p;
         lines.push_back("  Slowdown: " + line);
     }
     if (!r.slowdownFallback.empty()) lines.push_back("  Slowdown given up: " + r.slowdownFallback);
     return lines;
+}
+
+std::string TrackRipResult::readProblemText() const {
+    std::vector<std::string> parts;
+    if (retries) parts.push_back("retries");
+    if (c2ErrorSectors) parts.push_back("C2 errors");
+    if (slowedDown()) parts.push_back("slowdown");
+    if (unreadableSectors) parts.push_back("unreadable sectors");
+    if (!suspiciousSectors.empty()) parts.push_back("suspicious positions");
+    std::string text;
+    for (const std::string& p : parts) text += (text.empty() ? "" : ", ") + p;
+    return text;
 }
 
 std::vector<int> slowdownSteps(const RipOptions& options) {
@@ -275,6 +299,7 @@ TrackRipResult Ripper::ripTrack(const Track& track, const SampleSink& sink, cons
     if (cacheFallbackReason_ != cacheFallbackBefore) result.cacheFallback = cacheFallbackReason_;
     if (result.slowdown && !slowdownActive_) result.slowdownFallback = slowdownFallbackReason_;
     result.readMicros = trackReadMicros_;
+    defeatCacheFirst_ = false;
     return result;
 }
 
@@ -284,8 +309,11 @@ void Ripper::readSpan(int64_t lba, uint32_t count, uint8_t* out, TrackRipResult&
     const int64_t begin = std::max<int64_t>(lba, readable_.begin);
     const int64_t end = std::min<int64_t>(lba + count, readable_.end);
     std::memset(out, 0, size_t(count) * kSectorBytes);
-    if (begin < end)
-        readRange(uint32_t(begin), uint32_t(end - begin), out + size_t(begin - lba) * kSectorBytes, false, result);
+    if (begin < end) {
+        const bool reread = defeatCacheFirst_;  // see defeatCacheOnNextTrack()
+        defeatCacheFirst_ = false;
+        readRange(uint32_t(begin), uint32_t(end - begin), out + size_t(begin - lba) * kSectorBytes, reread, result);
+    }
     // Slowed down for a problem in this block: back to the speed of the rip.
     if (slowedKBps_) restoreSpeed(uint32_t(std::max<int64_t>(begin, 0)));
 }
@@ -305,6 +333,7 @@ bool Ripper::setSpeed(uint16_t kBps, uint32_t lba) {
     if (r.ok()) return true;
     slowdownActive_ = false;
     slowedKBps_ = 0;
+    slowedFactor_ = 0;
     slowdownFallbackReason_ = "SET CD SPEED to " + (kBps == kMaxSpeedKBps ? std::string("max") : formatSpeed(kBps)) +
                               " failed at LBA " + std::to_string(lba) + " (" + r.describe() +
                               "), no slowdown from there on";
@@ -313,27 +342,33 @@ bool Ripper::setSpeed(uint16_t kBps, uint32_t lba) {
 
 void Ripper::restoreSpeed(uint32_t lba) {
     slowedKBps_ = 0;
+    slowedFactor_ = 0;
     setSpeed(options_.speedKBps, lba);
 }
 
-// A sector that stayed unreadable at the rip's speed: reads it at each
-// lower speed (two attempts each) until one works. True when it did; the
-// data and C2 bits are in `out` / `c2`. The speed stays lowered until the
-// end of the block (readSpan restores it).
-bool Ripper::slowDownForSector(uint32_t lba, uint8_t* out, uint8_t* c2, TrackRipResult& result) {
-    if (!slowdownActive_) return false;
-    bool tried = false;
-    for (int factor : currentSlowdownSteps()) {
-        if (!setSpeed(speedKBps(factor), lba)) break;
-        slowedKBps_ = speedKBps(factor);
-        tried = true;
-        if (readBlock(lba, 1, out, c2, true, result, std::min(options_.maxRetries, 1))) {
-            ++result.slowdownRecovered[factor];
-            return true;
-        }
+bool Ripper::slowDownTo(int factor, uint32_t lba) {
+    if (!setSpeed(speedKBps(factor), lba)) return false;
+    slowedKBps_ = speedKBps(factor);
+    slowedFactor_ = factor;
+    return true;
+}
+
+// The speed (x) of each retry of a block that failed: the slowdown steps
+// below the current speed, the retries shared out among them (the first
+// steps get fewer when they do not divide evenly; with fewer retries than
+// steps only the fastest steps). Empty: no slowdown.
+std::vector<int> Ripper::slowdownPlan(int retries) const {
+    std::vector<int> plan;
+    if (!slowdownActive_ || retries <= 0) return plan;
+    const std::vector<int> steps = currentSlowdownSteps();
+    const size_t n = steps.size();
+    const size_t r = size_t(retries);
+    if (r < n) return std::vector<int>(steps.begin(), steps.begin() + std::ptrdiff_t(r));
+    for (size_t i = 0; i < n; ++i) {
+        const size_t k = r / n + (i >= n - r % n ? 1 : 0);
+        plan.insert(plan.end(), k, steps[i]);
     }
-    if (tried) ++result.slowdownFailed;
-    return false;
+    return plan;
 }
 
 // Makes the drive read [lba, lba + count) from the disc on the next read
@@ -392,7 +427,9 @@ bool Ripper::readOnce(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, b
 
 // Reads a block with retries; in verify mode a block only counts once two
 // consecutive reads return identical data (their C2 bits are combined).
-// Every read but the first (unless `reread`) defeats the drive cache.
+// Every read but the first (unless `reread`) defeats the drive cache. With
+// slowdown (#49) the retries are made at lower speeds (slowdownPlan()); the
+// speed stays lowered until the end of the block (readSpan restores it).
 bool Ripper::readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, bool reread,
                        TrackRipResult& result, int retries) {
     const size_t bytes = size_t(count) * kSectorBytes;
@@ -402,16 +439,26 @@ bool Ripper::readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, 
         checkC2.resize(size_t(count) * kC2BytesPerSector);
     }
 
+    std::vector<int> plan;
     for (int attempt = 0; attempt <= retries; ++attempt) {
-        if (attempt > 0) ++result.retries;
-        if (!readOnce(lba, count, out, c2, reread || attempt > 0, result)) continue;
-        if (!options_.verify) return true;
-        if (!readOnce(lba, count, check.data(), checkC2.data(), true, result)) continue;
-        if (std::memcmp(out, check.data(), bytes) == 0) {
-            for (size_t i = 0; i < checkC2.size(); ++i) c2[i] |= checkC2[i];
-            return true;
+        if (attempt > 0) {
+            ++result.retries;
+            // The first failure decides the speeds of the retries.
+            if (attempt == 1) plan = slowdownPlan(retries);
+            const int factor = size_t(attempt - 1) < plan.size() ? plan[size_t(attempt - 1)] : 0;
+            if (factor && slowdownActive_ && factor != slowedFactor_) slowDownTo(factor, lba);
         }
+        if (!readOnce(lba, count, out, c2, reread || attempt > 0, result)) continue;
+        if (options_.verify) {
+            if (!readOnce(lba, count, check.data(), checkC2.data(), true, result)) continue;
+            if (std::memcmp(out, check.data(), bytes) != 0) continue;
+            for (size_t i = 0; i < checkC2.size(); ++i) c2[i] |= checkC2[i];
+        }
+        if (attempt > 0 && slowedFactor_) ++result.slowdownBlocks[slowedFactor_];
+        return true;
     }
+    // A sector that stays unreadable although the drive was slowed down.
+    if (count == 1 && slowedFactor_) ++result.slowdownFailed;
     return false;
 }
 
@@ -422,9 +469,7 @@ bool Ripper::readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, 
 // read defeats the drive cache.
 void Ripper::readRange(uint32_t lba, uint32_t count, uint8_t* out, bool reread, TrackRipResult& result) {
     std::vector<uint8_t> c2(size_t(count) * kC2BytesPerSector);
-    const bool ok = readBlock(lba, count, out, c2.data(), reread, result, options_.maxRetries) ||
-                    (count == 1 && slowDownForSector(lba, out, c2.data(), result));
-    if (ok) {
+    if (readBlock(lba, count, out, c2.data(), reread, result, options_.maxRetries)) {
         for (uint32_t i = 0; i < count; ++i) {
             const uint8_t* bits = c2.data() + size_t(i) * kC2BytesPerSector;
             if (!anyBit(bits)) continue;
@@ -472,12 +517,11 @@ void Ripper::rereadC2Sector(uint32_t lba, uint8_t* out, const uint8_t* c2, Track
     if (slowdownActive_ && c2Active_ && options_.maxRetries > 0) {
         bool tried = false;
         for (int factor : currentSlowdownSteps()) {
-            if (!setSpeed(speedKBps(factor), lba)) break;
-            slowedKBps_ = speedKBps(factor);
+            if (!slowDownTo(factor, lba)) break;
             tried = true;
             state.prevValid = false;
             if (rereadC2Loop(lba, out, state, std::min(options_.maxRetries, 2), result)) {
-                ++result.slowdownRecovered[factor];
+                ++result.slowdownC2Sectors[factor];
                 return;
             }
             if (!c2Active_) break;

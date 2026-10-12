@@ -407,8 +407,10 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
                     return checkCondition(0x3, 0x11, 0x05);  // L-EC uncorrectable error
                 }
                 auto sf = speedFaults.find(s);
-                if (sf != speedFaults.end() && !sf->second.c2 && tooFast(sf->second))
+                if (sf != speedFaults.end() && !sf->second.c2 && tooFast(sf->second) && sf->second.errorReads != 0) {
+                    if (sf->second.errorReads > 0) --sf->second.errorReads;
                     return checkCondition(0x3, 0x11, 0x05);
+                }
             }
             for (uint32_t i = 0; i < count; ++i) {
                 const uint32_t s = lba + i;
@@ -433,6 +435,8 @@ cdr::ScsiResult FakeDrive::execute(const uint8_t* cdb, size_t, void* data, size_
                     if (f.flagged) full[cdr::kSectorBytes + 294] = 0xFF;  // block error byte
                 }
                 auto sf = speedFaults.find(s);
+                if (sf != speedFaults.end() && !sf->second.c2 && tooFast(sf->second))
+                    for (size_t b = 1000; b < 1016; ++b) sector[b] ^= 0x5A;  // errorReads used up: silently wrong
                 if (sf != speedFaults.end() && sf->second.c2 && tooFast(sf->second)) {
                     const uint8_t noise = uint8_t(++c2Counter_ % 255 + 1);
                     for (size_t b = 1000; b < 1016; ++b) {

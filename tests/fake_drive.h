@@ -122,9 +122,14 @@ public:
     // Sectors that read correctly only at maxKBps or slower: faster (or at
     // the speed never set) a read fails with a MEDIUM ERROR, or with c2
     // returns wrong data flagged with C2 bits (bytes 1000..1015).
+    // errorReads >= 0 (without c2): only the first errorReads reads that are
+    // too fast fail; later ones return wrong data without an error or C2
+    // bits (bytes 1000..1015, the same every time): the drive "recovers"
+    // the sector after a retry, but wrongly (seen on a real drive, #49).
     struct SpeedFault {
         uint32_t maxKBps = 0;
         bool c2 = false;
+        int errorReads = -1;  // -1: every read that is too fast fails
     };
     std::map<uint32_t, SpeedFault> speedFaults;
     bool tooFast(const SpeedFault& f) const { return readSpeedKBps == 0 || readSpeedKBps > f.maxKBps; }

@@ -7434,7 +7434,8 @@ TEST(speed_measured_with_fake_clock) {
     CHECK_EQ(cdr::trackRipLogLines("02.wav", untimed.result).size(), size_t(1));
 }
 
-// A sector that only reads at 8x or slower: re-read at 8x, then back to max.
+// A sector that only reads at 8x or slower: the first read error of its
+// block makes the retries go at 8x, then back to max after the block.
 TEST(slowdown_recovers_unreadable_sector) {
     FakeDrive fake = makeSpeedDisc();
     fake.readSpeedKBps = k48x;
@@ -7444,25 +7445,95 @@ TEST(slowdown_recovers_unreadable_sector) {
     CHECK(r.result.clean());
     CHECK(r.result.slowdown);
     CHECK(r.slowdownActive);
-    CHECK_EQ(r.result.slowdownRecovered.size(), size_t(1));
-    CHECK_EQ(r.result.slowdownRecovered.at(8), 1u);
+    CHECK(r.result.slowdownBlocks == (std::map<int, uint32_t>{{8, 1}}));
+    CHECK(r.result.slowdownC2Sectors.empty());
     CHECK_EQ(r.result.slowdownFailed, 0u);
+    CHECK_EQ(r.result.retries, 1u);
     CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{1412, 0xFFFF}));
     CHECK_EQ(fake.readSpeedKBps, k48x);  // restored
-    // 8x right before the successful re-read of 310, max right after the
-    // block, before the next one.
+    // The block fails at max, its first retry (the whole block) is made at
+    // 8x right after the error, max comes back right after it, before the
+    // next block.
     const std::vector<FakeDrive::Command>& log = fake.commandLog;
     size_t slow = 0;
     while (log[slow].opcode != 0xBB) ++slow;
-    CHECK(log[slow + 1].opcode == 0xBE && log[slow + 1].lba == 310 && log[slow + 1].count == 1);
-    CHECK(log[slow + 2].opcode == 0xBE && log[slow + 2].lba == 311);
-    size_t restore = slow + 1;
-    while (log[restore].opcode != 0xBB) ++restore;
-    CHECK(log[restore - 1].lba == 325);
-    CHECK(log[restore + 1].opcode == 0xBE && log[restore + 1].lba == 326);
-    CHECK(cdr::slowdownLogLines(r.result) == std::vector<std::string>{"  Slowdown: 1 sector(s) re-read at 8x"});
+    CHECK(log[slow - 1].opcode == 0xBE && log[slow - 1].lba == 300 && log[slow - 1].count == 26);
+    CHECK(log[slow + 1].opcode == 0xBE && log[slow + 1].lba == 300 && log[slow + 1].count == 26);
+    CHECK(log[slow + 2].opcode == 0xBB && log[slow + 2].lba == 0xFFFF);
+    CHECK(log[slow + 3].opcode == 0xBE && log[slow + 3].lba == 326);
+    CHECK(cdr::slowdownLogLines(r.result) == std::vector<std::string>{"  Slowdown: 1 block(s) re-read at 8x"});
     const std::vector<std::string> lines = cdr::trackRipLogLines("02.wav", r.result);
-    CHECK(lines.back() == "  Slowdown: 1 sector(s) re-read at 8x");
+    CHECK(lines.back() == "  Slowdown: 1 block(s) re-read at 8x");
+    CHECK(r.result.readProblems());
+    CHECK(r.result.readProblemText() == "retries, slowdown");
+}
+
+// The retries are shared out among the speeds: with 5 retries and 8x, 4x
+// two at 8x, three at 4x; with one retry only 8x.
+TEST(slowdown_shares_retries_among_speeds) {
+    FakeDrive fake = makeSpeedDisc();
+    fake.failuresBySector[310] = -1;
+    const SpeedRip r = ripSpeed(fake, 2, slowdownOptions(5));
+    CHECK_EQ(r.result.unreadableSectors, 1u);
+    std::vector<uint32_t> blockReads;  // the speed of every read of block 300
+    uint32_t speed = 0;
+    for (const FakeDrive::Command& c : fake.commandLog) {
+        if (c.opcode == 0xBB) speed = c.lba;
+        if (c.opcode == 0xBE && c.lba == 300 && c.count == 26) blockReads.push_back(speed);
+    }
+    CHECK(blockReads == (std::vector<uint32_t>{0, 1412, 1412, 706, 706, 706}));
+    CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{1412, 706, 0xFFFF}));
+    CHECK_EQ(r.result.slowdownFailed, 1u);
+
+    FakeDrive one = makeSpeedDisc();
+    one.failuresBySector[310] = -1;
+    const SpeedRip o = ripSpeed(one, 2, slowdownOptions(1));
+    // The block at 8x; the sector-by-sector fallback at 8x, its retries at 4x.
+    CHECK(speedRequests(one.commandLog) == (std::vector<uint32_t>{1412, 706, 0xFFFF}));
+    CHECK_EQ(o.result.unreadableSectors, 1u);
+    CHECK_EQ(o.result.slowdownFailed, 1u);
+
+    // No retries: nothing slowed down.
+    FakeDrive none = makeSpeedDisc();
+    none.speedFaults[310] = {1412, false};
+    const SpeedRip n = ripSpeed(none, 2, slowdownOptions(0));
+    CHECK_EQ(none.setSpeedCommands, 0);
+    CHECK_EQ(n.result.unreadableSectors, 1u);
+    CHECK(!n.result.slowedDown());
+}
+
+// The drive of #49: after one read error at full speed it returns wrong
+// data without an error (or C2 bits) on the retry; read slower, the data is
+// right. Retrying at a lower speed right after the first error gets the
+// right data; without slowdown the rip ends "OK" with the wrong data.
+TEST(slowdown_on_first_error_avoids_silently_wrong_data) {
+    auto disc = [] {
+        FakeDrive fake = makeSpeedDisc();
+        fake.c2Supported = true;
+        fake.speedFaults[310] = {1412, false, 1};
+        return fake;
+    };
+    cdr::RipOptions o = slowdownOptions(5);
+    o.useC2 = true;
+    FakeDrive fake = disc();
+    const SpeedRip r = ripSpeed(fake, 2, o);
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK(r.result.clean());
+    CHECK_EQ(r.result.retries, 1u);
+    CHECK_EQ(r.result.c2ErrorSectors, 0u);
+    CHECK(r.result.slowdownBlocks == (std::map<int, uint32_t>{{8, 1}}));
+    CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{1412, 0xFFFF}));
+
+    FakeDrive off = disc();
+    cdr::RipOptions no = o;
+    no.slowdown = false;
+    const SpeedRip w = ripSpeed(off, 2, no);
+    CHECK(w.result.clean());  // "OK" ...
+    CHECK_EQ(w.result.retries, 1u);
+    CHECK(w.bytes != expectedTrackData(300, 150));  // ... but wrong
+    CHECK_EQ(off.setSpeedCommands, 0);
+    CHECK(w.result.readProblems());
+    CHECK(w.result.readProblemText() == "retries");
 }
 
 TEST(slowdown_steps_down_to_4x) {
@@ -7473,11 +7544,10 @@ TEST(slowdown_steps_down_to_4x) {
     const SpeedRip r = ripSpeed(fake, 2, slowdownOptions());
     CHECK(r.bytes == expectedTrackData(300, 150));
     CHECK(r.result.clean());
-    CHECK_EQ(r.result.slowdownRecovered.at(8), 1u);
-    CHECK_EQ(r.result.slowdownRecovered.at(4), 1u);
+    CHECK(r.result.slowdownBlocks == (std::map<int, uint32_t>{{8, 1}, {4, 1}}));
     CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{1412, 706, 0xFFFF, 1412, 0xFFFF}));
     CHECK(cdr::slowdownLogLines(r.result) ==
-          std::vector<std::string>{"  Slowdown: 1 sector(s) re-read at 8x, 1 at 4x"});
+          std::vector<std::string>{"  Slowdown: 1 block(s) re-read at 8x, 1 at 4x"});
 }
 
 TEST(slowdown_resolves_c2_errors) {
@@ -7494,8 +7564,11 @@ TEST(slowdown_resolves_c2_errors) {
     CHECK_EQ(r.result.c2Recovered, 1u);
     CHECK_EQ(r.result.c2Unresolved, 0u);
     CHECK(r.result.suspiciousSectors.empty());
-    CHECK_EQ(r.result.slowdownRecovered.at(8), 1u);
+    CHECK(r.result.slowdownC2Sectors == (std::map<int, uint32_t>{{8, 1}}));
+    CHECK(r.result.slowdownBlocks.empty());
     CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{1412, 0xFFFF}));
+    CHECK(cdr::slowdownLogLines(r.result) == std::vector<std::string>{"  Slowdown: 1 C2 sector(s) re-read at 8x"});
+    CHECK(r.result.readProblemText() == "C2 errors, slowdown");
 
     // Only right at 4x: 8x gets two re-reads, 4x resolves it.
     FakeDrive four = makeSpeedDisc();
@@ -7504,7 +7577,7 @@ TEST(slowdown_resolves_c2_errors) {
     const SpeedRip f = ripSpeed(four, 2, o);
     CHECK(f.bytes == expectedTrackData(300, 150));
     CHECK_EQ(f.result.c2Rereads, 6u);  // 3 at max, 2 at 8x, 1 at 4x
-    CHECK(f.result.slowdownRecovered == (std::map<int, uint32_t>{{4, 1}}));
+    CHECK(f.result.slowdownC2Sectors == (std::map<int, uint32_t>{{4, 1}}));
     CHECK(speedRequests(four.commandLog) == (std::vector<uint32_t>{1412, 706, 0xFFFF}));
 }
 
@@ -7513,16 +7586,20 @@ TEST(slowdown_unrecoverable_sector_restores_speed) {
     fake.failuresBySector[310] = -1;
     const SpeedRip r = ripSpeed(fake, 2, slowdownOptions());
     CHECK_EQ(r.result.unreadableSectors, 1u);
-    CHECK(r.result.slowdownRecovered.empty());
+    CHECK(r.result.slowdownBlocks.empty());
     CHECK_EQ(r.result.slowdownFailed, 1u);
     CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{1412, 706, 0xFFFF}));
     CHECK_EQ(fake.readSpeedKBps, k48x);
     CHECK(cdr::slowdownLogLines(r.result) ==
           std::vector<std::string>{"  Slowdown: 1 sector(s) not recovered at lower speeds"});
-    // 2 attempts per speed (retries capped at 1).
-    int reads = 0;
-    for (const FakeDrive::Command& c : fake.commandLog) reads += c.opcode == 0xBE && c.lba == 310 && c.count == 1;
-    CHECK_EQ(reads, 3 + 2 + 2);
+    // The block at max, 8x, 4x; the sector on its own (3 attempts) at 4x.
+    int reads = 0, blockReads = 0;
+    for (const FakeDrive::Command& c : fake.commandLog) {
+        reads += c.opcode == 0xBE && c.lba == 310 && c.count == 1;
+        blockReads += c.opcode == 0xBE && c.lba == 300 && c.count == 26;
+    }
+    CHECK_EQ(reads, 3);
+    CHECK_EQ(blockReads, 3);
 
     // Unresolved C2 errors at every speed: suspicious, counted as not recovered.
     FakeDrive c2 = makeSpeedDisc();
@@ -7552,8 +7629,8 @@ TEST(slowdown_skips_speeds_at_or_above_current) {
     CHECK(r.bytes == expectedTrackData(300, 150));
     CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{706, 1412, 706, 1412}));
     CHECK_EQ(fake.readSpeedKBps, 1412);
-    CHECK(r.result.slowdownRecovered == (std::map<int, uint32_t>{{4, 2}}));
-    CHECK(cdr::slowdownLogLines(r.result) == std::vector<std::string>{"  Slowdown: 2 sector(s) re-read at 4x"});
+    CHECK(r.result.slowdownBlocks == (std::map<int, uint32_t>{{4, 2}}));
+    CHECK(cdr::slowdownLogLines(r.result) == std::vector<std::string>{"  Slowdown: 2 block(s) re-read at 4x"});
 
     // Already at 4x: nothing to slow down to, no command.
     FakeDrive four = makeSpeedDisc();
@@ -7582,7 +7659,7 @@ TEST(slowdown_rejected_by_drive_is_given_up) {
     CHECK_EQ(a.unreadableSectors, 2u);
     CHECK(a.slowdown);
     CHECK_EQ(a.slowdownFailed, 0u);
-    CHECK(a.slowdownFallback.find("SET CD SPEED to 8x failed at LBA 310 (SCSI status 0x02, sense ILLEGAL REQUEST") ==
+    CHECK(a.slowdownFallback.find("SET CD SPEED to 8x failed at LBA 300 (SCSI status 0x02, sense ILLEGAL REQUEST") ==
           0);
     CHECK(a.slowdownFallback == ripper.slowdownFallbackReason());
     CHECK(cdr::slowdownLogLines(a) == std::vector<std::string>{"  Slowdown given up: " + a.slowdownFallback});
@@ -7644,7 +7721,7 @@ TEST(slowdown_disabled_keeps_the_command_sequence) {
         const SpeedRip b = ripSpeed(on, 2, slow);
         CHECK(on.setSpeedCommands > 0);
         CHECK_EQ(b.result.unreadableSectors, a.result.unreadableSectors - 1);  // 420 recovered at 8x
-        CHECK_EQ(b.result.slowdownRecovered.at(8), 1u);
+        CHECK_EQ(b.result.slowdownBlocks.at(8), 1u);
 
         // Clean disc: identical commands with and without slowdown.
         FakeDrive clean1 = makeSpeedDisc();

@@ -35,13 +35,19 @@ struct RipOptions {
     CacheDefeat cacheDefeat = CacheDefeat::None;
     uint32_t flushSectors = 0;  // sectors per flush (0: flushSectorsForCache(0))
 
-    // Automatic slowdown on read errors (#49). A sector that stays unreadable
-    // after the retries, or keeps C2 errors after its re-reads, is read again
-    // at each of slowdownSpeeds (in x, descending) that is below the speed
-    // the drive reads at (speedKBps / currentSpeedKBps), until it reads
-    // cleanly; after the block, SET CD SPEED speedKBps restores the speed.
-    // Clean reads send no extra command. A drive that rejects SET CD SPEED
-    // makes the ripper give up slowing down (for the rest of the disc).
+    // Automatic slowdown on read errors (#49). When a read of a block fails
+    // (a read error; in verify mode also two reads that differ), its
+    // retries are made at the slowdownSpeeds (in x, descending) that are
+    // below the speed the drive reads at (speedKBps / currentSpeedKBps):
+    // the retries are shared out among them, the first ones at the fastest
+    // (with 5 retries and 8x, 4x: 2 at 8x, 3 at 4x). The sector-by-sector
+    // fallback of a block that still fails stays at the lowest speed. A
+    // sector that keeps C2 errors after its re-reads at the rip's speed is
+    // re-read at each of those speeds as well. After the block, SET CD
+    // SPEED speedKBps restores the speed. Clean reads send no extra command;
+    // without retries (maxRetries 0) nothing is slowed down. A drive that
+    // rejects SET CD SPEED makes the ripper give up slowing down (for the
+    // rest of the disc); the retries then go on at the current speed.
     bool slowdown = false;
     std::vector<int> slowdownSpeeds = {8, 4};
     // The speed set before the rip (--speed; kMaxSpeedKBps: the drive's own),
@@ -105,11 +111,18 @@ struct TrackRipResult {
     uint32_t flushSectorsRead = 0;  // sectors read by the flushes
     std::string cacheFallback;      // FUA was rejected during this track: why (flush from then on)
 
-    // Slowdown on read errors (#49): sectors whose problem (unreadable or C2
-    // errors) a re-read at that speed (x) resolved, sectors still bad at the
-    // slowest speed, and why slowing down was given up during this track.
+    // Slowdown on read errors (#49), keyed by the speed (x):
+    // - slowdownBlocks: reads that failed at first and then worked on a
+    //   retry at that lower speed (a block, or one sector of the
+    //   sector-by-sector fallback);
+    // - slowdownC2Sectors: sectors whose C2 errors a re-read at that speed
+    //   resolved;
+    // - slowdownFailed: sectors still unreadable, or still with C2 errors,
+    //   at the lowest speed;
+    // and why slowing down was given up during this track.
     bool slowdown = false;  // enabled at the start of the track
-    std::map<int, uint32_t> slowdownRecovered;
+    std::map<int, uint32_t> slowdownBlocks;
+    std::map<int, uint32_t> slowdownC2Sectors;
     uint32_t slowdownFailed = 0;
     std::string slowdownFallback;
 
@@ -118,6 +131,17 @@ struct TrackRipResult {
     uint64_t readMicros = 0;
 
     bool clean() const { return unreadableSectors == 0 && suspiciousSectors.empty(); }
+    // Slowed down for this track (blocks, C2 sectors or sectors not recovered).
+    bool slowedDown() const { return !slowdownBlocks.empty() || !slowdownC2Sectors.empty() || slowdownFailed > 0; }
+    // The drive had trouble with this track: retries, C2 errors, slowdown,
+    // unreadable or suspicious sectors. Even when it all ended in good
+    // reads, the data may be wrong (a drive can return wrong data without
+    // an error after one), so AccurateRip decides (#49).
+    bool readProblems() const {
+        return retries > 0 || c2ErrorSectors > 0 || slowedDown() || !clean();
+    }
+    // What readProblems() found, e.g. "retries, C2 errors, slowdown" (empty: none).
+    std::string readProblemText() const;
     // "OK", "2 unreadable sector(s)", "3 suspicious sector(s)" or both.
     std::string status() const;
 };
@@ -158,8 +182,9 @@ std::vector<std::string> c2LogLines(const TrackRipResult& result);
 std::vector<std::string> cacheLogLines(const TrackRipResult& result);
 
 // The slowdown lines of a track (#49), indented by two spaces: "  Slowdown:
-// 2 sector(s) re-read at 8x, 1 at 4x" (", 1 not recovered") and "  Slowdown
-// given up: <reason>"; empty when nothing was slowed down.
+// 2 block(s) re-read at 8x, 1 at 4x; 1 C2 sector(s) re-read at 4x; 1
+// sector(s) not recovered at lower speeds" (the parts that apply) and
+// "  Slowdown given up: <reason>"; empty when nothing was slowed down.
 std::vector<std::string> slowdownLogLines(const TrackRipResult& result);
 
 // rip.log lines of one ripped file or one part of a disc image (#42): "<name>
@@ -205,6 +230,11 @@ public:
     // Reading time of the track being ripped so far (for a progress display).
     uint64_t trackReadMicros() const { return trackReadMicros_; }
 
+    // The next ripTrack() treats its first block as a re-read: the drive
+    // cache is defeated before it (the AccurateRip re-read, #49, reads a
+    // track again that the drive may still have in its cache).
+    void defeatCacheOnNextTrack() { defeatCacheFirst_ = true; }
+
 private:
     struct UnresolvedSector {
         uint32_t lba;
@@ -220,8 +250,9 @@ private:
     void rereadC2Sector(uint32_t lba, uint8_t* out, const uint8_t* c2, TrackRipResult& result);
     struct C2Reread;
     bool rereadC2Loop(uint32_t lba, uint8_t* out, C2Reread& state, int budget, TrackRipResult& result);
-    bool slowDownForSector(uint32_t lba, uint8_t* out, uint8_t* c2, TrackRipResult& result);
     std::vector<int> currentSlowdownSteps() const;
+    std::vector<int> slowdownPlan(int retries) const;
+    bool slowDownTo(int factor, uint32_t lba);
     bool setSpeed(uint16_t kBps, uint32_t lba);
     void restoreSpeed(uint32_t lba);
 
@@ -235,6 +266,8 @@ private:
     bool slowdownActive_;
     std::string slowdownFallbackReason_;
     uint16_t slowedKBps_ = 0;  // the speed slowed down to (0: not slowed)
+    int slowedFactor_ = 0;     // ... in x
+    bool defeatCacheFirst_ = false;
     Clock* clock_ = nullptr;
     uint64_t trackReadMicros_ = 0;
     Toc::LbaRange readable_;                     // audio run of the current track
