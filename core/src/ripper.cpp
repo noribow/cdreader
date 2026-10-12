@@ -151,6 +151,28 @@ std::vector<int> slowdownSteps(const RipOptions& options) {
     return steps;
 }
 
+std::vector<std::string> ReadSpeedSetup::logLines() const {
+    std::vector<std::string> lines = {info.logLine()};
+    if (change.result != SpeedChange::Result::NotRequested) lines.push_back(change.logLine());
+    lines.push_back(slowdownLine);
+    return lines;
+}
+
+ReadSpeedSetup setUpReadSpeed(CdDrive& drive, const DriveCapabilities& caps, const SpeedSetting& speed,
+                              RipOptions& options) {
+    ReadSpeedSetup setup;
+    setup.info = driveSpeedInfo(caps, readDiscPerformance(drive));
+    DriveCapabilities after;
+    setup.change = setReadSpeed(drive, speed, caps, &after);
+    options.speedKBps = setup.change.effectiveKBps();
+    options.currentSpeedKBps = driveSpeedInfo(after, {}).currentReadKBps;
+    std::string unavailable;
+    if (setup.change.result == SpeedChange::Result::Rejected) unavailable = "the drive rejects SET CD SPEED";
+    setup.slowdownLine = slowdownLogLine(options, unavailable);
+    if (!unavailable.empty()) options.slowdown = false;
+    return setup;
+}
+
 std::string slowdownLogLine(const RipOptions& options, const std::string& unavailable) {
     const std::string head = "Slowdown on read errors: ";
     if (!options.slowdown) return head + "disabled";

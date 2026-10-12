@@ -33,6 +33,7 @@ object NativeCd {
     @JvmStatic external fun nativeCancel(handle: Long)
     @JvmStatic external fun nativeInquiry(handle: Long): String
     @JvmStatic external fun nativeDriveInfo(handle: Long): Array<String>
+    @JvmStatic external fun nativeDriveSpeed(handle: Long): String
     @JvmStatic external fun nativeIsReady(handle: Long): Boolean
     @JvmStatic external fun nativeReadToc(handle: Long): IntArray
     @JvmStatic external fun nativeLookupCddb(
@@ -59,6 +60,7 @@ object NativeCd {
         cacheMode: Int,
         offsetSource: Int,
         offsetDetail: String,
+        slowdown: Boolean,
     )
     @JvmStatic external fun nativeRipTrack(handle: Long, track: Int, path: String, listener: RipProgressListener?): IntArray
     @JvmStatic external fun nativeImageFileNames(handle: Long, format: String, tracks: IntArray): Array<String>
@@ -415,6 +417,9 @@ class CdSession private constructor(private val handle: Long) : Closeable {
         return DriveInfo(v[0], v[1], v[2], v[3], v[4])
     }
 
+    /** The drive's read speeds (#49), e.g. "max 48x (8467 kB/s), current 24x; disc performance 16x-40x". */
+    fun driveSpeed(): String = NativeCd.nativeDriveSpeed(handle)
+
     fun isReady(): Boolean = NativeCd.nativeIsReady(handle)
 
     /** Also forgets the metadata and rip results of the previous disc. */
@@ -453,6 +458,7 @@ class CdSession private constructor(private val handle: Long) : Closeable {
      * [useC2]: read with C2 error pointers when the drive supports them.
      * [cacheMode]: drive cache defeat; [CacheMode.AUTO] tests the drive once per disc (a few seconds).
      * [offsetSource] / [offsetDetail]: where [readOffset] came from, for rip.log (#37).
+     * [slowdown]: re-read sectors with read / C2 errors at lower speeds (#49).
      */
     fun beginRip(
         format: String,
@@ -463,8 +469,10 @@ class CdSession private constructor(private val handle: Long) : Closeable {
         cacheMode: CacheMode,
         offsetSource: OffsetSource,
         offsetDetail: String,
+        slowdown: Boolean,
     ) = NativeCd.nativeBeginRip(
-        handle, format, readOffset, maxRetries, verify, useC2, cacheMode.code, offsetSource.code, offsetDetail
+        handle, format, readOffset, maxRetries, verify, useC2, cacheMode.code, offsetSource.code, offsetDetail,
+        slowdown,
     )
 
     /**

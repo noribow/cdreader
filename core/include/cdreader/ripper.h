@@ -52,6 +52,23 @@ struct RipOptions {
     uint32_t currentSpeedKBps = 0;
 };
 
+// The read speed of a rip (#49), decided once before ripping.
+struct ReadSpeedSetup {
+    DriveSpeedInfo info;        // what the drive reported before any change
+    SpeedChange change;         // --speed (NotRequested: no command)
+    std::string slowdownLine;   // slowdownLogLine() as set up
+
+    // info.logLine(), change.logLine() (when requested) and slowdownLine.
+    std::vector<std::string> logLines() const;
+};
+
+// Reads GET PERFORMANCE, applies `speed` (SET CD SPEED and MODE SENSE again,
+// see setReadSpeed()) and fills options.speedKBps / currentSpeedKBps;
+// options.slowdown (what the user wants) is turned off when the drive
+// rejected SET CD SPEED. `caps`: MODE SENSE page 2Ah read before. Never throws.
+ReadSpeedSetup setUpReadSpeed(CdDrive& drive, const DriveCapabilities& caps, const SpeedSetting& speed,
+                              RipOptions& options);
+
 // The slowdown speeds that are below the current read speed (all of them
 // when it is unknown), in the order they are tried.
 std::vector<int> slowdownSteps(const RipOptions& options);

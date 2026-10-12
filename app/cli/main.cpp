@@ -28,6 +28,7 @@
 #include "cdreader/disc_image.h"
 #include "cdreader/drive_cache.h"
 #include "cdreader/drive_offset_db.h"
+#include "cdreader/drive_speed.h"
 #include "cdreader/file_naming.h"
 #include "cdreader/gaps.h"
 #include "cdreader/metadata.h"
@@ -169,7 +170,7 @@ void printUsage() {
         "\n"
         "Usage:\n"
         "  cdreader drives                       List optical drives (C2 pointer support,\n"
-        "                                        cache size)\n"
+        "                                        cache size, read speed)\n"
         "  cdreader toc <drive> [options]        Show the table of contents and disc info\n"
         "                        (CDDB options, --no-isrc and --no-gaps)\n"
         "  cdreader rip <drive> [options]        Rip audio tracks (see --format)\n"
@@ -214,6 +215,16 @@ void printUsage() {
         "                        a few seconds), fua (READ(12) with FUA, fast, only\n"
         "                        some drives), flush (read more than the cache size\n"
         "                        elsewhere first, any drive, slower), none\n"
+        "      --speed <max|N>   Set the read speed before ripping: max, or N (in x,\n"
+        "                        1-%d, e.g. 8 or 8x) with SET CD SPEED; rip.log tells\n"
+        "                        whether the drive applied it. The drive is left at\n"
+        "                        that speed (drives reset it when the disc changes).\n"
+        "                        Default: the drive's own speed, no command\n"
+        "      --no-slowdown     Do not slow down on read errors. By default a sector\n"
+        "                        that stays unreadable or keeps C2 errors after the\n"
+        "                        retries is re-read at 8x, then 4x (only speeds below\n"
+        "                        the current one); the speed is restored after the\n"
+        "                        block. Drives that reject SET CD SPEED rip without it\n"
         "      --no-accuraterip  Do not look up the AccurateRip database after ripping\n"
         "      --single-file     Rip the tracks into one file (an image of the disc);\n"
         "                        the CUE sheet then marks the track positions. FLAC\n"
@@ -268,7 +279,7 @@ void printUsage() {
         "                        (default: cdreader %s)\n"
         "\n"
         "<drive> is a drive letter such as D or D:\n",
-        kVersion, formatList().c_str(), offsetStorePath().u8string().c_str(), cddbPresetHelp().c_str(),
+        kVersion, formatList().c_str(), cdr::kMaxSpeedFactor, offsetStorePath().u8string().c_str(), cddbPresetHelp().c_str(),
         settingsPath().u8string().c_str(), kVersion);
 }
 
@@ -530,6 +541,8 @@ int cmdDrives() {
             }
             std::printf("%c:  %s  [%s, %s%s%s]\n", letter, d.info.displayName().c_str(),
                         cdr::checkC2(caps, true).logLine().c_str(), cache.c_str(), offset.c_str(), db.c_str());
+            // Speeds (#49); the disc performance only with a disc in the drive.
+            std::printf("    %s\n", cdr::readDriveSpeed(*d.drive, &caps).logLine().c_str());
         } catch (const std::exception& e) {
             std::printf("%c:  (%s)\n", letter, e.what());
         }
@@ -551,8 +564,10 @@ int cmdToc(const std::vector<std::string>& args) {
 
     OpenedDrive d = openDrive(letter);
     std::printf("Drive: %s\n", d.info.displayName().c_str());
-    std::printf("%s\n", cdr::checkC2(*d.drive, true).logLine().c_str());
+    const cdr::DriveCapabilities caps = d.drive->readCapabilities();
+    std::printf("%s\n", cdr::checkC2(caps, true).logLine().c_str());
     const cdr::Toc toc = readTocOrExplain(*d.drive);
+    std::printf("%s\n", cdr::readDriveSpeed(*d.drive, &caps).logLine().c_str());
     const cdr::DiscCodes codes = readDiscCodes(*d.drive, toc.tracks, discCodes);
     const cdr::DiscGaps gaps = detectGaps(*d.drive, toc, gapDetection);
     const cdr::CddbLookupResult found = lookupDisc(toc, cddb);
@@ -705,6 +720,8 @@ int cmdRip(const std::vector<std::string>& args) {
     bool gapDetection = true;
     bool ripHtoa = false;
     bool useC2 = true;
+    cdr::SpeedSetting speed;
+    bool slowdown = true;
     cdr::CacheSetting cacheSetting = cdr::CacheSetting::Auto;
     cdr::EncoderSettings encoder;
     bool offsetAuto = false;
@@ -732,6 +749,12 @@ int cmdRip(const std::vector<std::string>& args) {
         else if (a == "--htoa") ripHtoa = true;
         else if (a == "--verify") options.verify = true;
         else if (a == "--no-c2") useC2 = false;
+        else if (a == "--speed") {
+            if (!cdr::parseSpeedSetting(value(), speed))
+                throw UsageError("invalid --speed '" + args[i] + "' (max, or 1-" +
+                                 std::to_string(cdr::kMaxSpeedFactor) + " in x, e.g. 8)");
+        }
+        else if (a == "--no-slowdown") slowdown = false;
         else if (a == "--cache") {
             if (!cdr::parseCacheSetting(value(), cacheSetting))
                 throw UsageError("invalid --cache mode '" + args[i] + "' (auto, fua, flush or none)");
@@ -838,6 +861,13 @@ int cmdRip(const std::vector<std::string>& args) {
     options.cacheDefeat = cache.method;
     options.flushSectors = cache.flushSectors;
 
+    // Read speed (#49): after the cache test, which reads at the drive's speed.
+    options.slowdown = slowdown;
+    const cdr::ReadSpeedSetup speedSetup = cdr::setUpReadSpeed(*d.drive, caps, speed, options);
+    std::vector<std::string> speedLines = speedSetup.logLines();
+    if (!slowdown) speedLines.back() += " (--no-slowdown)";
+    for (const std::string& l : speedLines) std::printf("%s\n", l.c_str());
+
     // MCN / ISRC are optional too: a drive that cannot read them only means
     // no CATALOG / ISRC lines and tags.
     const cdr::DiscCodes codes = readDiscCodes(*d.drive, selected, discCodes);
@@ -905,6 +935,7 @@ int cmdRip(const std::vector<std::string>& args) {
         << "Drive: " << d.info.displayName() << "\n"
         << c2Line << "\n";
     for (const std::string& l : cache.logLines()) log << l << "\n";
+    for (const std::string& l : speedLines) log << l << "\n";
     log << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
         << cdr::readOffsetLogLine(options.readOffsetSamples, offsetSource) << "\n";
@@ -934,6 +965,9 @@ int cmdRip(const std::vector<std::string>& args) {
     log << "\n";
 
     cdr::Ripper ripper(*d.drive, toc, options);
+    ripper.setClock(cdr::steadyClock());
+    uint64_t readSectors = 0, readMicros = 0;  // measured read speed (#49)
+    size_t timedTracks = 0;
     int problems = 0;
     std::vector<ArTrack> arTracks;
     std::unique_ptr<cdr::AudioWriter> writer;
@@ -981,7 +1015,8 @@ int cmdRip(const std::vector<std::string>& args) {
             [&](uint32_t done, uint32_t total) {
                 int percent = total ? int(uint64_t(done) * 100 / total) : 100;
                 if (percent != lastPercent) {
-                    std::printf("\rTrack %02d [%s]  %3d%%", t.number, cdr::formatMsf(t.lengthSectors).c_str(), percent);
+                    std::printf("\rTrack %02d [%s]  %3d%%  %-18s", t.number, cdr::formatMsf(t.lengthSectors).c_str(),
+                                percent, cdr::formatMeasuredSpeed(done, ripper.trackReadMicros()).c_str());
                     std::fflush(stdout);
                     lastPercent = percent;
                 }
@@ -1000,6 +1035,12 @@ int cmdRip(const std::vector<std::string>& args) {
         std::printf("  CRC32 %s  %s%s\n", hex32(r.crc32).c_str(), status.c_str(), notes.c_str());
         if (!r.c2Fallback.empty()) std::printf("  C2 reads given up: %s\n", r.c2Fallback.c_str());
         if (!r.cacheFallback.empty()) std::printf("  FUA given up: %s\n", r.cacheFallback.c_str());
+        for (const std::string& l : cdr::slowdownLogLines(r)) std::printf("%s\n", l.c_str());
+        if (r.readMicros) {
+            readSectors += r.sectors;
+            readMicros += r.readMicros;
+            ++timedTracks;
+        }
         for (const std::string& l : cdr::trackRipLogLines(name, r)) log << l << "\n";
         if (!r.clean()) ++problems;
         if (!htoa) arTracks.push_back({t, ar.v1(), ar.v2()});
@@ -1007,6 +1048,11 @@ int cmdRip(const std::vector<std::string>& args) {
     if (singleFile) {
         writer->close();
         log << cdr::discImageCrcLogLine(image.fileName, imageCrc.value()) << "\n";
+    }
+    const std::string average = cdr::averageSpeedLogLine(readSectors, readMicros, timedTracks);
+    if (!average.empty()) {
+        log << average << "\n";
+        std::printf("%s\n", average.c_str());
     }
 
     if (cueFile) {

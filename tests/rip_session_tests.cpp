@@ -81,6 +81,12 @@ struct Register {
 
 bool contains(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
 
+// The measured read speed line of a track in rip.log (#49; the Rig's clock is
+// the fake drive's simulated time).
+std::string speedLine(const cdr::TrackRipResult& r) {
+    return "  Read speed: " + cdr::formatMeasuredSpeed(r.sectors, r.readMicros) + "\n";
+}
+
 // Three audio tracks; lead-out at 10 seconds (as in test_main.cpp).
 FakeDrive makeAudioDisc() { return FakeDrive({{0, false}, {300, false}, {450, false}}, 750); }
 
@@ -943,7 +949,8 @@ TEST(c2_errors_in_results_and_rip_log) {
     CHECK(t1.result.clean());
     CHECK_EQ(t1.result.crc32, referenceRip(1).crc32);
     const cdr::RippedTrack t2 = rig.session.ripTrack(2, dir.path / "2.wav");
-    CHECK_EQ(t2.result.c2Rereads, 2u);  // settings(): 2 retries
+    CHECK_EQ(t2.result.c2Rereads, 6u);  // settings(): 2 retries, then 2 each at 8x and 4x (#49)
+    CHECK_EQ(t2.result.slowdownFailed, 1u);
     CHECK_EQ(t2.result.c2Unresolved, 1u);
     CHECK(t2.result.suspiciousSectors == std::vector<uint32_t>{20});
     CHECK(rig.fake.c2ReadCommands > 0);
@@ -952,12 +959,16 @@ TEST(c2_errors_in_results_and_rip_log) {
     const std::string log = rig.session.ripLog();
     CHECK(contains(log, "Drive: FAKE CD-ROM DRIVE (1.00)\nC2 pointers: supported\nDrive cache: 200 KB, "
                         "no audio caching detected (method: none)\nCache test (26 sectors): re-read 32.2 ms, after "
-                        "flush 32.2 ms, after FUA 32.2 ms\nMode: burst"));
+                        "flush 32.2 ms, after FUA 32.2 ms\nRead speed: not reported by the drive\n"
+                        "Slowdown on read errors: 8x, 4x\nMode: burst"));
     CHECK(contains(log, "Track01.wav  CRC32 "));
-    CHECK(contains(log, "  OK\n  C2 errors: 1 sector(s), 1 re-read(s) (1 recovered, 0 identical re-reads with C2, "
-                        "0 unresolved)\n"));
-    CHECK(contains(log, "retries 0  1 suspicious sector(s)\n  C2 errors: 1 sector(s), 2 re-read(s) (0 recovered, "
-                        "0 identical re-reads with C2, 1 unresolved)\n  Suspicious position 0:00:00 (sector 20)\n"));
+    CHECK(contains(log, "  OK\n" + speedLine(t1.result) +
+                            "  C2 errors: 1 sector(s), 1 re-read(s) (1 recovered, 0 identical re-reads with C2, "
+                            "0 unresolved)\n"));
+    CHECK(contains(log, "retries 0  1 suspicious sector(s)\n" + speedLine(t2.result) +
+                            "  C2 errors: 1 sector(s), 6 re-read(s) (0 recovered, "
+                            "0 identical re-reads with C2, 1 unresolved)\n  Suspicious position 0:00:00 (sector 20)\n"
+                            "  Slowdown: 1 sector(s) not recovered at lower speeds\n"));
     CHECK(contains(log, "\nFinished with errors\n"));
 }
 
@@ -1035,8 +1046,9 @@ TEST(cache_detection_once_per_disc_and_rip_log) {
     CHECK_EQ(rig.fake.fuaCommands, detectionFua + 14);
     const std::string log = rig.session.ripLog();
     CHECK(contains(log, "\nDrive cache: 200 KB, caches audio, FUA works (method: fua)\nCache test (26 sectors): re-read "
-                        "1.0 ms, after flush 32.2 ms, after FUA 32.2 ms\nMode: verify (double read)"));
-    CHECK(contains(log, "retries 1  OK\n  Cache defeat: 14 FUA command(s)\n"));
+                        "1.0 ms, after flush 32.2 ms, after FUA 32.2 ms\nRead speed: not reported by the drive\n"
+                        "Slowdown on read errors: 8x, 4x\nMode: verify (double read)"));
+    CHECK(contains(log, "retries 1  OK\n" + speedLine(t.result) + "  Cache defeat: 14 FUA command(s)\n"));
 
     // The next rip of the same disc keeps the result, a new disc runs the test again.
     rig.session.beginRip(s);
@@ -1053,8 +1065,8 @@ TEST(cache_detection_once_per_disc_and_rip_log) {
     CHECK(contains(rig.session.ripLog(), "\nDrive cache: 200 KB, method: flush (forced), 114 sectors per flush\n"));
 }
 
-// "None" sends no cache command at all (not even MODE SENSE without C2):
-// the commands of a rip before #34.
+// "None" sends no cache command at all: only MODE SENSE and GET PERFORMANCE
+// for the read speed (#49).
 TEST(cache_none_setting_over_usb) {
     for (bool c2 : {false, true}) {
         Rig rig;
@@ -1069,12 +1081,15 @@ TEST(cache_none_setting_over_usb) {
         rig.device.opcodes.clear();
         rig.session.beginRip(s);
         CHECK(rig.session.ripSettings().options.cacheDefeat == cdr::CacheDefeat::None);
-        CHECK(rig.device.opcodes == (c2 ? std::vector<uint8_t>{0x5A} : std::vector<uint8_t>{}));
+        // GET PERFORMANCE fails on this drive: REQUEST SENSE after it.
+        CHECK(rig.device.opcodes == (std::vector<uint8_t>{0x5A, 0xAC, 0x03}));
         TempDir dir;
         rig.session.ripTrack(2, dir.path / "2.wav");
         CHECK(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xA8)) == 0);
-        CHECK(contains(rig.session.ripLog(), c2 ? "\nDrive cache: 200 KB, method: none (disabled)\nMode: burst"
-                                                : "\nDrive cache: method: none (disabled)\nMode: burst"));
+        CHECK(contains(rig.session.ripLog(), c2 ? "\nDrive cache: 200 KB, method: none (disabled)\nRead speed: "
+                                                  "not reported by the drive\nSlowdown on read errors: 8x, 4x\nMode: burst"
+                                                : "\nDrive cache: method: none (disabled)\nRead speed: not reported "
+                                                  "by the drive\nSlowdown on read errors: 8x, 4x\nMode: burst"));
     }
 }
 
@@ -1486,18 +1501,24 @@ TEST(image_wav_equals_per_track_rips_with_offsets) {
 
         // rip.log: the single-file layout of the CLI.
         const std::string log = rig.session.ripLog();
-        char lines[512];
+        char lines[1024];
+        const std::string speed1 = tracks.size() == 3 ? speedLine(tracks[0].result) : "";
+        const std::string speed2 = tracks.size() == 3 ? speedLine(tracks[1].result) : "";
+        const std::string speed3 = tracks.size() == 3 ? speedLine(tracks[2].result) : "";
         std::snprintf(lines, sizeof lines,
                       "Folder: Various - Album_ Live\n"
                       "Single file: Various - Album_ Live.wav\n"
-                      "Track 01  CRC32 %08X  retries 0  OK%s\n"
-                      "Track 02  CRC32 %08X  retries 0  OK\n"
-                      "Track 03  CRC32 %08X  retries 0  OK%s\n"
-                      "Various - Album_ Live.wav  CRC32 %08X\n",
+                      "Track 01  CRC32 %08X  retries 0  OK%s\n%s"
+                      "Track 02  CRC32 %08X  retries 0  OK\n%s"
+                      "Track 03  CRC32 %08X  retries 0  OK%s\n%s"
+                      "Various - Album_ Live.wav  CRC32 %08X\n"
+                      "Average read speed: ",
                       tracks.size() == 3 ? tracks[0].result.crc32 : 0,
-                      offset < 0 ? "  (1206 samples outside the disc padded with silence)" : "",
-                      tracks.size() == 3 ? tracks[1].result.crc32 : 0, tracks.size() == 3 ? tracks[2].result.crc32 : 0,
-                      offset > 0 ? "  (667 samples outside the disc padded with silence)" : "", image.crc32);
+                      offset < 0 ? "  (1206 samples outside the disc padded with silence)" : "", speed1.c_str(),
+                      tracks.size() == 3 ? tracks[1].result.crc32 : 0, speed2.c_str(),
+                      tracks.size() == 3 ? tracks[2].result.crc32 : 0,
+                      offset > 0 ? "  (667 samples outside the disc padded with silence)" : "", speed3.c_str(),
+                      image.crc32);
         CHECK(contains(log, lines));
         CHECK(!contains(log, "Embedded CUE sheet"));
         CHECK(contains(log, "\nAll tracks ripped without errors\n"));
@@ -1749,6 +1770,104 @@ TEST(image_cancel_and_errors_delete_partial_files) {
     CHECK(!rig.session.rippedImage());
     CHECK_EQ(rig.session.rippedTracks().size(), size_t(1));
     CHECK(!contains(rig.session.ripLog(), "Single file"));
+}
+
+// --- Read speed (#49) ----------------------------------------------------------
+
+// A 48x drive at 24x, CAV 16x-40x: the connection status, --speed 8 and a
+// sector that reads only at 4x: slowed down to 4x, back to 8x after it.
+TEST(read_speed_and_slowdown_over_usb) {
+    Rig rig;
+    rig.fake.maxSpeedKBps = 8467;
+    rig.fake.readSpeedKBps = 4234;
+    rig.fake.perfStartKBps = 2822;
+    rig.fake.perfEndKBps = 7056;
+    CHECK_STR(rig.session.readDriveSpeed().summary(), "max 48x (8467 kB/s), current 24x; disc performance 16x-40x");
+    rig.fake.speedFaults[310] = {706, false};
+    cdr::RipSettings s = settings("wav");
+    s.readDiscCodes = false;
+    s.detectGaps = false;
+    s.cache = cdr::CacheSetting::None;
+    CHECK(cdr::parseSpeedSetting("8", s.speed));
+    rig.session.beginRip(s);
+    CHECK(rig.session.speedSetup().change.result == cdr::SpeedChange::Result::Applied);
+    CHECK_EQ(rig.session.ripSettings().options.speedKBps, 1412);
+    CHECK_EQ(rig.session.ripSettings().options.currentSpeedKBps, 1412u);
+    CHECK(rig.session.ripSettings().options.slowdown);
+    CHECK_STR(rig.session.driveSpeed().summary(), "max 48x (8467 kB/s), current 24x; disc performance 16x-40x");
+
+    TempDir dir;
+    rig.device.opcodes.clear();
+    const cdr::RippedTrack t = rig.session.ripTrack(2, dir.path / "2.wav");
+    CHECK(t.result.clean());
+    CHECK_EQ(t.result.crc32, referenceRip(2).crc32);
+    CHECK(t.result.slowdownRecovered == (std::map<int, uint32_t>{{4, 1}}));
+    CHECK_EQ(int(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xBB))), 2);
+    CHECK_EQ(rig.fake.readSpeedKBps, 1412);  // back at the --speed setting
+    CHECK(t.result.readMicros > 0);
+
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "\nRead speed: max 48x (8467 kB/s), current 24x; disc performance 16x-40x\n"
+                        "Read speed set to 8x (drive reports 8x)\nSlowdown on read errors: 4x\nMode: burst"));
+    CHECK(contains(log, "  OK\n" + speedLine(t.result) + "  Slowdown: 1 sector(s) re-read at 4x\n"));
+    CHECK(contains(log, "\nAverage read speed: " + cdr::formatMeasuredSpeed(150, t.result.readMicros) +
+                            ", 1 track(s) in 0:00\n"));
+}
+
+// A drive that rejects SET CD SPEED: given up at the first problem sector,
+// for the rest of the rip; with --speed it is known before the rip.
+TEST(slowdown_fallback_lasts_for_the_rest_of_the_rip) {
+    Rig rig;
+    rig.fake.setSpeedMode = FakeDrive::SetSpeedMode::Reject;
+    rig.fake.failuresBySector[310] = -1;
+    rig.fake.failuresBySector[460] = -1;
+    cdr::RipSettings s = settings("wav");
+    s.readDiscCodes = false;
+    s.detectGaps = false;
+    s.cache = cdr::CacheSetting::None;
+    rig.session.beginRip(s);
+    TempDir dir;
+    rig.device.opcodes.clear();
+    const cdr::RippedTrack t2 = rig.session.ripTrack(2, dir.path / "2.wav");
+    CHECK_EQ(t2.result.unreadableSectors, 1u);
+    CHECK(rig.session.slowdownFallback().find("SET CD SPEED to 8x failed at LBA 310 (") == 0);
+    CHECK(t2.result.slowdownFallback == rig.session.slowdownFallback());
+    CHECK(!rig.session.ripSettings().options.slowdown);
+    CHECK_EQ(int(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xBB))), 1);
+    const cdr::RippedTrack t3 = rig.session.ripTrack(3, dir.path / "3.wav");
+    CHECK_EQ(t3.result.unreadableSectors, 1u);
+    CHECK(!t3.result.slowdown);
+    CHECK_EQ(int(std::count(rig.device.opcodes.begin(), rig.device.opcodes.end(), uint8_t(0xBB))), 1);
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "\nSlowdown on read errors: 8x, 4x\n"));
+    CHECK(contains(log, "  Slowdown given up: SET CD SPEED to 8x failed at LBA 310 ("));
+
+    CHECK(cdr::parseSpeedSetting("max", s.speed));
+    rig.session.beginRip(s);
+    CHECK(!rig.session.ripSettings().options.slowdown);
+    const std::string again = rig.session.ripLog();
+    CHECK(contains(again, "\nRead speed: the drive rejected SET CD SPEED to max (SCSI status 0x02, sense ILLEGAL "
+                          "REQUEST"));
+    CHECK(contains(again, "\nSlowdown on read errors: not possible (the drive rejects SET CD SPEED)\n"));
+}
+
+// Disabled (the app's checkbox): no SET CD SPEED, the reads of before #49.
+TEST(slowdown_disabled_over_usb) {
+    Rig rig;
+    rig.fake.failuresBySector[310] = -1;
+    rig.fake.speedFaults[320] = {1412, false};
+    cdr::RipSettings s = settings("wav");
+    s.readDiscCodes = false;
+    s.detectGaps = false;
+    s.cache = cdr::CacheSetting::None;
+    s.slowdown = false;
+    rig.session.beginRip(s);
+    TempDir dir;
+    const cdr::RippedTrack t = rig.session.ripTrack(2, dir.path / "2.wav");
+    CHECK_EQ(t.result.unreadableSectors, 2u);
+    CHECK_EQ(rig.fake.setSpeedCommands, 0);
+    CHECK(contains(rig.session.ripLog(), "\nSlowdown on read errors: disabled\n"));
+    CHECK(!contains(rig.session.ripLog(), "  Slowdown"));
 }
 
 int main() {

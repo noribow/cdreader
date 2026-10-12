@@ -28,6 +28,7 @@
 #include "cdreader/disc_image.h"
 #include "cdreader/drive_cache.h"
 #include "cdreader/drive_offset_db.h"
+#include "cdreader/drive_speed.h"
 #include "cdreader/file_naming.h"
 #include "cdreader/flac_encoder.h"
 #include "cdreader/flac_writer.h"
@@ -7010,6 +7011,636 @@ TEST(cache_flush_stays_inside_the_audio_run) {
         CHECK(r.result.clean());
         CHECK(r.result.flushSectorsRead > 0);
         CHECK(readsWithin(fake.commandLog, 300, 750));
+    }
+}
+
+// --- Drive read speed (#49) -------------------------------------------------
+
+namespace {
+
+constexpr uint16_t k48x = 8467;  // what drives report for 48x
+constexpr uint16_t k24x = 4234;
+
+// makeAudioDisc() on a 48x drive currently at 24x, CAV 16x-40x over the disc.
+FakeDrive makeSpeedDisc() {
+    FakeDrive fake = makeAudioDisc();
+    fake.maxSpeedKBps = k48x;
+    fake.readSpeedKBps = k24x;
+    fake.perfStartKBps = 2822;
+    fake.perfEndKBps = 7056;
+    return fake;
+}
+
+// The SET CD SPEED requests (kB/s) in the command log.
+std::vector<uint32_t> speedRequests(const std::vector<FakeDrive::Command>& log) {
+    std::vector<uint32_t> v;
+    for (const FakeDrive::Command& c : log)
+        if (c.opcode == 0xBB) v.push_back(c.lba);
+    return v;
+}
+
+cdr::RipOptions slowdownOptions(int retries = 2) {
+    cdr::RipOptions o;
+    o.maxRetries = retries;
+    o.slowdown = true;
+    return o;
+}
+
+struct SpeedRip {
+    cdr::TrackRipResult result;
+    std::vector<uint8_t> bytes;
+    bool slowdownActive = false;
+    std::string fallback;
+};
+
+SpeedRip ripSpeed(FakeDrive& fake, int track, const cdr::RipOptions& options, cdr::Clock* clock = nullptr) {
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    fake.commandLog.clear();
+    cdr::Ripper ripper(drive, toc, options);
+    if (clock) ripper.setClock(*clock);
+    SpeedRip out;
+    out.result = ripper.ripTrack(*toc.findTrack(track), [&](const uint8_t* p, size_t n) {
+        out.bytes.insert(out.bytes.end(), p, p + n);
+    });
+    out.slowdownActive = ripper.slowdownActive();
+    out.fallback = ripper.slowdownFallbackReason();
+    return out;
+}
+
+}  // namespace
+
+TEST(speed_conversions) {
+    CHECK_EQ(cdr::speedFactor(8467), 48);
+    CHECK_EQ(cdr::speedFactor(7040), 40);  // 176 per x
+    CHECK_EQ(cdr::speedFactor(7056), 40);
+    CHECK_EQ(cdr::speedFactor(176), 1);
+    CHECK_EQ(cdr::speedFactor(0), 0);
+    CHECK_EQ(cdr::speedKBps(1), 177);
+    CHECK_EQ(cdr::speedKBps(4), 706);
+    CHECK_EQ(cdr::speedKBps(8), 1412);
+    CHECK_EQ(cdr::speedKBps(48), 8468);
+    CHECK_EQ(cdr::speedKBps(0), 0xFFFF);
+    CHECK_EQ(cdr::speedFactor(cdr::speedKBps(40)), 40);
+    CHECK(!cdr::plausibleCdSpeed(0));
+    CHECK(!cdr::plausibleCdSpeed(87));
+    CHECK(cdr::plausibleCdSpeed(88));
+    CHECK(cdr::plausibleCdSpeed(12701));  // 72x
+    CHECK(!cdr::plausibleCdSpeed(12702));
+    CHECK(!cdr::plausibleCdSpeed(0xFFFF));
+    CHECK(!cdr::plausibleCdSpeed(22160));  // 16x DVD
+    CHECK(cdr::formatSpeed(4234) == "24x");
+}
+
+TEST(speed_mode_sense_fields) {
+    FakeDrive fake = makeSpeedDisc();
+    cdr::CdDrive drive(fake);
+    cdr::DriveCapabilities caps = drive.readCapabilities();
+    CHECK(caps.valid);
+    CHECK_EQ(caps.maxReadKBps, 8467u);
+    CHECK_EQ(caps.currentReadKBps, 4234u);
+    fake.reportCurrentSpeed = false;
+    CHECK_EQ(drive.readCapabilities().currentReadKBps, 0u);
+
+    // A page of 20 bytes (length 18) with both speeds.
+    uint8_t data[8 + 20] = {};
+    data[1] = sizeof data - 2;
+    uint8_t* page = data + 8;
+    page[0] = 0x2A;
+    page[1] = 18;
+    page[8] = 0x21;  // 8467
+    page[9] = 0x13;
+    page[14] = 0x10;  // 4234
+    page[15] = 0x8A;
+    caps = cdr::DriveCapabilities::parse(data, sizeof data);
+    CHECK_EQ(caps.maxReadKBps, 8467u);
+    CHECK_EQ(caps.currentReadKBps, 4234u);
+    page[1] = 12;  // ... and a page too short for bytes 14..15
+    caps = cdr::DriveCapabilities::parse(data, sizeof data);
+    CHECK_EQ(caps.maxReadKBps, 8467u);
+    CHECK_EQ(caps.currentReadKBps, 0u);
+    page[1] = 18;
+    caps = cdr::DriveCapabilities::parse(data, 8 + 15);  // the response ends inside byte 14..15
+    CHECK_EQ(caps.currentReadKBps, 0u);
+    page[1] = 6;  // MMC-1 minimum: no speeds
+    caps = cdr::DriveCapabilities::parse(data, sizeof data);
+    CHECK(caps.valid);
+    CHECK_EQ(caps.maxReadKBps, 0u);
+}
+
+TEST(speed_get_performance_cdb_and_parse) {
+    FakeDrive fake = makeSpeedDisc();
+    cdr::CdDrive drive(fake);
+    cdr::DiscPerformance p = cdr::readDiscPerformance(drive);
+    const std::vector<uint8_t> cdb = {0xAC, 0x10, 0, 0, 0, 0, 0, 0, 0, cdr::kPerformanceDescriptors, 0x00, 0};
+    CHECK(fake.lastGetPerformanceCdb == cdb);
+    CHECK(p.valid);
+    CHECK_EQ(p.startKBps, 2822u);
+    CHECK_EQ(p.endKBps, 7056u);
+    CHECK(p.range() == "16x-40x");
+    fake.perfStartKBps = fake.perfEndKBps = 4234;  // CLV
+    CHECK(cdr::readDiscPerformance(drive).range() == "24x");
+    fake.perfStartKBps = fake.perfEndKBps = 0;  // not supported
+    p = cdr::readDiscPerformance(drive);
+    CHECK(!p.valid);
+    CHECK(p.range().empty());
+    CHECK(p.error.find("GET PERFORMANCE failed: SCSI status 0x02, sense ILLEGAL REQUEST") == 0);
+
+    auto put = [](std::vector<uint8_t>& v, size_t at, uint32_t x) {
+        v[at] = uint8_t(x >> 24);
+        v[at + 1] = uint8_t(x >> 16);
+        v[at + 2] = uint8_t(x >> 8);
+        v[at + 3] = uint8_t(x);
+    };
+    // Two zones (a drive switching from CLV to CAV) and garbage descriptors.
+    std::vector<uint8_t> r(8 + 4 * 16);
+    put(r, 0, uint32_t(r.size() - 4));
+    put(r, 8, 0), put(r, 12, 0), put(r, 16, 9999), put(r, 20, 0);             // 0 kB/s: skipped
+    put(r, 24, 0), put(r, 28, 2117), put(r, 32, 99999), put(r, 36, 2117);     // 12x
+    put(r, 40, 100000), put(r, 44, 2117), put(r, 48, 359999), put(r, 52, 8467);  // 12x-48x
+    put(r, 56, 5), put(r, 60, 0xFFFFFFFF), put(r, 64, 6), put(r, 68, 0xFFFFFFFF);  // garbage
+    p = cdr::DiscPerformance::parse(r.data(), r.size());
+    CHECK(p.valid);
+    CHECK_EQ(p.startKBps, 2117u);
+    CHECK_EQ(p.endKBps, 8467u);
+    CHECK_EQ(p.minKBps, 2117u);
+    CHECK_EQ(p.maxKBps, 8467u);
+    CHECK(p.range() == "12x-48x");
+    put(r, 0, 4 + 16);  // the data length covers the first (skipped) descriptor only
+    p = cdr::DiscPerformance::parse(r.data(), r.size());
+    CHECK(!p.valid);
+    CHECK(p.error == "implausible performance descriptors");
+    put(r, 0, 4);  // header only
+    CHECK(cdr::DiscPerformance::parse(r.data(), r.size()).error == "no performance descriptors");
+    CHECK(cdr::DiscPerformance::parse(r.data(), 7).error == "GET PERFORMANCE response too short");
+    put(r, 0, uint32_t(r.size() - 4));
+    put(r, 24, 200000);  // end LBA before start LBA
+    put(r, 40, 400000);
+    p = cdr::DiscPerformance::parse(r.data(), r.size());
+    CHECK(!p.valid);
+    // DVD rates (16x DVD = 22160 kB/s) are no CD speeds.
+    fake.performanceResponse.assign(r.begin(), r.begin() + 24);
+    put(fake.performanceResponse, 0, 20);
+    put(fake.performanceResponse, 8, 0);
+    put(fake.performanceResponse, 12, 22160);
+    put(fake.performanceResponse, 16, 1000);
+    put(fake.performanceResponse, 20, 22160);
+    CHECK(!cdr::readDiscPerformance(drive).valid);
+}
+
+TEST(speed_info_log_line) {
+    FakeDrive fake = makeSpeedDisc();
+    cdr::CdDrive drive(fake);
+    cdr::DriveSpeedInfo info = cdr::readDriveSpeed(drive);
+    CHECK(info.logLine() == "Read speed: max 48x (8467 kB/s), current 24x; disc performance 16x-40x");
+    CHECK(info.known());
+    const cdr::DriveCapabilities caps = drive.readCapabilities();
+    fake.commandLog.clear();
+    info = cdr::readDriveSpeed(drive, &caps);  // no second MODE SENSE
+    CHECK_EQ(countOpcode(fake.commandLog, 0x5A), 0);
+    CHECK_EQ(countOpcode(fake.commandLog, 0xAC), 1);
+    CHECK(info.summary() == "max 48x (8467 kB/s), current 24x; disc performance 16x-40x");
+
+    fake.perfStartKBps = fake.perfEndKBps = 0;
+    CHECK(cdr::readDriveSpeed(drive).logLine() == "Read speed: max 48x (8467 kB/s), current 24x");
+    fake.reportCurrentSpeed = false;
+    CHECK(cdr::readDriveSpeed(drive).logLine() == "Read speed: max 48x (8467 kB/s)");
+    fake.maxSpeedKBps = 0xFFFF;  // garbage
+    info = cdr::readDriveSpeed(drive);
+    CHECK(!info.known());
+    CHECK(info.logLine() == "Read speed: not reported by the drive");
+    fake.perfStartKBps = 4234;
+    fake.perfEndKBps = 4234;
+    CHECK(cdr::readDriveSpeed(drive).logLine() == "Read speed: disc performance 24x");
+    fake.modeSenseSupported = false;
+    CHECK(cdr::readDriveSpeed(drive).logLine() == "Read speed: disc performance 24x");
+}
+
+TEST(speed_setting_parse) {
+    cdr::SpeedSetting s;
+    CHECK(!s.requested);
+    CHECK(s.name() == "drive default");
+    CHECK(cdr::parseSpeedSetting("max", s) && s.requested && s.factor == 0);
+    CHECK(s.name() == "max");
+    CHECK_EQ(s.kBps(), 0xFFFF);
+    CHECK(cdr::parseSpeedSetting("8", s) && s.factor == 8);
+    CHECK(s.name() == "8x");
+    CHECK_EQ(s.kBps(), 1412);
+    CHECK(cdr::parseSpeedSetting("8x", s) && s.factor == 8);
+    CHECK(cdr::parseSpeedSetting("1", s) && s.factor == 1);
+    CHECK(cdr::parseSpeedSetting("72", s) && s.factor == 72);
+    for (const char* bad : {"", "0", "73", "-1", "+8", "x", "8.5", "abc", "1000", "8 ", " 8", "MAX", "8xx"}) {
+        cdr::SpeedSetting t;
+        CHECK(!cdr::parseSpeedSetting(bad, t));
+        CHECK(!t.requested);
+    }
+}
+
+TEST(speed_set_cd_speed_cdb) {
+    FakeDrive fake = makeSpeedDisc();
+    cdr::CdDrive drive(fake);
+    CHECK(drive.setCdSpeed(1412).ok());
+    CHECK(fake.lastSetSpeedCdb == (std::vector<uint8_t>{0xBB, 0, 0x05, 0x84, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0}));
+    CHECK_EQ(fake.readSpeedKBps, 1412);
+    CHECK(drive.setCdSpeed(0xFFFF).ok());
+    CHECK(fake.lastSetSpeedCdb == (std::vector<uint8_t>{0xBB, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0}));
+    CHECK_EQ(fake.readSpeedKBps, k48x);
+    fake.setSpeedMode = FakeDrive::SetSpeedMode::Reject;
+    const cdr::ScsiResult r = drive.setCdSpeed(1412);
+    CHECK(!r.ok());
+    CHECK_EQ(r.sense.key, 0x5);
+}
+
+TEST(speed_set_applied_ignored_rejected) {
+    auto set = [](FakeDrive& fake, const char* text) {
+        cdr::CdDrive drive(fake);
+        cdr::SpeedSetting s;
+        cdr::parseSpeedSetting(text, s);
+        const cdr::DriveCapabilities before = drive.readCapabilities();
+        cdr::DriveCapabilities after;
+        const cdr::SpeedChange c = cdr::setReadSpeed(drive, s, before, &after);
+        CHECK_EQ(after.currentReadKBps, c.result == cdr::SpeedChange::Result::Rejected ? before.currentReadKBps
+                                        : fake.reportCurrentSpeed                     ? fake.readSpeedKBps
+                                                                                       : 0u);
+        return c;
+    };
+    {
+        FakeDrive fake = makeSpeedDisc();
+        const cdr::SpeedChange c = set(fake, "8");
+        CHECK(c.result == cdr::SpeedChange::Result::Applied);
+        CHECK_EQ(c.beforeKBps, 4234u);
+        CHECK_EQ(c.afterKBps, 1412u);
+        CHECK_EQ(c.effectiveKBps(), 1412);
+        CHECK(c.logLine() == "Read speed set to 8x (drive reports 8x)");
+        CHECK_EQ(fake.setSpeedCommands, 1);
+    }
+    {
+        // The drive picks the closest speed it supports.
+        FakeDrive fake = makeSpeedDisc();
+        fake.supportedSpeeds = {706, 1411, 2822, 4234, 5645, 7056, 8467};
+        const cdr::SpeedChange c = set(fake, "10");
+        CHECK(c.result == cdr::SpeedChange::Result::Applied);
+        CHECK(c.logLine() == "Read speed set to 10x (drive reports 8x)");
+        CHECK(set(fake, "1").logLine() == "Read speed set to 1x (drive reports 4x)");
+        CHECK(set(fake, "max").logLine() == "Read speed set to max (drive reports 48x)");
+        CHECK(set(fake, "24").logLine() == "Read speed set to 24x (drive reports 24x)");
+    }
+    {
+        FakeDrive fake = makeSpeedDisc();
+        fake.setSpeedMode = FakeDrive::SetSpeedMode::Ignore;
+        const cdr::SpeedChange c = set(fake, "8");
+        CHECK(c.result == cdr::SpeedChange::Result::Ignored);
+        CHECK_EQ(c.effectiveKBps(), 0xFFFF);
+        CHECK(c.logLine() == "Read speed: requested 8x, but the drive ignored the request (drive reports 24x)");
+        CHECK(set(fake, "24").result == cdr::SpeedChange::Result::Applied);  // nothing to change
+        CHECK(set(fake, "max").result == cdr::SpeedChange::Result::Applied);
+    }
+    {
+        FakeDrive fake = makeSpeedDisc();
+        fake.setSpeedMode = FakeDrive::SetSpeedMode::Reject;
+        fake.commandLog.clear();
+        const cdr::SpeedChange c = set(fake, "8");
+        CHECK(c.result == cdr::SpeedChange::Result::Rejected);
+        CHECK_EQ(c.effectiveKBps(), 0xFFFF);
+        CHECK(c.logLine().find("Read speed: the drive rejected SET CD SPEED to 8x (SCSI status 0x02, sense "
+                               "ILLEGAL REQUEST") == 0);
+        CHECK_EQ(countOpcode(fake.commandLog, 0x5A), 1);  // no MODE SENSE after the rejection
+    }
+    {
+        FakeDrive fake = makeSpeedDisc();
+        fake.reportCurrentSpeed = false;
+        const cdr::SpeedChange c = set(fake, "8");
+        CHECK(c.result == cdr::SpeedChange::Result::Unknown);
+        CHECK_EQ(c.effectiveKBps(), 1412);
+        CHECK(c.logLine() == "Read speed set to 8x (the drive does not report its current speed)");
+        CHECK_EQ(fake.readSpeedKBps, 1412);
+    }
+    {
+        FakeDrive fake = makeSpeedDisc();
+        cdr::CdDrive drive(fake);
+        const cdr::SpeedChange c = cdr::setReadSpeed(drive, {}, drive.readCapabilities());
+        CHECK(c.result == cdr::SpeedChange::Result::NotRequested);
+        CHECK(c.logLine().empty());
+        CHECK_EQ(c.effectiveKBps(), 0xFFFF);
+        CHECK_EQ(fake.setSpeedCommands, 0);
+    }
+}
+
+TEST(speed_setup_and_slowdown_line) {
+    auto setup = [](FakeDrive& fake, const char* speed, bool slowdown, cdr::RipOptions& options) {
+        cdr::CdDrive drive(fake);
+        cdr::SpeedSetting s;
+        if (speed) cdr::parseSpeedSetting(speed, s);
+        options.slowdown = slowdown;
+        return cdr::setUpReadSpeed(drive, drive.readCapabilities(), s, options);
+    };
+    {
+        FakeDrive fake = makeSpeedDisc();
+        cdr::RipOptions o;
+        const cdr::ReadSpeedSetup r = setup(fake, nullptr, true, o);
+        CHECK(r.logLines() == (std::vector<std::string>{
+                                  "Read speed: max 48x (8467 kB/s), current 24x; disc performance 16x-40x",
+                                  "Slowdown on read errors: 8x, 4x"}));
+        CHECK_EQ(o.speedKBps, 0xFFFF);
+        CHECK_EQ(o.currentSpeedKBps, 4234u);
+        CHECK(o.slowdown);
+        CHECK_EQ(fake.setSpeedCommands, 0);
+    }
+    {
+        FakeDrive fake = makeSpeedDisc();
+        cdr::RipOptions o;
+        const cdr::ReadSpeedSetup r = setup(fake, "8", true, o);
+        CHECK(r.logLines() == (std::vector<std::string>{
+                                  "Read speed: max 48x (8467 kB/s), current 24x; disc performance 16x-40x",
+                                  "Read speed set to 8x (drive reports 8x)", "Slowdown on read errors: 4x"}));
+        CHECK_EQ(o.speedKBps, 1412);
+        CHECK_EQ(o.currentSpeedKBps, 1412u);
+        CHECK(cdr::slowdownSteps(o) == std::vector<int>{4});
+    }
+    {
+        FakeDrive fake = makeSpeedDisc();
+        cdr::RipOptions o;
+        CHECK(setup(fake, "4", true, o).slowdownLine == "Slowdown on read errors: none below the current speed");
+        CHECK(cdr::slowdownSteps(o).empty());
+    }
+    {
+        FakeDrive fake = makeSpeedDisc();
+        fake.setSpeedMode = FakeDrive::SetSpeedMode::Reject;
+        cdr::RipOptions o;
+        const cdr::ReadSpeedSetup r = setup(fake, "8", true, o);
+        CHECK(r.slowdownLine == "Slowdown on read errors: not possible (the drive rejects SET CD SPEED)");
+        CHECK(!o.slowdown);
+        CHECK_EQ(o.speedKBps, 0xFFFF);
+    }
+    {
+        FakeDrive fake = makeSpeedDisc();
+        cdr::RipOptions o;
+        CHECK(setup(fake, nullptr, false, o).slowdownLine == "Slowdown on read errors: disabled");
+    }
+    // The steps: below the current speed, valid, descending.
+    cdr::RipOptions o;
+    o.slowdownSpeeds = {16, 8, 8, 0, 99, 12, 4};
+    CHECK(cdr::slowdownSteps(o) == (std::vector<int>{16, 8, 4}));
+    o.currentSpeedKBps = cdr::speedKBps(16);
+    CHECK(cdr::slowdownSteps(o) == (std::vector<int>{8, 4}));
+    o.speedKBps = cdr::speedKBps(10);
+    o.currentSpeedKBps = cdr::speedKBps(16);  // a CAV drive reports where it is: the lower one counts
+    CHECK(cdr::slowdownSteps(o) == (std::vector<int>{8, 4}));
+    o.speedKBps = cdr::speedKBps(8);
+    CHECK(cdr::slowdownSteps(o) == (std::vector<int>{4}));
+}
+
+TEST(speed_measured_with_fake_clock) {
+    CHECK(cdr::formatMeasuredSpeed(750, 10000000) == "1.0x (176 kB/s)");
+    CHECK(cdr::formatMeasuredSpeed(150, 0).empty());
+    CHECK(cdr::averageSpeedLogLine(75 * 60 * 24, 60000000, 3) ==
+          "Average read speed: 24.0x (4234 kB/s), 3 track(s) in 1:00");
+    CHECK(cdr::averageSpeedLogLine(1, 0, 1).empty());
+
+    FakeDrive fake = makeSpeedDisc();
+    fake.commandMicros = 0;
+    fake.accessMicros = 0;
+    fake.readSpeedKBps = 1412;  // 8x: 1665 us per sector
+    const uint64_t before = fake.simulatedMicros;
+    const SpeedRip r = ripSpeed(fake, 2, cdr::RipOptions{}, &fake);
+    CHECK_EQ(r.result.readMicros, fake.simulatedMicros - before);
+    CHECK_EQ(r.result.readMicros, uint64_t(150) * 1665);
+    CHECK(cdr::formatMeasuredSpeed(r.result.sectors, r.result.readMicros) == "8.0x (1413 kB/s)");
+    const std::vector<std::string> lines = cdr::trackRipLogLines("02.wav", r.result);
+    CHECK_EQ(lines.size(), size_t(2));
+    CHECK(lines[1] == "  Read speed: 8.0x (1413 kB/s)");
+
+    // Slower drive, slower measurement; without a clock nothing is measured.
+    FakeDrive slow = makeSpeedDisc();
+    slow.commandMicros = 0;
+    slow.accessMicros = 0;
+    slow.readSpeedKBps = 706;
+    CHECK(cdr::formatMeasuredSpeed(150, ripSpeed(slow, 2, cdr::RipOptions{}, &slow).result.readMicros) ==
+          "4.0x (706 kB/s)");
+    const SpeedRip untimed = ripSpeed(slow, 2, cdr::RipOptions{});
+    CHECK_EQ(untimed.result.readMicros, 0u);
+    CHECK_EQ(cdr::trackRipLogLines("02.wav", untimed.result).size(), size_t(1));
+}
+
+// A sector that only reads at 8x or slower: re-read at 8x, then back to max.
+TEST(slowdown_recovers_unreadable_sector) {
+    FakeDrive fake = makeSpeedDisc();
+    fake.readSpeedKBps = k48x;
+    fake.speedFaults[310] = {1412, false};
+    const SpeedRip r = ripSpeed(fake, 2, slowdownOptions());
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK(r.result.clean());
+    CHECK(r.result.slowdown);
+    CHECK(r.slowdownActive);
+    CHECK_EQ(r.result.slowdownRecovered.size(), size_t(1));
+    CHECK_EQ(r.result.slowdownRecovered.at(8), 1u);
+    CHECK_EQ(r.result.slowdownFailed, 0u);
+    CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{1412, 0xFFFF}));
+    CHECK_EQ(fake.readSpeedKBps, k48x);  // restored
+    // 8x right before the successful re-read of 310, max right after the
+    // block, before the next one.
+    const std::vector<FakeDrive::Command>& log = fake.commandLog;
+    size_t slow = 0;
+    while (log[slow].opcode != 0xBB) ++slow;
+    CHECK(log[slow + 1].opcode == 0xBE && log[slow + 1].lba == 310 && log[slow + 1].count == 1);
+    CHECK(log[slow + 2].opcode == 0xBE && log[slow + 2].lba == 311);
+    size_t restore = slow + 1;
+    while (log[restore].opcode != 0xBB) ++restore;
+    CHECK(log[restore - 1].lba == 325);
+    CHECK(log[restore + 1].opcode == 0xBE && log[restore + 1].lba == 326);
+    CHECK(cdr::slowdownLogLines(r.result) == std::vector<std::string>{"  Slowdown: 1 sector(s) re-read at 8x"});
+    const std::vector<std::string> lines = cdr::trackRipLogLines("02.wav", r.result);
+    CHECK(lines.back() == "  Slowdown: 1 sector(s) re-read at 8x");
+}
+
+TEST(slowdown_steps_down_to_4x) {
+    FakeDrive fake = makeSpeedDisc();
+    fake.speedFaults[310] = {706, false};  // 4x only
+    fake.speedFaults[340] = {1412, false};
+    fake.speedFaults[345] = {1412, false};  // same block: already slow enough
+    const SpeedRip r = ripSpeed(fake, 2, slowdownOptions());
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK(r.result.clean());
+    CHECK_EQ(r.result.slowdownRecovered.at(8), 1u);
+    CHECK_EQ(r.result.slowdownRecovered.at(4), 1u);
+    CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{1412, 706, 0xFFFF, 1412, 0xFFFF}));
+    CHECK(cdr::slowdownLogLines(r.result) ==
+          std::vector<std::string>{"  Slowdown: 1 sector(s) re-read at 8x, 1 at 4x"});
+}
+
+TEST(slowdown_resolves_c2_errors) {
+    FakeDrive fake = makeSpeedDisc();
+    fake.c2Supported = true;
+    fake.speedFaults[310] = {1412, true};  // C2 errors faster than 8x
+    cdr::RipOptions o = slowdownOptions(3);
+    o.useC2 = true;
+    const SpeedRip r = ripSpeed(fake, 2, o);
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK(r.result.clean());
+    CHECK_EQ(r.result.c2ErrorSectors, 1u);
+    CHECK_EQ(r.result.c2Rereads, 4u);  // 3 at max, 1 at 8x
+    CHECK_EQ(r.result.c2Recovered, 1u);
+    CHECK_EQ(r.result.c2Unresolved, 0u);
+    CHECK(r.result.suspiciousSectors.empty());
+    CHECK_EQ(r.result.slowdownRecovered.at(8), 1u);
+    CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{1412, 0xFFFF}));
+
+    // Only right at 4x: 8x gets two re-reads, 4x resolves it.
+    FakeDrive four = makeSpeedDisc();
+    four.c2Supported = true;
+    four.speedFaults[310] = {706, true};
+    const SpeedRip f = ripSpeed(four, 2, o);
+    CHECK(f.bytes == expectedTrackData(300, 150));
+    CHECK_EQ(f.result.c2Rereads, 6u);  // 3 at max, 2 at 8x, 1 at 4x
+    CHECK(f.result.slowdownRecovered == (std::map<int, uint32_t>{{4, 1}}));
+    CHECK(speedRequests(four.commandLog) == (std::vector<uint32_t>{1412, 706, 0xFFFF}));
+}
+
+TEST(slowdown_unrecoverable_sector_restores_speed) {
+    FakeDrive fake = makeSpeedDisc();
+    fake.failuresBySector[310] = -1;
+    const SpeedRip r = ripSpeed(fake, 2, slowdownOptions());
+    CHECK_EQ(r.result.unreadableSectors, 1u);
+    CHECK(r.result.slowdownRecovered.empty());
+    CHECK_EQ(r.result.slowdownFailed, 1u);
+    CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{1412, 706, 0xFFFF}));
+    CHECK_EQ(fake.readSpeedKBps, k48x);
+    CHECK(cdr::slowdownLogLines(r.result) ==
+          std::vector<std::string>{"  Slowdown: 1 sector(s) not recovered at lower speeds"});
+    // 2 attempts per speed (retries capped at 1).
+    int reads = 0;
+    for (const FakeDrive::Command& c : fake.commandLog) reads += c.opcode == 0xBE && c.lba == 310 && c.count == 1;
+    CHECK_EQ(reads, 3 + 2 + 2);
+
+    // Unresolved C2 errors at every speed: suspicious, counted as not recovered.
+    FakeDrive c2 = makeSpeedDisc();
+    c2.c2Supported = true;
+    c2.c2Faults[310] = FakeDrive::C2Fault{};
+    cdr::RipOptions o = slowdownOptions(3);
+    o.useC2 = true;
+    const SpeedRip u = ripSpeed(c2, 2, o);
+    CHECK_EQ(u.result.c2Unresolved, 1u);
+    CHECK_EQ(u.result.slowdownFailed, 1u);
+    CHECK(!u.result.suspiciousSectors.empty());
+    CHECK(speedRequests(c2.commandLog) == (std::vector<uint32_t>{1412, 706, 0xFFFF}));
+    CHECK(cdr::slowdownLogLines(u.result) ==
+          std::vector<std::string>{"  Slowdown: 1 sector(s) not recovered at lower speeds"});
+}
+
+// After --speed 8: only 4x is slower, and the ripper returns to 8x.
+TEST(slowdown_skips_speeds_at_or_above_current) {
+    FakeDrive fake = makeSpeedDisc();
+    fake.readSpeedKBps = 1412;
+    fake.speedFaults[310] = {706, false};
+    fake.speedFaults[400] = {706, false};
+    cdr::RipOptions o = slowdownOptions();
+    o.speedKBps = 1412;
+    o.currentSpeedKBps = 1412;
+    const SpeedRip r = ripSpeed(fake, 2, o);
+    CHECK(r.bytes == expectedTrackData(300, 150));
+    CHECK(speedRequests(fake.commandLog) == (std::vector<uint32_t>{706, 1412, 706, 1412}));
+    CHECK_EQ(fake.readSpeedKBps, 1412);
+    CHECK(r.result.slowdownRecovered == (std::map<int, uint32_t>{{4, 2}}));
+    CHECK(cdr::slowdownLogLines(r.result) == std::vector<std::string>{"  Slowdown: 2 sector(s) re-read at 4x"});
+
+    // Already at 4x: nothing to slow down to, no command.
+    FakeDrive four = makeSpeedDisc();
+    four.failuresBySector[310] = -1;
+    o.speedKBps = 706;
+    o.currentSpeedKBps = 706;
+    const SpeedRip f = ripSpeed(four, 2, o);
+    CHECK_EQ(four.setSpeedCommands, 0);
+    CHECK_EQ(f.result.unreadableSectors, 1u);
+    CHECK(cdr::slowdownLogLines(f.result).empty());
+}
+
+// A drive that rejects SET CD SPEED: slowdown is given up for the rest of the disc.
+TEST(slowdown_rejected_by_drive_is_given_up) {
+    FakeDrive fake = makeSpeedDisc();
+    fake.setSpeedMode = FakeDrive::SetSpeedMode::Reject;
+    fake.failuresBySector[310] = -1;
+    fake.failuresBySector[340] = -1;
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    cdr::Ripper ripper(drive, toc, slowdownOptions());
+    auto sink = [](const uint8_t*, size_t) {};
+    const cdr::TrackRipResult a = ripper.ripTrack(*toc.findTrack(2), sink);
+    CHECK_EQ(fake.setSpeedCommands, 1);
+    CHECK(!ripper.slowdownActive());
+    CHECK_EQ(a.unreadableSectors, 2u);
+    CHECK(a.slowdown);
+    CHECK_EQ(a.slowdownFailed, 0u);
+    CHECK(a.slowdownFallback.find("SET CD SPEED to 8x failed at LBA 310 (SCSI status 0x02, sense ILLEGAL REQUEST") ==
+          0);
+    CHECK(a.slowdownFallback == ripper.slowdownFallbackReason());
+    CHECK(cdr::slowdownLogLines(a) == std::vector<std::string>{"  Slowdown given up: " + a.slowdownFallback});
+    fake.failuresBySector[460] = -1;
+    const cdr::TrackRipResult b = ripper.ripTrack(*toc.findTrack(3), sink);
+    CHECK_EQ(fake.setSpeedCommands, 1);
+    CHECK(!b.slowdown);
+    CHECK(b.slowdownFallback.empty());
+    CHECK(cdr::slowdownLogLines(b).empty());
+
+    // A drive that ignores it: tried, nothing helps, still restored.
+    FakeDrive ignoring = makeSpeedDisc();
+    ignoring.setSpeedMode = FakeDrive::SetSpeedMode::Ignore;
+    ignoring.speedFaults[310] = {1412, false};
+    const SpeedRip r = ripSpeed(ignoring, 2, slowdownOptions());
+    CHECK_EQ(r.result.unreadableSectors, 1u);
+    CHECK_EQ(r.result.slowdownFailed, 1u);
+    CHECK(r.slowdownActive);
+    CHECK(speedRequests(ignoring.commandLog) == (std::vector<uint32_t>{1412, 706, 0xFFFF}));
+}
+
+// Without slowdown, or on a clean disc, the commands are those of a rip
+// before #49: no SET CD SPEED at all.
+TEST(slowdown_disabled_keeps_the_command_sequence) {
+    auto setup = [](FakeDrive& fake) {
+        fake.c2Supported = true;
+        fake.failuresBySector[310] = -1;
+        fake.failuresBySector[320] = 2;
+        fake.c2Faults[400] = FakeDrive::C2Fault{};
+        fake.speedFaults[420] = {1412, false};
+    };
+    for (bool verify : {false, true}) {
+        cdr::RipOptions base;
+        base.maxRetries = 3;
+        base.verify = verify;
+        base.useC2 = true;
+        FakeDrive reference = makeSpeedDisc();
+        setup(reference);
+        cdr::RipOptions noSteps = base;
+        noSteps.slowdown = true;
+        noSteps.slowdownSpeeds.clear();  // enabled, but nothing to slow down to
+        const SpeedRip ref = ripSpeed(reference, 2, noSteps);
+
+        FakeDrive off = makeSpeedDisc();
+        setup(off);
+        const SpeedRip a = ripSpeed(off, 2, base);
+        CHECK(off.commandLog == reference.commandLog);
+        CHECK(a.bytes == ref.bytes);
+        CHECK_EQ(a.result.crc32, ref.result.crc32);
+        CHECK(a.result.unreadableSectors >= 2u);
+        CHECK_EQ(off.setSpeedCommands, 0);
+        CHECK(!a.result.slowdown);
+        CHECK(cdr::slowdownLogLines(a.result).empty());
+
+        FakeDrive on = makeSpeedDisc();
+        setup(on);
+        cdr::RipOptions slow = base;
+        slow.slowdown = true;
+        const SpeedRip b = ripSpeed(on, 2, slow);
+        CHECK(on.setSpeedCommands > 0);
+        CHECK_EQ(b.result.unreadableSectors, a.result.unreadableSectors - 1);  // 420 recovered at 8x
+        CHECK_EQ(b.result.slowdownRecovered.at(8), 1u);
+
+        // Clean disc: identical commands with and without slowdown.
+        FakeDrive clean1 = makeSpeedDisc();
+        FakeDrive clean2 = makeSpeedDisc();
+        ripSpeed(clean1, 3, base);
+        ripSpeed(clean2, 3, slow);
+        CHECK(clean1.commandLog == clean2.commandLog);
+        CHECK_EQ(clean2.setSpeedCommands, 0);
     }
 }
 

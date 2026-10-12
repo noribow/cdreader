@@ -248,6 +248,11 @@ std::string RipSession::trackFileName(int number, const std::string& format) {
     return trackFileBaseName(trackMetadata(number)) + "." + writer->extension();
 }
 
+const DriveSpeedInfo& RipSession::readDriveSpeed() {
+    driveSpeed_ = cdr::readDriveSpeed(drive_);
+    return driveSpeed_;
+}
+
 void RipSession::beginRip(const RipSettings& settings) {
     if (!createAudioWriter(settings.format, settings.encoder))  // throws for invalid encoder settings
         throw std::invalid_argument("unknown format '" + settings.format + "'");
@@ -257,8 +262,9 @@ void RipSession::beginRip(const RipSettings& settings) {
     if (settings.options.maxRetries < 0) throw std::invalid_argument("negative retry count");
     settings_ = settings;
     // MODE SENSE on every rip: cheap, and the drive may have been swapped.
+    const DriveCapabilities page = drive_.readCapabilities();
     std::optional<DriveCapabilities> caps;
-    if (settings.useC2 || settings.cache != CacheSetting::None) caps = drive_.readCapabilities();
+    if (settings.useC2 || settings.cache != CacheSetting::None) caps = page;
     c2_ = caps ? checkC2(*caps, settings.useC2) : C2Availability{};
     settings_.options.useC2 = c2_.usable();
     c2Fallback_.clear();
@@ -274,6 +280,11 @@ void RipSession::beginRip(const RipSettings& settings) {
     settings_.options.cacheDefeat = cacheCheck_.method;
     settings_.options.flushSectors = cacheCheck_.flushSectors;
     cacheFallback_.clear();
+    // Read speed (#49): after the cache test, which reads at the drive's speed.
+    settings_.options.slowdown = settings.slowdown;
+    speedSetup_ = setUpReadSpeed(drive_, page, settings.speed, settings_.options);
+    driveSpeed_ = speedSetup_.info;
+    slowdownFallback_.clear();
     ripped_.clear();
     image_.reset();
     accurateRip_ = {};
@@ -302,6 +313,7 @@ const RippedTrack& RipSession::ripTrack(int number, const std::filesystem::path&
     writer->open(path, metadata);
     AccurateRipChecksum ar = AccurateRipChecksum::forTrack(t, *track);
     Ripper ripper(drive_, t, settings_.options);
+    ripper.setClock(*clock_);
     ripped.result = ripper.ripTrack(
         *track,
         [&](const uint8_t* pcm, size_t bytes) {
@@ -346,6 +358,11 @@ void RipSession::takeFallbacks(const Ripper& ripper, const TrackRipResult& resul
         settings_.options.cacheDefeat = ripper.cacheDefeat();
         cacheFallback_ = ripper.cacheFallbackReason();
     }
+    if (result.slowdown && !ripper.slowdownActive() && settings_.options.slowdown) {
+        // The drive rejected SET CD SPEED: no slowdown for the rest of the rip.
+        settings_.options.slowdown = false;
+        slowdownFallback_ = ripper.slowdownFallbackReason();
+    }
 }
 
 DiscImagePlan RipSession::planImage(const std::vector<int>& numbers, const std::string& format) {
@@ -388,6 +405,7 @@ const RippedImage& RipSession::ripImage(const std::vector<int>& tracks, const st
         Crc32 crc;
         uint32_t base = 0;  // sectors of the parts before this one
         Ripper ripper(drive_, t, settings_.options);
+        ripper.setClock(*clock_);
         for (const Track& part : plan.parts) {
             const bool htoa = part.number == 0;
             RippedTrack ripped;
@@ -492,6 +510,7 @@ std::string RipSession::ripLog() {
         << "Drive: " << driveName() << "\n"
         << c2_.logLine() << "\n";
     for (const std::string& l : cacheCheck_.logLines()) log << l << "\n";
+    for (const std::string& l : speedSetup_.logLines()) log << l << "\n";
     log << "Mode: " << (options.verify ? "verify (double read)" : "burst") << ", retries " << options.maxRetries
         << "\n"
         << readOffsetLogLine(options.readOffsetSamples, settings_.offsetSource) << "\n";
@@ -553,6 +572,18 @@ std::string RipSession::ripLog() {
     for (const RippedTrack& r : ripped_)
         for (const std::string& l : trackRipLogLines(r.fileName, r.result)) log << l << "\n";
     if (image_) log << discImageCrcLogLine(image_->plan.fileName, image_->crc32) << "\n";
+    // Measured read speed over the ripped tracks (#49).
+    uint64_t sectors = 0, micros = 0;
+    size_t timed = 0;
+    auto add = [&](const TrackRipResult& r) {
+        if (!r.readMicros) return;
+        sectors += r.sectors;
+        micros += r.readMicros;
+        ++timed;
+    };
+    if (image_ && image_->htoa) add(image_->htoa->result);
+    for (const RippedTrack& r : ripped_) add(r.result);
+    if (micros) log << averageSpeedLogLine(sectors, micros, timed) << "\n";
 
     if (accurateRipChecked_) {
         log << "\n";

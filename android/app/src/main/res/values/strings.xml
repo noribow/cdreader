@@ -13,6 +13,7 @@
     <string name="advanced_collapsed">▶ 詳細設定</string>
     <string name="advanced_expanded">▼ 詳細設定</string>
     <string name="use_c2">C2 エラーポインタを使う (対応ドライブのみ)</string>
+    <string name="slowdown">読み取りエラー時に速度を落として読み直す</string>
     <string name="cache_mode">キャッシュ対策</string>
     <!-- Order = NativeCd CacheMode (auto, FUA, flush, none). -->
     <string-array name="cache_modes">

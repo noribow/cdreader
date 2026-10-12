@@ -134,6 +134,14 @@
                 android:checked="true"
                 android:text="@string/use_c2" />
 
+            <!-- Slowdown on read errors (#49). -->
+            <CheckBox
+                android:id="@+id/checkSlowdown"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:text="@string/slowdown" />
+
             <!-- Drive cache defeat before re-reads (#34): 自動 / FUA / 追い出し / なし. -->
             <LinearLayout
                 android:layout_width="match_parent"
