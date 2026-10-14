@@ -107,6 +107,11 @@ public:
     // the fake drive's simulated time. `clock` must outlive the session.
     void setClock(Clock& clock) { clock_ = &clock; }
 
+    // What the drive is reading (#52), for the progress display: passed to
+    // the rippers of ripTrack(), ripImage() and rereadTrack() (see
+    // Ripper::setReadObserver()). Empty: none. Exceptions propagate.
+    void setReadObserver(Ripper::ReadObserver observer) { readObserver_ = std::move(observer); }
+
     // INQUIRY strings / display name (cached after the first call).
     const DriveInfo& driveInfo();
     const std::string& driveName();
@@ -287,6 +292,7 @@ private:
     C2Availability c2_;
     std::string c2Fallback_;
     Clock* clock_ = &steadyClock();
+    Ripper::ReadObserver readObserver_;
     DriveCacheCheck cacheCheck_;
     std::optional<DriveCacheCheck> detectedCache_;  // Auto: the timing test of this disc
     std::string cacheFallback_;

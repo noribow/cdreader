@@ -402,6 +402,45 @@ Slowdown on read errors: 8x, 4x
 
 注意: 速度の扱いはドライブ依存です (指定を無視する、近い速度に丸める、現在の速度を報告しないドライブがあります)。実機での動作確認はこれからです。
 
+### 読み取り中の LBA と問題のあった位置
+
+([#52](https://github.com/noribow/cdreader/issues/52))
+
+トラックの終わり (99% 付近) で遅くなる・止まるように見えるとき、ドライブがどこを・どう読んでいるかを確かめられるように、
+リッピング中の進捗表示に**いま読んでいる LBA** と読み取りの種類を出します (Windows 版は進捗の行、Android 版は進捗バーの下):
+
+```
+Track 05 [04:12.33]   99%  23.8x  LBA 78500-78525  retry 3 at 4x
+```
+
+| 表示 | 意味 |
+| --- | --- |
+| `read` | 通常の読み取り (最大 26 セクタ) |
+| `verify read` | `--verify` の 2 回目の読み取り |
+| `retry N` | 失敗したブロックの N 回目のリトライ |
+| `sector by sector` / `sector by sector, retry N` | リトライでも読めなかったブロックのセクタ単位の読み直し |
+| `C2 re-read N` | C2 エラーのあったセクタの N 回目の再読込 |
+| `cache flush` | 再読込の前のキャッシュ追い出しの読み取り (`--cache flush`) |
+| `at 8x` | エラー時の減速で速度を落としている |
+
+種類が変わったとき (リトライが始まった、など) はすぐに、それ以外は 0.2 秒ごと (Android 版は 0.1 秒ごと) に表示を更新するので、
+読み取りが止まっている間はその LBA が表示されたままになります。
+
+`rip.log` には、トラックごとにリトライ・C2 の再読込・読めなかったセクタの LBA の範囲を記録します (隣り合う範囲はまとめ、
+それぞれ 20 行まで。残りは `... and N more ...` の 1 行)。トラック内の位置 (トラック先頭からの時間) のほか、
+読み取りオフセット補正のためにトラックの外 (前後のトラック) を読んだ部分は `before the track start (read offset)` /
+`after the track end (read offset)`、オーディオ領域の最後 (リードアウトまたはデータトラックの直前) まで続く範囲は
+`up to the end of the audio area` と書くので、トラックの終わり・次のトラックへのはみ出し・リードアウト直前のどれで問題が起きたか分かります
+(リードアウトそのものは読まず、無音で埋めます)。
+
+```
+05 - Song.flac  CRC32 0A1B2C3D  retries 6  1 unreadable sector(s)
+  Slowdown: 1 sector(s) not recovered at lower speeds
+  Retried: LBA 78500-78525 at 4:31, 6 retries, sector by sector, slowed down to 4x
+  C2 re-read: LBA 78530 at 4:31, 3 re-reads
+  Unreadable: LBA 78512 at 4:31, slowed down to 4x
+```
+
 ### FLAC 出力
 
 `--format flac` を指定すると、各トラックを FLAC (可逆圧縮、[RFC 9639](https://www.rfc-editor.org/rfc/rfc9639)) で保存します。

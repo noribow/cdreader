@@ -40,6 +40,8 @@ import java.io.IOException
 import java.util.concurrent.CancellationException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Single screen: connect to a USB CD drive, show its TOC (with titles from
@@ -51,6 +53,8 @@ import java.util.concurrent.Executors
 class MainActivity : Activity() {
     private companion object {
         const val ACTION_USB_PERMISSION = "io.github.noribow.cdreader.USB_PERMISSION"
+        // At most this late on screen: the read the drive is doing (#52).
+        const val ACTIVITY_DELAY_MS = 100L
         const val REQUEST_FOLDER = 1
         const val PREFS = "settings"
         const val PREF_FOLDER = "outputTree"
@@ -97,6 +101,7 @@ class MainActivity : Activity() {
     private lateinit var textDisc: TextView
     private lateinit var textFolder: TextView
     private lateinit var textStatus: TextView
+    private lateinit var textActivity: TextView
     private lateinit var textResults: TextView
     private lateinit var listTracks: ListView
     private lateinit var spinnerMatch: Spinner
@@ -144,6 +149,22 @@ class MainActivity : Activity() {
     @Volatile private var cddbEmail = ""
     // Set on the UI thread; stops a rip between tracks, even before it reached native code.
     @Volatile private var cancelRequested = false
+
+    // What the drive reads (#52). The ripping thread calls the listener before
+    // every read command; the UI shows the latest text at most every
+    // ACTIVITY_DELAY_MS (one update pending at a time), so a read that
+    // stalls is on screen while it lasts.
+    private val activityText = AtomicReference<String?>(null)
+    private val activityPosted = AtomicBoolean(false)
+    private val showActivity = Runnable {
+        activityPosted.set(false)
+        val text = activityText.get() ?: return@Runnable  // the rip has ended
+        textActivity.text = getString(R.string.read_activity, text)
+    }
+    private val readActivity = ReadActivityListener { _, text ->
+        activityText.set(text)
+        if (activityPosted.compareAndSet(false, true)) textActivity.postDelayed(showActivity, ACTIVITY_DELAY_MS)
+    }
 
     // UI thread state.
     private var driveName = ""
@@ -197,6 +218,7 @@ class MainActivity : Activity() {
         textDisc = findViewById(R.id.textDisc)
         textFolder = findViewById(R.id.textFolder)
         textStatus = findViewById(R.id.textStatus)
+        textActivity = findViewById(R.id.textActivity)
         textResults = findViewById(R.id.textResults)
         listTracks = findViewById(R.id.listTracks)
         spinnerMatch = findViewById(R.id.spinnerMatch)
@@ -597,6 +619,9 @@ class MainActivity : Activity() {
         buttonRip.isEnabled = true
         buttonRip.text = getString(R.string.cancel)
         progress.progress = 0
+        activityText.set(null)
+        textActivity.text = ""
+        textActivity.visibility = View.VISIBLE
         textResults.text = ""
         textResults.visibility = View.GONE
 
@@ -631,7 +656,7 @@ class MainActivity : Activity() {
                         if (cancelRequested) throw CancellationException()
                         val label = "トラック ${track.number} (${index + 1}/${selected.size})"
                         runOnUiThread { setStatus("$label を読み取り中…") }
-                        val r = s.ripTrack(track.number, temp.path) { done, total ->
+                        val r = s.ripTrack(track.number, temp.path, readActivity) { done, total ->
                             val permille = if (total > 0) (1000L * done / total).toInt() else 0
                             runOnUiThread {
                                 progress.progress = permille
@@ -680,6 +705,9 @@ class MainActivity : Activity() {
     private fun finishRip(message: String, results: String?, suggestDetection: Boolean) {
         runOnUiThread {
             ripping = false
+            activityText.set(null)
+            textActivity.text = ""
+            textActivity.visibility = View.GONE
             buttonRip.text = getString(R.string.rip)
             setBusy(false)
             setStatus(message)
@@ -708,7 +736,7 @@ class MainActivity : Activity() {
                 val label = "トラック $number を低速で読み直しています (AccurateRip 不一致)"
                 runOnUiThread { setStatus("$label…") }
                 val r = try {
-                    s.rereadTrack(number, temp.path) { done, total ->
+                    s.rereadTrack(number, temp.path, readActivity) { done, total ->
                         val permille = if (total > 0) (1000L * done / total).toInt() else 0
                         runOnUiThread {
                             progress.progress = permille
@@ -823,7 +851,7 @@ class MainActivity : Activity() {
         tempCue: File,
     ): Pair<Uri, ImageResult> {
         runOnUiThread { setStatus("${image.imageFile} を読み取り中…") }
-        val r = s.ripImage(selected.map { it.number }, temp.path, tempCue.path) { track, done, total ->
+        val r = s.ripImage(selected.map { it.number }, temp.path, tempCue.path, readActivity) { track, done, total ->
             val permille = if (total > 0) (1000L * done / total).toInt() else 0
             val part = if (track == 0) "隠しトラック (HTOA)" else "トラック $track"
             runOnUiThread {

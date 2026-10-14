@@ -51,6 +51,42 @@ struct JavaExceptionPending {};
 
 Session* session(jlong handle) { return reinterpret_cast<Session*>(static_cast<intptr_t>(handle)); }
 
+// What the drive is reading (#52): ReadActivityListener.onActivity(lba, text)
+// of `listener` (may be null) as the session's read observer for one rip
+// call, with the text of cdr::formatReadActivity(). An exception the
+// listener throws stays pending (no further calls) until the progress
+// callback, which unwinds the rip at the end of the block.
+class ScopedReadActivity {
+public:
+    ScopedReadActivity(cdr::RipSession& rip, JNIEnv* env, jobject listener) : rip_(rip) {
+        if (listener == nullptr) return;
+        jclass cls = env->GetObjectClass(listener);
+        jmethodID method = env->GetMethodID(cls, "onActivity", "(ILjava/lang/String;)V");
+        env->DeleteLocalRef(cls);
+        if (method == nullptr) {
+            failed_ = true;  // NoSuchMethodError pending
+            return;
+        }
+        rip_.setReadObserver([env, listener, method](const cdr::ReadActivity& a) {
+            if (env->ExceptionCheck()) return;
+            jstring text = env->NewStringUTF(cdr::formatReadActivity(a).c_str());
+            if (text == nullptr) return;  // OutOfMemoryError pending
+            env->CallVoidMethod(listener, method, jint(a.lba), text);
+            // Called for every block: free the local reference right away.
+            env->DeleteLocalRef(text);
+        });
+    }
+    ~ScopedReadActivity() { rip_.setReadObserver({}); }
+    ScopedReadActivity(const ScopedReadActivity&) = delete;
+    ScopedReadActivity& operator=(const ScopedReadActivity&) = delete;
+
+    bool failed() const { return failed_; }
+
+private:
+    cdr::RipSession& rip_;
+    bool failed_ = false;
+};
+
 void throwJava(JNIEnv* env, const char* className, const std::string& message) {
     if (env->ExceptionCheck()) return;  // keep the first exception
     jclass cls = env->FindClass(className);
@@ -549,7 +585,9 @@ JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(
 }
 
 // Rips one track to a local file at `path` (in the format given to
-// nativeBeginRip), calling listener.onProgress(done, total) in sectors.
+// nativeBeginRip), calling listener.onProgress(done, total) in sectors and
+// activity.onActivity(lba, text) before every read command (#52; see
+// ScopedReadActivity).
 // Returns [sectors, unreadableSectors, retries, paddedSamples, crc32,
 // accurateRipV1, accurateRipV2, c2 (1: read with C2 pointers), C2 error
 // sectors, C2 re-reads, unresolved C2 sectors, suspicious sectors, cache
@@ -558,7 +596,8 @@ JNIEXPORT void JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeBeginRip(
 // IOException on errors; the partial file is left for the caller to delete.
 JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTrack(JNIEnv* env, jclass,
                                                                                     jlong handle, jint trackNumber,
-                                                                                    jstring path, jobject listener) {
+                                                                                    jstring path, jobject listener,
+                                                                                    jobject activity) {
     Session& s = *session(handle);
     std::string outputPath;
     if (!fromJava(env, path, outputPath)) return nullptr;
@@ -570,13 +609,18 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipTr
         if (onProgress == nullptr) return nullptr;  // NoSuchMethodError pending
     }
 
+    ScopedReadActivity reads(s.rip, env, activity);
+    if (reads.failed()) return nullptr;  // NoSuchMethodError pending
+
     try {
         const cdr::RippedTrack& r =
             s.rip.ripTrack(trackNumber, std::filesystem::u8path(outputPath), [&](uint32_t done, uint32_t total) {
+                if (env->ExceptionCheck()) throw JavaExceptionPending{};  // from onActivity
                 if (onProgress == nullptr) return;
                 env->CallVoidMethod(listener, onProgress, jint(done), jint(total));
                 if (env->ExceptionCheck()) throw JavaExceptionPending{};
             });
+        if (env->ExceptionCheck()) return nullptr;
         std::vector<jint> v;
         appendTrackResult(v, r);
         return toJavaArray(env, v);
@@ -620,7 +664,8 @@ JNIEXPORT jobjectArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeIm
 // in the format given to nativeBeginRip, with the CUE sheet embedded where
 // the format can carry it, and writes the CUE sheet to `cuePath` (empty: not
 // written). Calls listener.onProgress(track, done, total) with the part
-// being read (0: the HTOA) and the sectors of the whole image. Returns
+// being read (0: the HTOA) and the sectors of the whole image, and
+// activity.onActivity(lba, text) as nativeRipTrack. Returns
 // [image CRC32, flags (1: CUE sheet embedded, 2: HTOA included), parts N,
 // then per part: track number (0: the HTOA) and the 13 values of
 // nativeRipTrack]. Throws java.util.concurrent.CancellationException after
@@ -630,7 +675,8 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipIm
                                                                                     jlong handle, jintArray tracks,
                                                                                     jstring imagePath,
                                                                                     jstring cuePath,
-                                                                                    jobject listener) {
+                                                                                    jobject listener,
+                                                                                    jobject activity) {
     Session& s = *session(handle);
     std::vector<int> numbers;
     std::string image, cue;
@@ -644,14 +690,19 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRipIm
         if (onProgress == nullptr) return nullptr;  // NoSuchMethodError pending
     }
 
+    ScopedReadActivity reads(s.rip, env, activity);
+    if (reads.failed()) return nullptr;  // NoSuchMethodError pending
+
     try {
         const cdr::RippedImage& r = s.rip.ripImage(
             numbers, std::filesystem::u8path(image), cue.empty() ? std::filesystem::path() : std::filesystem::u8path(cue),
             [&](int track, uint32_t done, uint32_t total) {
+                if (env->ExceptionCheck()) throw JavaExceptionPending{};  // from onActivity
                 if (onProgress == nullptr) return;
                 env->CallVoidMethod(listener, onProgress, jint(track), jint(done), jint(total));
                 if (env->ExceptionCheck()) throw JavaExceptionPending{};
             });
+        if (env->ExceptionCheck()) return nullptr;
         const std::vector<cdr::RippedTrack>& ripped = s.rip.rippedTracks();
         std::vector<jint> v = {jint(r.crc32), (r.embeddedCueSheet ? 1 : 0) | (r.plan.withHtoa ? 2 : 0),
                                jint(ripped.size() + (r.htoa ? 1 : 0))};
@@ -836,7 +887,8 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRerea
 }
 
 // Re-reads one of those tracks into a new local file at `path`, calling
-// listener.onProgress(done, total). Returns [outcome (0 accurate: the file
+// listener.onProgress(done, total) and activity.onActivity(lba, text) as
+// nativeRipTrack. Returns [outcome (0 accurate: the file
 // at `path` replaces the track's file, 1 same data, 2 different data,
 // 3 failed; the file is deleted unless accurate), speed (x, 0: the speed of
 // the rip), CRC32 of the re-read, CRC32 of the first read]. Throws
@@ -844,7 +896,8 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRerea
 // track that is not to be re-read, IOException on errors.
 JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRereadTrack(JNIEnv* env, jclass,
                                                                                        jlong handle, jint trackNumber,
-                                                                                       jstring path, jobject listener) {
+                                                                                       jstring path, jobject listener,
+                                                                                       jobject activity) {
     Session& s = *session(handle);
     std::string outputPath;
     if (!fromJava(env, path, outputPath)) return nullptr;
@@ -854,13 +907,17 @@ JNIEXPORT jintArray JNICALL Java_io_github_noribow_cdreader_NativeCd_nativeRerea
         onProgress = env->GetMethodID(cls, "onProgress", "(II)V");
         if (onProgress == nullptr) return nullptr;  // NoSuchMethodError pending
     }
+    ScopedReadActivity reads(s.rip, env, activity);
+    if (reads.failed()) return nullptr;  // NoSuchMethodError pending
     try {
         const cdr::TrackReread& r =
             s.rip.rereadTrack(trackNumber, std::filesystem::u8path(outputPath), [&](uint32_t done, uint32_t total) {
+                if (env->ExceptionCheck()) throw JavaExceptionPending{};  // from onActivity
                 if (onProgress == nullptr) return;
                 env->CallVoidMethod(listener, onProgress, jint(done), jint(total));
                 if (env->ExceptionCheck()) throw JavaExceptionPending{};
             });
+        if (env->ExceptionCheck()) return nullptr;
         using Outcome = cdr::TrackReread::Outcome;
         const jint outcome = r.outcome == Outcome::Accurate        ? 0
                              : r.outcome == Outcome::SameData      ? 1

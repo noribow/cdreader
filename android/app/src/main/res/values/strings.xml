@@ -52,4 +52,6 @@
     <string name="no_folder">保存先が未選択です</string>
     <string name="permission_denied">USB へのアクセスが許可されませんでした</string>
     <string name="disconnected">ドライブが切断されました</string>
+    <!-- #52: what the drive is reading, e.g. "LBA 78512  retry 3 at 8x" -->
+    <string name="read_activity">読み取り位置: %1$s</string>
 </resources>

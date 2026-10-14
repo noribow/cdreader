@@ -7,6 +7,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
 #include <exception>
@@ -15,8 +16,10 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cdreader/accuraterip.h"
@@ -50,6 +53,101 @@ constexpr const char* kVersion = "0.1.0";
 struct UsageError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+// The progress line of a rip on the console ("\r..."): the head (track,
+// percent, speed) and what the drive is reading (#52), e.g. "Track 05
+// [04:12.33]   99%  24.3x  LBA 78500-78525  retry 3 at 8x". The read
+// changes with every block: a change of its kind (a retry, the
+// sector-by-sector fallback, ...) is shown at once, plain progress at most
+// every kRedrawMs by a ticker thread, so the read the drive is stuck on
+// stays visible while it lasts.
+class ProgressLine {
+public:
+    ProgressLine() : ticker_([this] { run(); }) {}
+    ~ProgressLine() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        ticker_.join();
+    }
+    ProgressLine(const ProgressLine&) = delete;
+    ProgressLine& operator=(const ProgressLine&) = delete;
+
+    void setHead(std::string head) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        head_ = std::move(head);
+        draw();
+    }
+    // The ripper's read observer.
+    void activity(const cdr::ReadActivity& a) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const bool changed = !hasActivity_ || a.kind != activity_.kind || a.attempt != activity_.attempt ||
+                             a.speedFactor != activity_.speedFactor;
+        activity_ = a;
+        hasActivity_ = true;
+        if (changed) draw();
+        else dirty_ = true;
+    }
+    cdr::Ripper::ReadObserver observer() {
+        return [this](const cdr::ReadActivity& a) { activity(a); };
+    }
+    // The head alone, the cursor after it (the caller appends the result).
+    void finish() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        hasActivity_ = false;
+        draw();
+    }
+    // An empty line, the cursor at its start.
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::printf("\r%*s\r", int(width_), "");
+        std::fflush(stdout);
+        width_ = 0;
+        head_.clear();
+        hasActivity_ = false;
+        dirty_ = false;
+    }
+
+private:
+    static constexpr int kRedrawMs = 200;
+    static constexpr size_t kMaxWidth = 79;  // no wrap in an 80 column console
+
+    void draw() {  // under mutex_
+        std::string line = head_;
+        if (hasActivity_) line += "  " + cdr::formatReadActivity(activity_);
+        if (line.size() > kMaxWidth) line.resize(kMaxWidth);
+        if (line.size() < width_) std::printf("\r%*s", int(width_), "");
+        std::printf("\r%s", line.c_str());
+        std::fflush(stdout);
+        width_ = line.size();
+        dirty_ = false;
+    }
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!stop_) {
+            wake_.wait_for(lock, std::chrono::milliseconds(kRedrawMs));
+            if (dirty_ && !stop_) draw();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::string head_;
+    cdr::ReadActivity activity_;
+    bool hasActivity_ = false;
+    bool dirty_ = false;
+    bool stop_ = false;
+    size_t width_ = 0;
+    std::thread ticker_;  // last: starts after the members above
+};
+
+// "24.3x" of formatMeasuredSpeed() ("24.3x (4286 kB/s)"), for the progress line.
+std::string shortSpeed(uint32_t sectors, uint64_t micros) {
+    const std::string s = cdr::formatMeasuredSpeed(sectors, micros);
+    return s.substr(0, s.find(' '));
+}
 
 std::string formatList() {
     std::string list;
@@ -655,14 +753,15 @@ struct ArTrack {
 };
 
 // "Track 02  re-reading at 4x   37%" on the console.
-cdr::Ripper::Progress rereadProgress(int track, int factor) {
+cdr::Ripper::Progress rereadProgress(ProgressLine& line, int track, int factor) {
     auto lastPercent = std::make_shared<int>(-1);
-    return [=](uint32_t done, uint32_t total) {
+    return [=, &line](uint32_t done, uint32_t total) {
         const int percent = total ? int(uint64_t(done) * 100 / total) : 100;
         if (percent == *lastPercent) return;
         *lastPercent = percent;
-        std::printf("\rTrack %02d  re-reading at %dx  %3d%%", track, factor, percent);
-        std::fflush(stdout);
+        char head[64];
+        std::snprintf(head, sizeof head, "Track %02d  re-reading at %dx  %3d%%", track, factor, percent);
+        line.setHead(head);
     };
 }
 
@@ -678,21 +777,24 @@ cdr::TrackReread rereadTrackFile(cdr::CdDrive& drive, const cdr::Toc& toc, const
     temp += ".reread";
     cdr::TrackReread rr;
     std::error_code ec;
+    ProgressLine line;
     try {
         std::unique_ptr<cdr::AudioWriter> writer = cdr::createAudioWriter(format, encoder);
         writer->open(temp, t.metadata);
         rr = cdr::rereadForAccurateRip(
             drive, toc, options, t.track, pressings, t.result.crc32,
             [&](const uint8_t* pcm, size_t bytes) { writer->write(pcm, bytes); },
-            rereadProgress(t.track.number, cdr::accurateRipRereadSpeed(options)), &cdr::steadyClock());
+            rereadProgress(line, t.track.number, cdr::accurateRipRereadSpeed(options)), &cdr::steadyClock(),
+            line.observer());
         writer->close();
-        std::printf("\r%-40s\r", "");
+        line.clear();
         if (rr.accurate()) {
             // Copy over the first read (rename does not replace on every runtime).
             fs::copy_file(temp, target, fs::copy_options::overwrite_existing);
             rr.replaced = true;
         }
     } catch (const std::exception& e) {
+        line.finish();
         std::printf("\n");
         rr = {};
         rr.track = t.track.number;
@@ -1054,6 +1156,8 @@ int cmdRip(const std::vector<std::string>& args) {
         int lastPercent = -1;
         // No AccurateRip checksums for the HTOA: the database has none.
         cdr::AccurateRipChecksum ar = cdr::AccurateRipChecksum::forTrack(toc, htoa ? selected.front() : t);
+        ProgressLine line;  // with the LBA being read (#52)
+        ripper.setReadObserver(line.observer());
         cdr::TrackRipResult r = ripper.ripTrack(
             t,
             [&](const uint8_t* pcm, size_t bytes) {
@@ -1064,12 +1168,16 @@ int cmdRip(const std::vector<std::string>& args) {
             [&](uint32_t done, uint32_t total) {
                 int percent = total ? int(uint64_t(done) * 100 / total) : 100;
                 if (percent != lastPercent) {
-                    std::printf("\rTrack %02d [%s]  %3d%%  %-18s", t.number, cdr::formatMsf(t.lengthSectors).c_str(),
-                                percent, cdr::formatMeasuredSpeed(done, ripper.trackReadMicros()).c_str());
-                    std::fflush(stdout);
+                    char head[64];
+                    std::snprintf(head, sizeof head, "Track %02d [%s]  %3d%%  %s", t.number,
+                                  cdr::formatMsf(t.lengthSectors).c_str(), percent,
+                                  shortSpeed(done, ripper.trackReadMicros()).c_str());
+                    line.setHead(head);
                     lastPercent = percent;
                 }
             });
+        ripper.setReadObserver({});
+        line.finish();
         if (!singleFile) writer->close();
 
         const std::string status = r.status();
@@ -1085,6 +1193,7 @@ int cmdRip(const std::vector<std::string>& args) {
         if (!r.c2Fallback.empty()) std::printf("  C2 reads given up: %s\n", r.c2Fallback.c_str());
         if (!r.cacheFallback.empty()) std::printf("  FUA given up: %s\n", r.cacheFallback.c_str());
         for (const std::string& l : cdr::slowdownLogLines(r)) std::printf("%s\n", l.c_str());
+        for (const std::string& l : cdr::readProblemLogLines(r, 5)) std::printf("%s\n", l.c_str());
         if (r.readMicros) {
             readSectors += r.sectors;
             readMicros += r.readMicros;
