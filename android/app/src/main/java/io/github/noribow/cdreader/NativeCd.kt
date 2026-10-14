@@ -16,6 +16,15 @@ fun interface ImageProgressListener {
     fun onProgress(track: Int, doneSectors: Int, totalSectors: Int)
 }
 
+/**
+ * What the drive is reading (#52), called from the ripping thread right
+ * before every read command (for every block: keep it cheap): the first LBA
+ * and a text such as "LBA 78500-78525  retry 3 at 8x".
+ */
+fun interface ReadActivityListener {
+    fun onActivity(lba: Int, text: String)
+}
+
 /** Progress of the read offset detection (#37): track [step] of at most [steps], in sectors. */
 fun interface OffsetProgressListener {
     fun onProgress(step: Int, steps: Int, track: Int, doneSectors: Int, totalSectors: Int)
@@ -63,7 +72,13 @@ object NativeCd {
         slowdown: Boolean,
         accurateRipReread: Boolean,
     )
-    @JvmStatic external fun nativeRipTrack(handle: Long, track: Int, path: String, listener: RipProgressListener?): IntArray
+    @JvmStatic external fun nativeRipTrack(
+        handle: Long,
+        track: Int,
+        path: String,
+        listener: RipProgressListener?,
+        activity: ReadActivityListener?,
+    ): IntArray
     @JvmStatic external fun nativeImageFileNames(handle: Long, format: String, tracks: IntArray): Array<String>
     @JvmStatic external fun nativeRipImage(
         handle: Long,
@@ -71,6 +86,7 @@ object NativeCd {
         imagePath: String,
         cuePath: String,
         listener: ImageProgressListener?,
+        activity: ReadActivityListener?,
     ): IntArray
     @JvmStatic external fun nativeDetectOffset(handle: Long, http: HttpGet?, listener: OffsetProgressListener?): Array<String>
     @JvmStatic external fun nativeSetDriveOffsetDbCache(handle: Long, path: String)
@@ -78,7 +94,13 @@ object NativeCd {
     @JvmStatic external fun nativeCheckAccurateRip(handle: Long, enabled: Boolean, http: HttpGet?): IntArray
     @JvmStatic external fun nativeAccurateRipError(handle: Long): String
     @JvmStatic external fun nativeRereadTracks(handle: Long): IntArray
-    @JvmStatic external fun nativeRereadTrack(handle: Long, track: Int, path: String, listener: RipProgressListener?): IntArray
+    @JvmStatic external fun nativeRereadTrack(
+        handle: Long,
+        track: Int,
+        path: String,
+        listener: RipProgressListener?,
+        activity: ReadActivityListener?,
+    ): IntArray
     @JvmStatic external fun nativeRipSummary(handle: Long): Array<String>
     @JvmStatic external fun nativeC2Status(handle: Long): Int
     @JvmStatic external fun nativeCacheStatus(handle: Long): IntArray
@@ -600,10 +622,10 @@ class CdSession private constructor(private val handle: Long) : Closeable {
     /**
      * Rips a track to the local file [path] (seekable: headers are patched at
      * the end). Throws java.util.concurrent.CancellationException after
-     * [cancel], IOException on errors.
+     * [cancel], IOException on errors. [activity]: what the drive reads (#52).
      */
-    fun ripTrack(track: Int, path: String, listener: RipProgressListener?): RipResult {
-        val v = NativeCd.nativeRipTrack(handle, track, path, listener)
+    fun ripTrack(track: Int, path: String, activity: ReadActivityListener?, listener: RipProgressListener?): RipResult {
+        val v = NativeCd.nativeRipTrack(handle, track, path, listener, activity)
         return RipResult(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7] != 0, v[8], v[9], v[10], v[11], v[12])
     }
 
@@ -629,8 +651,14 @@ class CdSession private constructor(private val handle: Long) : Closeable {
      * IllegalArgumentException for a selection that is no image and
      * IOException on errors; both files are deleted then.
      */
-    fun ripImage(tracks: List<Int>, imagePath: String, cuePath: String, listener: ImageProgressListener?): ImageResult {
-        val v = NativeCd.nativeRipImage(handle, tracks.toIntArray(), imagePath, cuePath, listener)
+    fun ripImage(
+        tracks: List<Int>,
+        imagePath: String,
+        cuePath: String,
+        activity: ReadActivityListener?,
+        listener: ImageProgressListener?,
+    ): ImageResult {
+        val v = NativeCd.nativeRipImage(handle, tracks.toIntArray(), imagePath, cuePath, listener, activity)
         val parts = (0 until v[2]).map { k ->
             val i = 3 + k * 14
             v[i] to RipResult(
@@ -669,8 +697,13 @@ class CdSession private constructor(private val handle: Long) : Closeable {
      * otherwise it is deleted. Throws java.util.concurrent.CancellationException
      * after [cancel], IOException on errors.
      */
-    fun rereadTrack(track: Int, path: String, listener: RipProgressListener?): RereadResult {
-        val v = NativeCd.nativeRereadTrack(handle, track, path, listener)
+    fun rereadTrack(
+        track: Int,
+        path: String,
+        activity: ReadActivityListener?,
+        listener: RipProgressListener?,
+    ): RereadResult {
+        val v = NativeCd.nativeRereadTrack(handle, track, path, listener, activity)
         return RereadResult(RereadOutcome.entries.getOrElse(v[0]) { RereadOutcome.FAILED }, v[1], v[2], v[3])
     }
 

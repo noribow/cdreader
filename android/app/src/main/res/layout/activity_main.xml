@@ -395,6 +395,17 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content" />
 
+    <!-- What the drive is reading during a rip (#52), e.g. "LBA 78512  retry 3 at 8x". -->
+    <TextView
+        android:id="@+id/textActivity"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:fontFamily="monospace"
+        android:singleLine="true"
+        android:ellipsize="end"
+        android:textSize="12sp"
+        android:visibility="gone" />
+
     <!-- C2 and AccurateRip results of the last rip (scrolls when long). -->
     <TextView
         android:id="@+id/textResults"

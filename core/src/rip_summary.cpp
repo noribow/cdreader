@@ -98,7 +98,8 @@ std::string accurateRipRereadLogLine(bool enabled, const RipOptions& options) {
 
 TrackReread rereadForAccurateRip(CdDrive& drive, const Toc& toc, const RipOptions& options, const Track& track,
                                  const std::vector<AccurateRipPressing>& pressings, uint32_t firstCrc32,
-                                 const Ripper::SampleSink& sink, const Ripper::Progress& progress, Clock* clock) {
+                                 const Ripper::SampleSink& sink, const Ripper::Progress& progress, Clock* clock,
+                                 const Ripper::ReadObserver& observer) {
     TrackReread rr;
     rr.track = track.number;
     rr.firstCrc32 = firstCrc32;
@@ -135,6 +136,7 @@ TrackReread rereadForAccurateRip(CdDrive& drive, const Toc& toc, const RipOption
 
     Ripper ripper(drive, toc, o);
     if (clock) ripper.setClock(*clock);
+    if (observer) ripper.setReadObserver(observer);
     ripper.defeatCacheOnNextTrack();
     AccurateRipChecksum ar = AccurateRipChecksum::forTrack(toc, track);
     rr.result = ripper.ripTrack(

@@ -4,6 +4,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cdreader/cd_drive.h"
@@ -83,9 +84,30 @@ std::vector<int> slowdownSteps(const RipOptions& options);
 // `unavailable`: why it cannot be used although enabled (empty: it can).
 std::string slowdownLogLine(const RipOptions& options, const std::string& unavailable = {});
 
+// A run of sectors (LBAs) where the drive had trouble (#52), for rip.log.
+struct ReadProblemRange {
+    uint32_t firstLba = 0;
+    uint32_t lastLba = 0;        // inclusive
+    uint32_t count = 0;          // retries / C2 re-reads / sectors, depending on the list
+    int slowestFactor = 0;       // the lowest speed (x) slowed down to for it (0: not slowed down)
+    bool sectorFallback = false; // retries: the block was read sector by sector
+
+    bool operator==(const ReadProblemRange& o) const {
+        return firstLba == o.firstLba && lastLba == o.lastLba && count == o.count &&
+               slowestFactor == o.slowestFactor && sectorFallback == o.sectorFallback;
+    }
+};
+
+// Adds [first, last] to `ranges` (ascending), merged into the last range
+// when it overlaps or adjoins it: the counts add up, the slowest speed and
+// the fallback flag are kept.
+void addReadProblemRange(std::vector<ReadProblemRange>& ranges, const ReadProblemRange& range);
+
 struct TrackRipResult {
     int track = 0;
     uint32_t sectors = 0;
+    uint32_t startLba = 0;      // first LBA of the track (before offset correction)
+    uint32_t audioEndLba = 0;   // end of the audio run the track is in (lead-out or data track), exclusive
     uint32_t unreadableSectors = 0;  // replaced with silence
     uint32_t retries = 0;            // failed or mismatching reads that were retried
     uint32_t paddedSamples = 0;      // samples outside the readable area (offset correction), filled with silence
@@ -125,6 +147,15 @@ struct TrackRipResult {
     std::map<int, uint32_t> slowdownC2Sectors;
     uint32_t slowdownFailed = 0;
     std::string slowdownFallback;
+
+    // Where the drive had trouble (#52), in LBAs as read from the drive
+    // (offset correction may reach into the neighbouring tracks), ascending:
+    // blocks that were retried (count: retries; also the sector-by-sector
+    // fallback and verify mismatches), sectors re-read for C2 errors (count:
+    // re-reads) and sectors that stayed unreadable (count: sectors).
+    std::vector<ReadProblemRange> retriedRanges;
+    std::vector<ReadProblemRange> c2Ranges;
+    std::vector<ReadProblemRange> unreadableRanges;
 
     // Time spent reading from the drive (not encoding), measured with the
     // ripper's clock (#49); 0 when not measured.
@@ -187,17 +218,51 @@ std::vector<std::string> cacheLogLines(const TrackRipResult& result);
 // "  Slowdown given up: <reason>"; empty when nothing was slowed down.
 std::vector<std::string> slowdownLogLines(const TrackRipResult& result);
 
+// Where the drive had trouble in a track (#52), indented by two spaces, one
+// line per range and list ("  Retried: LBA 78500-78525 at 4:31, 5 retries,
+// slowed down to 4x", "  C2 re-read: LBA 80001 at 4:20, 3 re-reads",
+// "  Unreadable: LBA 80002-80003 at 4:20"), with the position in the track
+// or "after the track end (read offset)" / "before the track start (read
+// offset)" and ", up to the end of the audio area" for the last sectors
+// before the lead-out (or a data track). After `maxLines` ranges of a list
+// one line counts the rest ("  ... and 3 more retried range(s)").
+std::vector<std::string> readProblemLogLines(const TrackRipResult& result, size_t maxLines = 20);
+
 // rip.log lines of one ripped file or one part of a disc image (#42): "<name>
 // CRC32 <crc>  retries <n>  <status>" (plus the padded samples of offset
 // correction), then "  Read speed: 24.3x (4286 kB/s)" (when measured),
-// c2LogLines(), cacheLogLines() and slowdownLogLines(). Shared by the CLI and
-// the app.
+// c2LogLines(), cacheLogLines(), slowdownLogLines() and
+// readProblemLogLines(). Shared by the CLI and the app.
 std::vector<std::string> trackRipLogLines(const std::string& name, const TrackRipResult& result);
+
+// A read command the ripper is about to send (#52), for a live display of
+// what the drive is doing.
+struct ReadActivity {
+    enum class Kind {
+        Read,            // the first read of a block
+        Verify,          // verify mode: the second read of a block
+        Retry,           // a block read again after a failure (attempt 1..maxRetries)
+        SectorFallback,  // one sector of a block that kept failing (attempt 0, then its retries)
+        C2Reread,        // a sector re-read for C2 errors (attempt 1..)
+        Flush,           // sectors read to evict the drive cache before a re-read
+    };
+    uint32_t lba = 0;
+    uint32_t count = 0;    // sectors
+    Kind kind = Kind::Read;
+    int attempt = 0;       // see Kind (Verify: the attempt it checks)
+    int speedFactor = 0;   // slowed down to this speed (x) for it; 0: the speed of the rip
+};
+
+// "LBA 78512  read", "LBA 78500-78525  retry 3 at 8x", "LBA 78512  sector
+// by sector, retry 2 at 4x", "LBA 80001  C2 re-read 2", "LBA 81000-82499
+// cache flush", "LBA 78500-78525  verify read". Shared by the CLI and the app.
+std::string formatReadActivity(const ReadActivity& activity);
 
 class Ripper {
 public:
     using SampleSink = std::function<void(const uint8_t* pcm, size_t bytes)>;
     using Progress = std::function<void(uint32_t doneSectors, uint32_t totalSectors)>;
+    using ReadObserver = std::function<void(const ReadActivity&)>;
 
     Ripper(CdDrive& drive, const Toc& toc, RipOptions options)
         : drive_(drive),
@@ -210,6 +275,11 @@ public:
     // The clock that times the reads (TrackRipResult::readMicros); without
     // one (the default) reads are not timed. `clock` must outlive the ripper.
     void setClock(Clock& clock) { clock_ = &clock; }
+
+    // Called right before every read command the ripper sends (#52):
+    // blocks, retries, the sector-by-sector fallback, C2 re-reads and cache
+    // flushes (not the FUA command). Exceptions propagate out of ripTrack().
+    void setReadObserver(ReadObserver observer) { observer_ = std::move(observer); }
 
     // Reads an audio track and streams its offset-corrected PCM data to `sink`.
     TrackRipResult ripTrack(const Track& track, const SampleSink& sink,
@@ -243,9 +313,14 @@ private:
 
     void readSpan(int64_t lba, uint32_t count, uint8_t* out, TrackRipResult& result);
     bool readBlock(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, bool reread, TrackRipResult& result,
-                   int retries);
-    void readRange(uint32_t lba, uint32_t count, uint8_t* out, bool reread, TrackRipResult& result);
-    bool readOnce(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, bool reread, TrackRipResult& result);
+                   int retries, bool fallback);
+    void readRange(uint32_t lba, uint32_t count, uint8_t* out, bool reread, TrackRipResult& result,
+                   bool fallback = false);
+    bool readOnce(uint32_t lba, uint32_t count, uint8_t* out, uint8_t* c2, bool reread, TrackRipResult& result,
+                  ReadActivity::Kind kind, int attempt);
+    void notify(uint32_t lba, uint32_t count, ReadActivity::Kind kind, int attempt) {
+        if (observer_) observer_(ReadActivity{lba, count, kind, attempt, slowedFactor_});
+    }
     void defeatCache(uint32_t lba, uint32_t count, TrackRipResult& result);
     void rereadC2Sector(uint32_t lba, uint8_t* out, const uint8_t* c2, TrackRipResult& result);
     struct C2Reread;
@@ -269,6 +344,7 @@ private:
     int slowedFactor_ = 0;     // ... in x
     bool defeatCacheFirst_ = false;
     Clock* clock_ = nullptr;
+    ReadObserver observer_;
     uint64_t trackReadMicros_ = 0;
     Toc::LbaRange readable_;                     // audio run of the current track
     std::vector<uint8_t> flushBuffer_;

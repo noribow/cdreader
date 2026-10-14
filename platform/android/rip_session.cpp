@@ -256,6 +256,7 @@ const RippedTrack& RipSession::ripTrack(int number, const std::filesystem::path&
     AccurateRipChecksum ar = AccurateRipChecksum::forTrack(t, *track);
     Ripper ripper(drive_, t, settings_.options);
     ripper.setClock(*clock_);
+    if (readObserver_) ripper.setReadObserver(readObserver_);
     ripped.result = ripper.ripTrack(
         *track,
         [&](const uint8_t* pcm, size_t bytes) {
@@ -348,6 +349,7 @@ const RippedImage& RipSession::ripImage(const std::vector<int>& tracks, const st
         uint32_t base = 0;  // sectors of the parts before this one
         Ripper ripper(drive_, t, settings_.options);
         ripper.setClock(*clock_);
+        if (readObserver_) ripper.setReadObserver(readObserver_);
         for (const Track& part : plan.parts) {
             const bool htoa = part.number == 0;
             RippedTrack ripped;
@@ -467,7 +469,7 @@ const TrackReread& RipSession::rereadTrack(int number, const std::filesystem::pa
                 if (cancelled_) throw RipCancelled();
                 if (progress) progress(done, total);
             },
-            clock_);
+            clock_, readObserver_);
         writer->close();
     } catch (const RipCancelled&) {
         std::error_code ec;

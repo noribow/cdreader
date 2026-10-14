@@ -902,6 +902,38 @@ TEST(unreadable_sectors_are_reported) {
     CHECK(contains(log, "\nFinished with errors\n"));
 }
 
+// What the drive reads (#52) reaches the session's observer, and rip.log
+// says where the retries and the unreadable sector were.
+TEST(read_activity_and_problem_ranges) {
+    Rig rig;
+    rig.fake.failuresBySector[320] = -1;
+    std::vector<cdr::ReadActivity> seen;
+    rig.session.setReadObserver([&](const cdr::ReadActivity& a) { seen.push_back(a); });
+    rig.session.beginRip(settings("wav"));
+    TempDir dir;
+    const uint32_t start = rig.session.toc().findTrack(2)->startLba;
+    const cdr::RippedTrack& t = rig.session.ripTrack(2, dir.path / "t.wav");
+    CHECK_EQ(t.result.unreadableSectors, 1u);
+    CHECK(!seen.empty() && seen.front().lba == start && seen.front().kind == cdr::ReadActivity::Kind::Read);
+    bool retry = false, fallback = false;
+    for (const cdr::ReadActivity& a : seen) {
+        retry = retry || a.kind == cdr::ReadActivity::Kind::Retry;
+        fallback = fallback || (a.kind == cdr::ReadActivity::Kind::SectorFallback && a.lba == 320);
+    }
+    CHECK(retry);
+    CHECK(fallback);
+    CHECK_EQ(t.result.unreadableRanges.size(), size_t(1));
+    const std::string log = rig.session.ripLog();
+    CHECK(contains(log, "\n  Retried: LBA 300-325 at "));
+    CHECK(contains(log, "\n  Unreadable: LBA 320 at "));
+
+    // A disc image as well.
+    seen.clear();
+    rig.session.ripImage({2, 3}, dir.path / "image.wav", dir.path / "image.cue");
+    CHECK(!seen.empty() && seen.front().lba == start);
+    CHECK(contains(rig.session.ripLog(), "\n  Unreadable: LBA 320 at "));
+}
+
 TEST(gaps_in_rip_log) {
     // Track 2 has a 1-second pregap, track 3 an INDEX 02; read through the BOT.
     Rig rig;
@@ -1965,6 +1997,17 @@ TEST(accuraterip_reread_replaces_a_silently_wrong_track) {
                         "1 accurately ripped (track 2)\nAll tracks ripped; the read problems were resolved "
                         "(AccurateRip confirms the tracks)\n"));
     CHECK(!contains(log, "without errors"));
+}
+
+// The re-read reports its reads to the session's observer as well (#52).
+TEST(accuraterip_reread_reports_read_activity) {
+    RereadRig r;
+    r.rig.fake.speedFaults[310] = {706, false, 1};
+    r.ripAll(r.ripSettings());
+    std::vector<cdr::ReadActivity> seen;
+    r.rig.session.setReadObserver([&](const cdr::ReadActivity& a) { seen.push_back(a); });
+    r.rig.session.rereadTrack(2, r.dir.path / "reread.wav");
+    CHECK(!seen.empty() && seen.front().lba == r.rig.session.toc().findTrack(2)->startLba);
 }
 
 // The same wrong data on every read (a different pressing, or damage): the

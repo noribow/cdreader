@@ -85,12 +85,13 @@ std::string accurateRipRereadLogLine(bool enabled, const RipOptions& options);
 // defeat of `options`. The offset-corrected PCM goes to `sink` (the caller
 // writes it to a new file); the checksums are compared with `pressings`.
 // `firstCrc32`: the CRC32 of the first read, for the outcome. A drive that
-// rejects SET CD SPEED gives Failed. Exceptions thrown by `sink` / `progress`
-// propagate (after the speed was restored).
+// rejects SET CD SPEED gives Failed. `observer`: Ripper::setReadObserver()
+// (#52). Exceptions thrown by `sink` / `progress` / `observer` propagate
+// (after the speed was restored).
 TrackReread rereadForAccurateRip(CdDrive& drive, const Toc& toc, const RipOptions& options, const Track& track,
                                  const std::vector<AccurateRipPressing>& pressings, uint32_t firstCrc32,
                                  const Ripper::SampleSink& sink, const Ripper::Progress& progress = {},
-                                 Clock* clock = nullptr);
+                                 Clock* clock = nullptr, const Ripper::ReadObserver& observer = {});
 
 // The AccurateRip result of a rip, with the re-reads.
 struct AccurateRipReport {

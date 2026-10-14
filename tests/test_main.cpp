@@ -7464,7 +7464,9 @@ TEST(slowdown_recovers_unreadable_sector) {
     CHECK(log[slow + 3].opcode == 0xBE && log[slow + 3].lba == 326);
     CHECK(cdr::slowdownLogLines(r.result) == std::vector<std::string>{"  Slowdown: 1 block(s) re-read at 8x"});
     const std::vector<std::string> lines = cdr::trackRipLogLines("02.wav", r.result);
-    CHECK(lines.back() == "  Slowdown: 1 block(s) re-read at 8x");
+    CHECK(lines[lines.size() - 2] == "  Slowdown: 1 block(s) re-read at 8x");
+    // Where (#52): the block of the failing sector, its retry at 8x.
+    CHECK(lines.back() == "  Retried: LBA 300-325 at 0:00:00, 1 retry, slowed down to 8x");
     CHECK(r.result.readProblems());
     CHECK(r.result.readProblemText() == "retries, slowdown");
 }
@@ -7990,6 +7992,217 @@ TEST(rip_summary_verdicts_and_lines) {
     CHECK(cdr::summarizeRip({{1, &clean}}, &two).verdict == cdr::RipSummary::Verdict::Clean);
 }
 
+
+// --- Read activity and problem ranges (#52) ----------------------------------
+
+namespace {
+
+using Kind = cdr::ReadActivity::Kind;
+
+struct ObservedRip {
+    SpeedRip rip;
+    std::vector<cdr::ReadActivity> seen;
+};
+
+ObservedRip ripObserved(FakeDrive& fake, int track, const cdr::RipOptions& options) {
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    fake.commandLog.clear();
+    cdr::Ripper ripper(drive, toc, options);
+    ObservedRip out;
+    ripper.setReadObserver([&](const cdr::ReadActivity& a) { out.seen.push_back(a); });
+    out.rip.result = ripper.ripTrack(*toc.findTrack(track), [&](const uint8_t* p, size_t n) {
+        out.rip.bytes.insert(out.rip.bytes.end(), p, p + n);
+    });
+    return out;
+}
+
+bool sameActivity(const cdr::ReadActivity& a, uint32_t lba, uint32_t count, Kind kind, int attempt, int speed) {
+    return a.lba == lba && a.count == count && a.kind == kind && a.attempt == attempt && a.speedFactor == speed;
+}
+
+std::vector<cdr::ReadActivity> ofKind(const std::vector<cdr::ReadActivity>& seen, Kind kind) {
+    std::vector<cdr::ReadActivity> v;
+    for (const cdr::ReadActivity& a : seen)
+        if (a.kind == kind) v.push_back(a);
+    return v;
+}
+
+}  // namespace
+
+TEST(read_activity_format) {
+    CHECK(cdr::formatReadActivity({78512, 1, Kind::Read, 0, 0}) == "LBA 78512  read");
+    CHECK(cdr::formatReadActivity({78500, 26, Kind::Read, 0, 0}) == "LBA 78500-78525  read");
+    CHECK(cdr::formatReadActivity({78500, 26, Kind::Retry, 3, 8}) == "LBA 78500-78525  retry 3 at 8x");
+    CHECK(cdr::formatReadActivity({78500, 26, Kind::Verify, 0, 0}) == "LBA 78500-78525  verify read");
+    CHECK(cdr::formatReadActivity({78512, 1, Kind::SectorFallback, 0, 4}) == "LBA 78512  sector by sector at 4x");
+    CHECK(cdr::formatReadActivity({78512, 1, Kind::SectorFallback, 2, 4}) ==
+          "LBA 78512  sector by sector, retry 2 at 4x");
+    CHECK(cdr::formatReadActivity({80001, 1, Kind::C2Reread, 2, 0}) == "LBA 80001  C2 re-read 2");
+    CHECK(cdr::formatReadActivity({81000, 1500, Kind::Flush, 0, 0}) == "LBA 81000-82499  cache flush");
+}
+
+// A clean rip: one Read per block, in order, at the speed of the rip.
+TEST(read_observer_sees_every_block) {
+    FakeDrive fake = makeAudioDisc();
+    const ObservedRip o = ripObserved(fake, 2, cdr::RipOptions{});
+    CHECK(o.rip.result.clean());
+    CHECK_EQ(o.seen.size(), size_t(6));
+    const uint32_t starts[] = {300, 326, 352, 378, 404, 430};
+    for (size_t i = 0; i < o.seen.size() && i < 6; ++i)
+        CHECK(sameActivity(o.seen[i], starts[i], i == 5 ? 20 : 26, Kind::Read, 0, 0));
+    CHECK_EQ(size_t(fake.readCommands), o.seen.size());
+    CHECK(o.rip.result.retriedRanges.empty());
+    CHECK(cdr::readProblemLogLines(o.rip.result).empty());
+
+    // Verify mode: a second read of every block.
+    FakeDrive v = makeAudioDisc();
+    cdr::RipOptions verify;
+    verify.verify = true;
+    const ObservedRip ov = ripObserved(v, 2, verify);
+    CHECK_EQ(ov.seen.size(), size_t(12));
+    CHECK(sameActivity(ov.seen[0], 300, 26, Kind::Read, 0, 0));
+    CHECK(sameActivity(ov.seen[1], 300, 26, Kind::Verify, 0, 0));
+}
+
+// A sector that never reads: the block's retries at 8x / 4x, the
+// sector-by-sector fallback at 4x, then back to the speed of the rip; the
+// retried LBA range and the unreadable sector in rip.log.
+TEST(read_observer_sees_retries_and_slowdown) {
+    FakeDrive fake = makeSpeedDisc();
+    fake.failuresBySector[310] = -1;
+    const ObservedRip o = ripObserved(fake, 2, slowdownOptions(3));
+    const cdr::TrackRipResult& r = o.rip.result;
+    CHECK_EQ(r.unreadableSectors, 1u);
+
+    CHECK(sameActivity(o.seen.at(0), 300, 26, Kind::Read, 0, 0));
+    const std::vector<cdr::ReadActivity> retries = ofKind(o.seen, Kind::Retry);
+    CHECK_EQ(retries.size(), size_t(3));
+    CHECK(sameActivity(retries.at(0), 300, 26, Kind::Retry, 1, 8));
+    CHECK(sameActivity(retries.at(1), 300, 26, Kind::Retry, 2, 4));
+    CHECK(sameActivity(retries.at(2), 300, 26, Kind::Retry, 3, 4));
+    CHECK(cdr::formatReadActivity(retries.at(0)) == "LBA 300-325  retry 1 at 8x");
+
+    const std::vector<cdr::ReadActivity> fallback = ofKind(o.seen, Kind::SectorFallback);
+    CHECK_EQ(fallback.size(), size_t(26 + 3));  // every sector once, 310 with its 3 retries
+    CHECK(sameActivity(fallback.at(0), 300, 1, Kind::SectorFallback, 0, 4));
+    int bad = 0;
+    for (const cdr::ReadActivity& a : fallback)
+        if (a.lba == 310) CHECK(sameActivity(a, 310, 1, Kind::SectorFallback, bad++, 4));
+    CHECK_EQ(bad, 4);
+    CHECK(cdr::formatReadActivity(fallback.at(13)) == "LBA 310  sector by sector, retry 3 at 4x");
+
+    // The next block at the speed of the rip again.
+    const std::vector<cdr::ReadActivity> reads = ofKind(o.seen, Kind::Read);
+    CHECK_EQ(reads.size(), size_t(6));
+    CHECK(sameActivity(reads.at(1), 326, 26, Kind::Read, 0, 0));
+    // One observation per read command.
+    CHECK_EQ(size_t(fake.readCommands), o.seen.size());
+
+    // 3 block retries + 3 of the sector, one range.
+    CHECK(r.retriedRanges == (std::vector<cdr::ReadProblemRange>{{300, 325, 6, 4, true}}));
+    CHECK(r.unreadableRanges == (std::vector<cdr::ReadProblemRange>{{310, 310, 1, 4, false}}));
+    const std::vector<std::string> lines = cdr::trackRipLogLines("02.wav", r);
+    const std::vector<std::string> where = {
+        "  Retried: LBA 300-325 at 0:00:00, 6 retries, sector by sector, slowed down to 4x",
+        "  Unreadable: LBA 310 at 0:00:00, slowed down to 4x"};
+    CHECK(cdr::readProblemLogLines(r) == where);
+    CHECK(std::vector<std::string>(lines.end() - 2, lines.end()) == where);
+}
+
+// Problems at the end of the last track: the over-read for a positive
+// offset is past the lead-out (padded, never read), so the retried range
+// ends at the end of the audio area.
+TEST(read_problem_ranges_at_track_end) {
+    FakeDrive fake = makeAudioDisc();
+    fake.failuresBySector[748] = 1;
+    cdr::RipOptions o;
+    o.readOffsetSamples = 600;  // reads one sector more, past the lead-out
+    const ObservedRip r = ripObserved(fake, 3, o);
+    CHECK(r.rip.result.clean());
+    CHECK(r.rip.result.retriedRanges == (std::vector<cdr::ReadProblemRange>{{737, 749, 1, 0, false}}));
+    CHECK(cdr::readProblemLogLines(r.rip.result) ==
+          (std::vector<std::string>{"  Retried: LBA 737-749 at 0:00:03, up to the end of the audio area, 1 retry"}));
+    // The last read stops at the lead-out.
+    CHECK(sameActivity(r.seen.back(), 737, 13, Kind::Retry, 1, 0));
+}
+
+// C2 re-reads: their attempts and speeds, and the sector in rip.log.
+TEST(read_observer_sees_c2_rereads) {
+    FakeDrive fake = makeSpeedDisc();
+    fake.c2Supported = true;
+    fake.speedFaults[310] = {1412, true};  // C2 errors faster than 8x
+    cdr::RipOptions opt = slowdownOptions(3);
+    opt.useC2 = true;
+    const ObservedRip o = ripObserved(fake, 2, opt);
+    const std::vector<cdr::ReadActivity> c2 = ofKind(o.seen, Kind::C2Reread);
+    CHECK_EQ(c2.size(), size_t(4));
+    CHECK(sameActivity(c2.at(0), 310, 1, Kind::C2Reread, 1, 0));
+    CHECK(sameActivity(c2.at(2), 310, 1, Kind::C2Reread, 3, 0));
+    CHECK(sameActivity(c2.at(3), 310, 1, Kind::C2Reread, 4, 8));
+    CHECK(sameActivity(o.seen.at(0), 300, 24, Kind::Read, 0, 0));  // C2 reads: 24 sectors
+    CHECK(o.rip.result.c2Ranges == (std::vector<cdr::ReadProblemRange>{{310, 310, 4, 8, false}}));
+    CHECK(cdr::readProblemLogLines(o.rip.result) ==
+          (std::vector<std::string>{"  C2 re-read: LBA 310 at 0:00:00, 4 re-reads, slowed down to 8x"}));
+}
+
+// Cache flushes before a retry are reported as such.
+TEST(read_observer_sees_cache_flush) {
+    FakeDrive fake = makeAudioDisc();
+    fake.failuresBySector[310] = 1;
+    cdr::RipOptions opt;
+    opt.cacheDefeat = cdr::CacheDefeat::Flush;
+    opt.flushSectors = 52;
+    const ObservedRip o = ripObserved(fake, 2, opt);
+    CHECK(o.rip.result.clean());
+    CHECK(o.seen.size() >= size_t(3));
+    CHECK(sameActivity(o.seen.at(0), 300, 26, Kind::Read, 0, 0));
+    CHECK(o.seen.at(1).kind == Kind::Flush);
+    CHECK_EQ(o.seen.at(1).count, 52u);
+    CHECK(o.seen.at(1).lba >= 326);  // away from the block
+    CHECK(sameActivity(o.seen.at(2), 300, 26, Kind::Retry, 1, 0));
+    CHECK(o.rip.result.retriedRanges == (std::vector<cdr::ReadProblemRange>{{300, 325, 1, 0, false}}));
+}
+
+// The AccurateRip re-read passes the observer on.
+TEST(read_observer_in_accuraterip_reread) {
+    FakeDrive fake = makeSpeedDisc();
+    cdr::CdDrive drive(fake);
+    const cdr::Toc toc = drive.readToc();
+    std::vector<cdr::ReadActivity> seen;
+    cdr::rereadForAccurateRip(
+        drive, toc, slowdownOptions(), *toc.findTrack(2), speedDiscDatabase(5), 0, [](const uint8_t*, size_t) {}, {},
+        nullptr, [&](const cdr::ReadActivity& a) { seen.push_back(a); });
+    CHECK(!ofKind(seen, Kind::Read).empty());
+    CHECK(ofKind(seen, Kind::Read).front().lba == 300);
+}
+
+// Merging, positions relative to the track and the line limit.
+TEST(read_problem_ranges_merge_and_lines) {
+    std::vector<cdr::ReadProblemRange> v;
+    cdr::addReadProblemRange(v, {100, 125, 2, 8, false});
+    cdr::addReadProblemRange(v, {110, 110, 3, 4, true});   // inside: merged
+    cdr::addReadProblemRange(v, {126, 151, 1, 0, false});  // adjoining: merged
+    cdr::addReadProblemRange(v, {200, 200, 1, 0, false});  // a gap: a new range
+    CHECK(v == (std::vector<cdr::ReadProblemRange>{{100, 151, 6, 4, true}, {200, 200, 1, 0, false}}));
+
+    cdr::TrackRipResult r;
+    r.startLba = 1000;
+    r.sectors = 750;  // ends at 1750
+    r.audioEndLba = 1760;
+    r.retriedRanges = {{990, 995, 2, 0, false}, {1745, 1755, 5, 8, false}, {1756, 1759, 1, 0, true}};
+    r.unreadableRanges = {{1500, 1501, 2, 0, false}};
+    CHECK(cdr::readProblemLogLines(r) ==
+          (std::vector<std::string>{
+              "  Retried: LBA 990-995 before the track start (read offset), 2 retries",
+              "  Retried: LBA 1745-1755 at 0:00:09 to after the track end (read offset), 5 retries, slowed down to 8x",
+              "  Retried: LBA 1756-1759 after the track end (read offset), up to the end of the audio area, 1 retry, "
+              "sector by sector",
+              "  Unreadable: LBA 1500-1501 at 0:00:06"}));
+    CHECK(cdr::readProblemLogLines(r, 1) ==
+          (std::vector<std::string>{"  Retried: LBA 990-995 before the track start (read offset), 2 retries",
+                                    "  ... and 2 more retried range(s)", "  Unreadable: LBA 1500-1501 at 0:00:06"}));
+}
 
 int main() {
     for (auto& [name, fn] : registry()) {
